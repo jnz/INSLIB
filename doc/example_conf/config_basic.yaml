@@ -1,0 +1,22 @@
+name: imugnssbaromag
+aiding: gnss
+init: auto
+chi2_disable: 1               # Disable outlier rejection
+
+baro:
+  enable: 1
+  stddev_m: 2.0
+
+imu:
+  gyr_psd: 5.392673001e-10    # Needs adjustment (rad/s)^2/Hz
+  acc_psd: 3.973520105e-08    # Needs adjustment (m/s^2)^2/Hz
+  gyr_bias_rw: 2.0e-06        # Needs adjustment rad/s/sqrt(s)
+  acc_bias_rw: 0.0003         # Needs adjustment m/s^2/sqrt(s)
+
+gnss:
+  leverarm_frd: [0, -0.15, 0] # Needs adjustment
+  delay_ms: 200               # 200 ms delay for u-blox F9P and X20
+
+mag:
+  enable: 1
+

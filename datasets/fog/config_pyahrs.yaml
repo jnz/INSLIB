@@ -1,0 +1,33 @@
+# NOT an accuracy benchmark: this only checks the C port agrees with its own Python prototype
+# aiding: none -- only the ARS/AHRS attitude comparison is meaningful
+# (ins never runs under aiding: none, so its checks incl. "enough
+# scored epochs" always read 0/FAIL -- expected, not a regression)
+name: fog-crosscheck
+aiding: none    # position scoring is meaningless here
+init: auto      # ins self-aligns from the ~22 s parked phase
+automotive_mode: 0
+gyro_bias_window_sec: 15
+
+imu:
+  rpy_pred_stddev_rad_sqrts: 1.745329252e-05    # rigid mount
+  gyr_psd: 2.329e-05   # (rad/s)^2/Hz, allan_variance.py ARW @ tau=1s, 22s parked window
+  acc_psd: 0.005799    # (m/s^2)^2/Hz, allan_variance.py ARW @ tau=1s, 22s parked window
+  gyr_bias_rw: 6.0e-06 # rad/s/sqrt(s), FIXME: 3x generic MEMS default, RRW unreadable (22s)
+  acc_bias_rw: 3.0e-05 # m/s^2/sqrt(s), FIXME: generic MEMS-ish guess, RRW unreadable (22s)
+
+inputs:
+  ref: ref_pyahrs.csv
+
+score:
+  ahrs: 1
+  warmup_sec: 30
+  min_epochs: 5000
+  lim_att_bias_deg: 999
+  lim_att_std_deg: 999
+  lim_yaw_bias_deg: 999
+  lim_yaw_std_deg: 999
+  lim_pos_rms_m: 999
+  lim_ars_att_bias_deg: 2
+  lim_ars_roll_std_deg: 2
+  lim_ars_pitch_std_deg: 2
+  lim_ars_yaw_drift_deg_min: 10

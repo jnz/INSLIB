@@ -1,0 +1,33 @@
+06_outdoor_to_indoor -- 22 Aug 2026, Spain
+
+Handheld, walked three times: along the pool, up the stairs, along the house,
+put down on a marked spot on the ground at the front door, through the house
+including one flight of stairs up and down, put down on the same spot on the
+way out, back down the stairs and along the pool to the start. Start and end
+are the same point to about 5 cm. Standstills: start, before and after each of
+the three house visits, end -- nowhere else.
+
+Heading on the straight legs is 310 deg true (measured with a phone compass).
+Fast turns at the corners.
+
+The receiver keeps producing 3D fixes throughout the house; the longest gap in
+the whole run is 1.0 s. Indoors its reported velocity accuracy degrades from
+about 0.11 m/s to 0.32 m/s (per axis, median), which separates inside from
+outside far better than the reported position accuracy does.
+
+ref_ardupilot.csv is ArduPilot EKF3 fed the same measurements through the same
+calibration, i.e. a second estimator rather than a ground truth. Position
+errors scored against it are the difference between two filters.
+
+imu.csv is block averaged from the original 763 Hz to 95 Hz; the sensor is
+internally filtered, so the full rate carried no additional information (the
+standstill noise is unchanged by the averaging).
+
+Sensors:
+ - ICM-45686 TDK InvenSense IMU
+ - LIS3MDL magnetometer
+ - BMP581 Bosch barometer
+ - u-blox X20P (ArduSimple board), L1/L2/L5/L patch antenna,
+   u-blox Point Perfect Flex (SPARTN) corrections
+ - GNSS antenna lever arm to the IMU, body FRD: [0.02, 0.28, 0.01] m
+ - IMU and magnetometer calibration taken at 34 degC

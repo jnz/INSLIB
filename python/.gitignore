@@ -1,0 +1,11 @@
+# Build artifact produced by `make pylib`
+INSLIB/libINSLIB.so
+INSLIB/libINSLIB.dylib
+INSLIB/libINSLIB.dll
+
+# Python / packaging cruft
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/

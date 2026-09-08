@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Minimal COLLADA "dart" body used by nav3d_kml.py to visualize attitude
+  (roll/tilt/heading) on the gx:Track in Google Earth. Deliberately
+  asymmetric so a wrong axis mapping is immediately obvious when opened:
+  the tip points forward (nose), the flat plate is the top, and the
+  single fin hangs below the plate (belly/down marker). Model space is
+  declared Z_UP with +Y forward, so it lines up directly with nav3d's
+  own NED-style reasoning (only the up-axis sign differs from body FRD's
+  down-axis) -- see the axis-mapping comment in nav3d_kml.py.
+-->
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <up_axis>Z_UP</up_axis>
+  </asset>
+  <library_materials>
+    <material id="dartMaterial" name="dartMaterial">
+      <instance_effect url="#dartEffect"/>
+    </material>
+  </library_materials>
+  <library_effects>
+    <effect id="dartEffect">
+      <profile_COMMON>
+        <technique sid="common">
+          <lambert>
+            <diffuse><color>0.9 0.2 0.1 1</color></diffuse>
+          </lambert>
+        </technique>
+      </profile_COMMON>
+    </effect>
+  </library_effects>
+  <library_geometries>
+    <geometry id="dartGeometry" name="dart">
+      <mesh>
+        <source id="dartPositions">
+          <float_array id="dartPositionsArray" count="12">
+            0 0.6 0
+            -0.25 -0.3 0
+            0.25 -0.3 0
+            0 -0.15 -0.2
+          </float_array>
+          <technique_common>
+            <accessor source="#dartPositionsArray" count="4" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <vertices id="dartVertices">
+          <input semantic="POSITION" source="#dartPositions"/>
+        </vertices>
+        <triangles material="dartMaterialRef" count="4">
+          <input semantic="VERTEX" source="#dartVertices" offset="0"/>
+          <p>
+            0 1 2
+            0 2 3
+            0 3 1
+            1 3 2
+          </p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="dartScene" name="dartScene">
+      <node id="dartNode" name="dart">
+        <instance_geometry url="#dartGeometry">
+          <bind_material>
+            <technique_common>
+              <instance_material symbol="dartMaterialRef" target="#dartMaterial"/>
+            </technique_common>
+          </bind_material>
+        </instance_geometry>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+  <scene>
+    <instance_visual_scene url="#dartScene"/>
+  </scene>
+</COLLADA>

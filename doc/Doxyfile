@@ -1,0 +1,41 @@
+# Doxygen configuration for the ins public C API.
+#
+# Run via `make doxygen` (repo root) or `make -C doc doxygen`; see
+# doc/Makefile. Output goes to doc/doxygen/{html,latex} (gitignored,
+# regenerate on demand -- unlike INSLIB_design.pdf, which is committed).
+#
+# Scope: the hand-written headers under src/ -- the library's documented
+# public API surface. Excludes generated data tables (wmm_lut.h,
+# wmm_test_vectors.h), the KFCore/RTKLIB submodules (third-party, not
+# ins's own API) and python/csrc/ins_capi.h (a deliberately terser
+# ctypes-binding shim that documents itself as outside this process --
+# see its own file header).
+#
+# This is a short, curated subset of Doxygen's config tags -- any tag not
+# listed here simply keeps Doxygen's built-in default.
+
+PROJECT_NAME          = "INSLIB"
+PROJECT_BRIEF         = "Error-state Kalman filter library for 3D navigation"
+PROJECT_LOGO          = figures/inslib_logo.png
+OUTPUT_DIRECTORY      = doxygen
+
+INPUT                 = ../src doxygen_modules.dox
+FILE_PATTERNS         = *.h *.dox
+EXCLUDE               = ../src/wmm_lut.h ../src/wmm_test_vectors.h
+RECURSIVE             = NO
+
+GENERATE_HTML         = YES
+GENERATE_LATEX        = YES
+GENERATE_MAN          = NO
+
+EXTRACT_ALL           = NO
+EXTRACT_STATIC        = NO
+JAVADOC_AUTOBRIEF     = NO
+OPTIMIZE_OUTPUT_FOR_C = YES
+TYPEDEF_HIDES_STRUCT  = YES
+
+WARN_IF_UNDOCUMENTED  = YES
+WARN_IF_DOC_ERROR     = YES
+WARN_NO_PARAMDOC      = YES
+
+QUIET                 = YES

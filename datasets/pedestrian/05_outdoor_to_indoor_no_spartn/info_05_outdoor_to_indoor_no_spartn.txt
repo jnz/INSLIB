@@ -1,0 +1,32 @@
+05_outdoor_to_indoor_no_spartn -- 22 Aug 2026, Spain
+
+Handheld, walked three times: along the pool, up the stairs, along the house,
+put down on a marked spot on the ground at the front door, a lap through the
+house, put down on the same spot on the way out, back down the stairs and along
+the pool to the start. Start and end are the same point to about 5 cm.
+
+Heading on the straight legs is 310 deg true (measured with a phone compass).
+Fast turns at the corners.
+
+The receiver ran STANDALONE, with a hard reset before the start and no
+correction data at all. Same route and the same hardware as the SPARTN runs, so
+the pair isolates what the corrections are worth: the receiver's own loop
+closure over this route is about 1.2 m here against 0.01 m with SPARTN, and its
+reported horizontal accuracy is 0.78 m against 0.03 m. 147 epochs were dropped
+below a 3D fix.
+
+ref_ardupilot.csv is ArduPilot EKF3 fed the same measurements through the same
+calibration, i.e. a second estimator rather than a ground truth. Position
+errors scored against it are the difference between two filters.
+
+imu.csv is block averaged from the original 786 Hz to 98 Hz; the sensor is
+internally filtered, so the full rate carried no additional information.
+
+Sensors:
+ - ICM-45686 TDK InvenSense IMU
+ - LIS3MDL magnetometer
+ - BMP581 Bosch barometer
+ - u-blox X20P (ArduSimple board), L1/L2/L5/L patch antenna,
+   no corrections (standalone, hard reset before the start)
+ - GNSS antenna lever arm to the IMU, body FRD: [0.02, 0.28, 0.01] m
+ - IMU and magnetometer calibration taken at 34 degC

@@ -1,0 +1,48 @@
+# Baro Filter, true acc-z-Bias 0.15 -> 0.25 m/s^2 at t=50 s
+
+name: D_baro
+aiding: none # use GNSS
+init: ref    # known truth start from ref.csv
+automotive_mode: 0
+chi2_disable: 0             # 1: disable outlier downweighting (diagnostics)
+chi2_reject_alpha: 0      # 0 -> outlier gate; e.g. 0.05 -> 95% global
+allow_unlimited_deadreckoning: 0  # 1: never expire the IMU-only coasting window
+max_deadreckoning_sec: 0.0  # IMU-only coasting budget [s]; 0 -> default 10 s
+gyro_bias_window_sec: 8.0   # static window to seed the initial gyro bias
+imu:
+  rpy_pred_stddev_rad_sqrts: 1.745329252e-05    # rigid mount
+  gyr_psd: 4.0e-08    # rad^2/s, gyro_noise_PSD
+  acc_psd: 6.4e-05    # (m/s^2)^2/Hz, accel_noise_PSD
+  gyr_bias_rw: 1.0e-06    # rad/s/sqrt(s), sqrt(gyro_bias_PSD)
+  acc_bias_rw: 0.002    # m/s^2/sqrt(s), sqrt(accel_bias_PSD)
+gnss:
+  leverarm_frd: [0.0, 0.0, 0.0]    # in IMU FRD body system to GNSS antenna
+  delay_ms: 0               # assumed fixed fix latency          [ms]
+
+score:
+  ahrs: 1
+  warmup_sec: 10
+  min_epochs: 100
+
+mag:
+  enable: 0
+  stddev_ut: 0            # heading-measurement noise [uT] (0 -> default)
+  wmm_year: 2026.0          # decimal year for the declination lookup
+  estimate_bias: 0          # 18-state hard-iron bias
+  fixed_bias: [0,0,0]       # hard-iron [uT];  misalignment: soft-iron 3x3
+  misalignment: [1,0,0, 0,1,0, 0,0,1]
+
+baro:
+  enable: 1
+  stddev_m: 0.2088             # 0 -> baro_alt default
+  acc_bias_rw: 0.002          # accel-bias drift  [m/s^2/sqrt(Hz)], 0 -> default
+  acc_bias_init_mps2: 0.3   # INITIAL accel-bias stddev [m/s^2], 0 -> default
+  acc_noise_mps2_sqrthz: 0.008 # accel-noise density [m/s^2/sqrt(Hz)]
+  h_process_noise: 0      # direct height process noise [m/sqrt(Hz)], 0 -> default
+
+inputs:                     # optional per-stream CSV filename overrides
+  imu:  IMU.csv             # each unset key -> the conventional <stream>.csv
+  ref:  ref.csv
+  gnss: GNSS.csv
+  mag:  Mag.csv
+  baro: Baro.csv

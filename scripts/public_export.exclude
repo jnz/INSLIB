@@ -1,0 +1,38 @@
+# rsync --exclude-from list: paths that stay in the private INSLIB repo
+# and must never reach the public export.
+#
+# Review this list before every release, not just once - new internal
+# tooling or datasets tend to get added without anyone remembering to
+# come back here.
+
+# Leading / anchors each pattern to the repo root - without it, rsync
+# matches the bare filename at ANY depth (e.g. bare "config.yaml" would
+# also strip every dataset's own datasets/*/config.yaml).
+/embedded/
+/tmp/
+/config.yaml
+/datasets/baroalt_mag01/
+/CLAUDE.md
+
+# Local build artifacts: rsync doesn't read .gitignore, so these would
+# otherwise be copied verbatim from whatever state the private working
+# tree happens to be in at export time.
+/build/
+/coverage/
+/doc/doxygen/
+/python/.venv/
+/python/INSLIB.egg-info/
+/python/__pycache__/
+__pycache__/
+*.gcda
+*.gcno
+
+# Not secret, just not part of the public snapshot's history:
+.git/
+
+# KFCore is a real git submodule in the private repo. rsync knows nothing
+# about submodules - copying it verbatim would commit its files as plain
+# tracked files instead, contradicting .gitmodules. release_public.sh
+# wires it up properly with `git submodule add` instead.
+/KFCore/
+/.gitmodules

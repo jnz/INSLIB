@@ -1,0 +1,117 @@
+# ctags
+tags
+
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# debug information files
+*.dwo
+
+# Machine-local dev environment helpers
+add_gcc_to_path.bat
+add_gcc_to_path.sh
+
+# Build output (Makefile: test binaries, replay, insrcv)
+/build/
+
+# Python bytecode
+__pycache__/
+
+# Coverage (Makefile `coverage` target)
+*.gcda
+*.gcno
+/coverage/
+
+# Python venv (python/setup_venv.sh)
+python/.venv/
+
+# Doxygen API reference (Makefile `doxygen` target; INSLIB_manual.pdf is
+# committed, but this generated tree is not)
+/doc/doxygen/
+
+# Latex
+/doc/INSLIB_manual.aux
+/doc/INSLIB_manual.fdb_latexmk
+/doc/INSLIB_manual.fls
+/doc/INSLIB_manual.log
+/doc/INSLIB_manual.out
+/doc/INSLIB_manual.toc
+
+# MSVC pylib build intermediates (build_pylib_msvc.bat, cleaned on success,
+# left only on a mid-build failure)
+/build_cl/
+/python/INSLIB/libINSLIB.def
+/python/INSLIB/libINSLIB.exp
+/python/INSLIB/libINSLIB.lib
+
+# Temp. directory
+/tmp/
+/datasets/tmp/
+
+# STM32CubeIDE metadata. The firmware builds from its own Makefile now, so
+# anything the IDE writes is a personal workspace setting rather than part
+# of the build -- see "Debugging" in Core/Src/inslib_sensor/README_inslib.md.
+/embedded/stm32f429/.project
+/embedded/stm32f429/.cproject
+/embedded/stm32f429/.settings/
+/embedded/stm32f429/Debug
+
+# Firmware build output (Makefile based, see embedded/stm32f429/Makefile)
+/embedded/stm32f429/build/
+/embedded/stm32f429/config.mk
+/embedded/stm32f429/firmware.bin
+/embedded/stm32f429/firmware.dmp
+/embedded/stm32f429/firmware.elf
+/embedded/stm32f429/firmware.hex
+/embedded/stm32f429/firmware.list
+/embedded/stm32f429/firmware.map

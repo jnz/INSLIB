@@ -1,0 +1,95 @@
+# B_drone replayed with a coasting window SHORTER than its GNSS outage.
+#
+# The sibling config.yaml keeps max_deadreckoning_sec (12 s) above the
+# dataset's 62-72 s outage on purpose, so the whole gap is ordinary coasting
+# and the filter never stops. This config drops the window to 4 s, which puts
+# the same 10 s outage across the boundary: ~4 s coasted, ~6 s with the filter
+# inert (REQ-NAV-064), then the first fix at 72 s re-anchors it (REQ-NAV-023,
+# REQ-NAV-065, REQ-NAV-066). That is the end-to-end gate for the freeze and
+# the re-acquisition on data with an independent truth; the unit tests pin the
+# mechanics, this pins the resulting trajectory error.
+#
+# Everything below other than name/max_deadreckoning_sec/score is a copy of
+# config.yaml -- keep the two in sync when the dataset's sensor model changes.
+
+name: B_drone_coasting
+aiding: gnss # use GNSS
+init: auto   # NOT ref: only the auto-init latches the barometric height
+             # source (REQ-NAV-053), which is what puts the vertical
+             # re-anchor of REQ-NAV-066 on the re-acquisition path
+automotive_mode: 0
+chi2_disable: 0             # 1: disable outlier downweighting (diagnostics)
+chi2_reject_alpha: 0.05      # 0 -> outlier gate; e.g. 0.05 -> 95% global
+allow_unlimited_deadreckoning: 0  # 1: never expire the IMU-only coasting window
+max_deadreckoning_sec: 4.0  # shorter than the 10 s outage: the filter freezes
+gyro_bias_window_sec: 3.0   # static window to seed the initial gyro bias
+imu:
+  rpy_pred_stddev_rad_sqrts: 1.745329252e-05    # rigid mount
+  gyr_psd: 3.6e-07    # rad^2/s, gyro_noise_PSD
+  acc_psd: 0.0004    # (m/s^2)^2/Hz, accel_noise_PSD
+  gyr_bias_rw: 9.0e-05    # rad/s/sqrt(s), sqrt(gyro_bias_PSD)
+  acc_bias_rw: 0.003    # m/s^2/sqrt(s), sqrt(accel_bias_PSD)
+gnss:
+  leverarm_frd: [0.0, 0.0, 0.0]    # in IMU FRD body system to GNSS antenna
+  delay_ms: 0               # assumed fixed fix latency          [ms]
+  # This synthetic receiver reports a flat 2.50 m horizontal position
+  # accuracy, just over the library's 2.0 m 3D entry gate (REQ-NAV-051), so
+  # the auto-init would hold 3D off forever and nothing would ever bootstrap.
+  # Opened to the accuracy the dataset actually reports. config.yaml sidesteps
+  # this by starting from the reference instead.
+  start_max_horizontal_pos_stddev_m: 3.0
+score:
+  # ARS/AHRS checks off, unlike config.yaml: the sub-filters are unaffected
+  # by anything this config changes, and the ARS free-running yaw drift in
+  # particular is sensitive to the init path rather than to the coasting
+  # behaviour under test. config.yaml is where they are scored.
+  ahrs: 0
+  warmup_sec: 10
+  min_epochs: 100
+  # Regression guard-rails (~2x one known-good run), not accuracy claims.
+  # A trip means the freeze/re-acquisition got worse than the baseline, not
+  # that this is the true error budget. Deterministic synthetic data, so
+  # these stay tight; retune to a new known-good run after an intentional
+  # change. The position and ellipsoid-height numbers are the ones this
+  # dataset exists for: they are dominated by what the re-anchor at 72 s
+  # produces after 6 s of an inert filter.
+  lim_att_bias_deg: 0.8        # observed 0.364 (pitch)
+  lim_att_std_deg: 0.5         # observed 0.215 (roll)
+  lim_yaw_bias_deg: 2.5        # observed 1.004
+  lim_yaw_std_deg: 4.5         # observed 2.140
+  lim_pos_rms_m: 6.0           # observed 3.252
+  lim_ellipsoid_rms_m: 1.0     # observed 0.451 (vertical continuity, REQ-NAV-066)
+init_stddev:                         # initial-state 1-sigma (each 0 -> built-in default)
+  pos_init_stddev_m: 0             # [m]
+  vel_init_stddev_mps: 0           # [m/s]
+  rpy_init_stddev_rad_deg:  0      # [deg]
+  yaw_init_stddev_rad_deg:  0      # [deg] (0 -> rpy_init_stddev_rad_deg)
+  acc_bias_init_stddev_mps2: 0     # [m/s^2]
+  gyr_bias_init_stddev_rps_deg: 0  # [deg/s]
+
+mag:
+  enable: 1
+  stddev_ut: 0.3            # heading-measurement noise [uT] (0 -> default)
+  wmm_year: 2026.0          # decimal year for the declination lookup
+  estimate_bias: 1          # 18-state hard-iron bias
+  fixed_bias: [0,0,0]       # hard-iron [uT];  misalignment: soft-iron 3x3
+  misalignment: [1,0,0, 0,1,0, 0,0,1]
+baro:
+  enable: 1
+  stddev_m: 0.2087             # 0 -> baro_alt default
+  acc_bias_rw: 0.003          # accel-bias drift  [m/s^2/sqrt(Hz)], 0 -> default
+  acc_bias_init_mps2: 0   # INITIAL accel-bias stddev [m/s^2], 0 -> default
+  acc_noise_mps2_sqrthz: 0.02 # accel-noise density [m/s^2/sqrt(Hz)]
+  h_process_noise: 0      # direct height process noise [m/sqrt(Hz)], 0 -> default
+ahrs:                       # SHARED ARS/AHRS noise override (0 -> derived
+                             # from imu: above); both sub-filters consume
+                             # the same physical gyro/accelerometer
+  gyr_noise_psd: 0        # [rad/s/sqrt(Hz)], 0 -> default
+  gyr_bias_rw: 0          # [rad/s^2/sqrt(Hz)], 0 -> default
+  acc_noise_mps2: 0       # [m/s^2], 0 -> default
+inputs:                     # optional per-stream CSV filename overrides
+  imu:  IMU.csv             # each unset key -> the conventional <stream>.csv
+  ref:  ref.csv
+  gnss: GNSS.csv
+  mag:  Mag.csv
+  baro: Baro.csv

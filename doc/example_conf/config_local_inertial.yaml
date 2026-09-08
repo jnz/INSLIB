@@ -1,0 +1,39 @@
+# Usage: build/insrcv.exe --config config_local_inertial.yaml
+
+chi2_disable: 1
+allow_unlimited_deadreckoning: 1
+
+free_inertial_start:               # IMU dead reckoning only
+  enable: 1
+  lat_deg: 49.0                    # Approx. coordinates
+  lon_deg: 8.4
+  height_m: 118.0
+  stddev_m: 0.05                   # Precision of initial position
+
+init_stddev:
+  pos_init_stddev_m: 5.00
+  vel_init_stddev_mps: 0.05
+  yaw_init_stddev_rad_deg: 0.1
+
+baro:
+  enable: 0
+  acc_bias_init_mps2: 0.05
+  stddev_m: 2.0
+
+gnss:
+  enable: 0
+
+imu:
+  gyr_psd: 5.0e-07      # Adjust for actual sensor
+  acc_psd: 1.0e-05      # <- same
+  gyr_bias_rw: 1.5e-05  # <- same
+  acc_bias_rw: 0.0003   # <- same
+  zero_vel_stddev_mps: 0.05
+  auto_zupt_dwell_sec: 0.1
+  auto_zupt_static_gyr_stddev_deg: 0.35
+  auto_zupt_static_acc_stddev_mps2: 0.45
+  zero_rot_stddev_deg: 0.03
+
+mag:
+  enable: 0
+

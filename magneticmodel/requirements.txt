@@ -1,0 +1,6 @@
+# Build-time tooling for regenerating the World Magnetic Model lookup
+# tables (src/wmm_lut.h, src/wmm_test_vectors.h). NOT a runtime
+# dependency of the INSLIB package or python/replay.py -- only needed to
+# run `make wmm` when the WMM epoch changes or the model is updated.
+#   pip install -r magneticmodel/requirements.txt
+pygeomag>=1.1

@@ -1,0 +1,56 @@
+# clang-format configuration for INSLIB (see coding_style.md).
+# Tuned for clang-format >= 14.
+---
+Language: Cpp
+Standard: c++03   # closest to C11 semantics: no C++11-specific spacing rules
+
+# --- Layout basics (coding_style.md §3) --------------------------------------
+ColumnLimit: 100
+IndentWidth: 4
+UseTab: Never
+BreakBeforeBraces: Allman
+
+# --- Short constructs: keep existing one-liners ------------------------------
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortEnumsOnASingleLine: false
+
+# --- Pointers / casts ---------------------------------------------------------
+PointerAlignment: Left
+SpaceAfterCStyleCast: false
+
+# --- Alignment (struct members + trailing /**< ... */ comments) --------------
+AlignTrailingComments: true
+AlignConsecutiveMacros: Consecutive
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveDeclarations: Consecutive
+AlignAfterOpenBracket: Align
+AlignOperands: Align
+AlignEscapedNewlines: Left
+
+# --- Function parameters ------------------------------------------------------
+BinPackParameters: true
+BinPackArguments: true
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowAllArgumentsOnNextLine: true
+PenaltyReturnTypeOnItsOwnLine: 1000
+
+# --- Comments / includes: hands off ------------------------------------------
+ReflowComments: true
+SortIncludes: Never
+
+# --- Misc ---------------------------------------------------------------------
+IndentCaseLabels: false
+IndentPPDirectives: None
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+SpaceBeforeParens: ControlStatements
+SpacesBeforeTrailingComments: 1
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: true
+ContinuationIndentWidth: 4
+IndentWrappedFunctionNames: false
+SeparateDefinitionBlocks: Leave

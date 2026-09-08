@@ -1,0 +1,25 @@
+# Static analysis config, run via `make clang-tidy` over production code
+# only: src/, datasets/, python/csrc/ -- not tests/ (same scope as
+# `make cppcheck` -- different tool, different bug classes; both
+# complement -Wall -Wextra).
+#
+# Exclusions:
+#   bugprone-easily-swappable-parameters  too noisy/subjective for a
+#     numerical C API with many legitimate multi-float-pointer signatures
+#   clang-analyzer-security.insecureAPI.* flags every memset/memcpy as
+#     "insecure" (wants memset_s/memcpy_s, not portably available); not
+#     actionable here
+#
+# False positives get an inline `// NOLINT(check-name)` /
+# `// NOLINTNEXTLINE(check-name)` right above the flagged line (see
+# tests/test_baro.c) rather than a blanket exclusion.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.*,
+  performance-*,
+  portability-*
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(^|/)(src|datasets|python/csrc)/'

@@ -1,0 +1,30 @@
+07_outdoor_only -- 22 Aug 2026, Spain
+
+Handheld, outdoors throughout but deliberately in awkward places: along the
+pool, along the house wall (with the unit moving in the hand), up the stairs, a
+lap around the courtyard, up the outside stairs to the terrace, back down,
+along the house again and back to the start at the pool. Open sky the whole
+time, but often close to the building and under trees and palms. Start and end
+are the same point to about 5 cm, with a standstill at each.
+
+Heading on the straight legs is 310 deg true (measured with a phone compass).
+Fast turns at the corners.
+
+The counterpart to 06: same hardware and the same corrections, without the
+indoor stretch, so the two isolate what the building does.
+
+ref_ardupilot.csv is ArduPilot EKF3 fed the same measurements through the same
+calibration, i.e. a second estimator rather than a ground truth. Position
+errors scored against it are the difference between two filters.
+
+imu.csv is block averaged from the original 783 Hz to 98 Hz; the sensor is
+internally filtered, so the full rate carried no additional information.
+
+Sensors:
+ - ICM-45686 TDK InvenSense IMU
+ - LIS3MDL magnetometer
+ - BMP581 Bosch barometer
+ - u-blox X20P (ArduSimple board), L1/L2/L5/L patch antenna,
+   u-blox Point Perfect Flex (SPARTN) corrections
+ - GNSS antenna lever arm to the IMU, body FRD: [0.02, 0.28, 0.01] m
+ - IMU and magnetometer calibration taken at 34 degC

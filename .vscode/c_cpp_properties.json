@@ -1,0 +1,37 @@
+{
+    // IntelliSense only (browsing/squiggles). The real build flags live in
+    // the Makefile; keep includePath in sync with its INCLUDES variable.
+    "configurations": [
+        {
+            "name": "INSLIB (Linux/gcc)",
+            "includePath": [
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/KFCore/c",
+                "${workspaceFolder}/KFCore/tests"
+            ],
+            "defines": ["_GNU_SOURCE"],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        },
+        {
+            // Pick this one via the language-status item in the status bar
+            // (or C/C++: Select a Configuration) when working on Windows.
+            // compilerPath is resolved from PATH, so it works with any
+            // MinGW-w64 / MSYS2 install without hardcoding a location.
+            "name": "INSLIB (Windows/MinGW)",
+            "includePath": [
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/KFCore/c",
+                "${workspaceFolder}/KFCore/tests"
+            ],
+            "defines": ["_GNU_SOURCE", "_WIN32"],
+            "compilerPath": "gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-gcc-x64"
+        }
+    ],
+    "version": 4
+}

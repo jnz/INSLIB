@@ -1,0 +1,95 @@
+<svg viewBox="0 0 1180 500" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <!-- Explicit background: without this, dark text on a transparent
+       background is nearly unreadable on GitHub's dark theme. -->
+  <rect x="0" y="0" width="1180" height="500" fill="#ffffff"/>
+
+  <!-- ===== Column 1: Inputs ===== -->
+  <text x="130" y="28" text-anchor="middle" font-size="15" font-weight="600" fill="#1e293b">Sensors / Inputs</text>
+
+  <g font-size="14">
+    <rect x="30" y="45"  width="200" height="52" rx="8" fill="#eef1f5" stroke="#94a3b8"/>
+    <text x="130" y="76" text-anchor="middle" fill="#1e293b">IMU (accel + gyro)</text>
+
+    <rect x="30" y="107" width="200" height="52" rx="8" fill="#eef1f5" stroke="#94a3b8"/>
+    <text x="130" y="138" text-anchor="middle" fill="#1e293b">GNSS / GPS (pos, vel)</text>
+
+    <rect x="30" y="169" width="200" height="52" rx="8" fill="#eef1f5" stroke="#94a3b8"/>
+    <text x="130" y="200" text-anchor="middle" fill="#1e293b">Magnetometer</text>
+
+    <rect x="30" y="231" width="200" height="52" rx="8" fill="#eef1f5" stroke="#94a3b8"/>
+    <text x="130" y="262" text-anchor="middle" fill="#1e293b">Barometer</text>
+
+    <rect x="30" y="293" width="200" height="52" rx="8" fill="#eef1f5" stroke="#94a3b8"/>
+    <text x="130" y="316" text-anchor="middle" fill="#1e293b">Local position / yaw</text>
+    <text x="130" y="333" text-anchor="middle" fill="#64748b" font-size="11">(mocap, UWB, OBD-II speed)</text>
+
+    <rect x="30" y="355" width="200" height="52" rx="8" fill="#eef1f5" stroke="#94a3b8"/>
+    <text x="130" y="378" text-anchor="middle" fill="#1e293b">Zero-velocity / zero-rotation</text>
+    <text x="130" y="395" text-anchor="middle" fill="#64748b" font-size="11">(virtual, e.g. stance detection)</text>
+  </g>
+
+  <!-- Bus line collecting all inputs -->
+  <path d="M 230 71  H 270" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 230 133 H 270" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 230 195 H 270" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 230 257 H 270" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 230 319 H 270" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 230 381 H 270" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 270 71 V 381" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 270 226 H 310" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ===== Column 2: parallel filters ===== -->
+  <text x="425" y="28" text-anchor="middle" font-size="15" font-weight="600" fill="#1e293b">Parallel filters</text>
+
+  <rect x="310" y="75"  width="230" height="130" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="425" y="130" text-anchor="middle" font-size="16" font-weight="700" fill="#1e3a8a">INS</text>
+  <text x="425" y="152" text-anchor="middle" font-size="12" fill="#1e3a8a">error-state Kalman filter</text>
+  <text x="425" y="169" text-anchor="middle" font-size="12" fill="#1e3a8a">15-state (+3 mag bias, optional)</text>
+  <text x="425" y="186" text-anchor="middle" font-size="12" fill="#1e3a8a">main navigation solution</text>
+
+  <rect x="310" y="235" width="230" height="90" rx="10" fill="#eef1f5" stroke="#64748b" stroke-width="1.5"/>
+  <text x="425" y="270" text-anchor="middle" font-size="15" font-weight="700" fill="#1e293b">AHRS / ARS</text>
+  <text x="425" y="291" text-anchor="middle" font-size="12" fill="#334155">5/6-state attitude filter</text>
+  <text x="425" y="308" text-anchor="middle" font-size="12" fill="#334155">cross-check + fallback</text>
+
+  <rect x="310" y="355" width="230" height="90" rx="10" fill="#eef1f5" stroke="#64748b" stroke-width="1.5"/>
+  <text x="425" y="390" text-anchor="middle" font-size="15" font-weight="700" fill="#1e293b">baro_alt</text>
+  <text x="425" y="411" text-anchor="middle" font-size="12" fill="#334155">3-state vertical channel</text>
+  <text x="425" y="428" text-anchor="middle" font-size="12" fill="#334155">+ 1-state baro/GNSS offset</text>
+
+  <!-- filters -> nav_suite -->
+  <path d="M 540 140 H 580" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 540 280 H 580" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 540 400 H 580" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 580 140 V 400" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 580 270 H 620" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ===== Column 3: nav_suite wrapper ===== -->
+  <text x="735" y="28" text-anchor="middle" font-size="15" font-weight="600" fill="#1e293b">Wrapper</text>
+
+  <rect x="620" y="150" width="230" height="240" rx="10" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+  <text x="735" y="245" text-anchor="middle" font-size="16" font-weight="700" fill="#4c1d95">nav_suite</text>
+  <text x="735" y="267" text-anchor="middle" font-size="12" fill="#4c1d95">runs all three in parallel</text>
+  <text x="735" y="284" text-anchor="middle" font-size="12" fill="#4c1d95">mode arbitration</text>
+  <text x="735" y="301" text-anchor="middle" font-size="12" fill="#4c1d95">vertical datum alignment</text>
+
+  <!-- nav_suite -> output -->
+  <path d="M 850 270 H 900" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ===== Column 4: output ===== -->
+  <text x="1015" y="28" text-anchor="middle" font-size="15" font-weight="600" fill="#1e293b">Output</text>
+
+  <rect x="900" y="215" width="250" height="110" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="1025" y="250" text-anchor="middle" font-size="15" font-weight="700" fill="#14532d">NED position / velocity</text>
+  <text x="1025" y="270" text-anchor="middle" font-size="15" font-weight="700" fill="#14532d">attitude (quaternion)</text>
+  <text x="1025" y="295" text-anchor="middle" font-size="12" fill="#166534">+ health / status flags</text>
+
+  <!-- footer note -->
+  <text x="590" y="480" text-anchor="middle" font-size="12" fill="#64748b">No heap allocation, no OS dependency &#8212; runs on bare-metal embedded targets or a desktop.</text>
+</svg>

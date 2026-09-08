@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-all:
+    name: check-all (build, tests, reqs, format, cppcheck, clang-tidy, doxygen, coverage)
+    # Pinned (not ubuntu-latest, and not 24.04): clang-format/cppcheck/
+    # doxygen results depend on their exact version. ubuntu-22.04's
+    # clang-format package (14.0.0-1ubuntu1.1) is a normal stable Ubuntu
+    # package - unlike 24.04's, which is an experimental snapshot build
+    # from universe ("~exp" suffix) that can drift on its own. This also
+    # matches the clang-format already available in a stock Ubuntu 22.04
+    # WSL install, so local and CI results agree without installing
+    # anything extra.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cppcheck clang-tidy clang-format lcov doxygen
+
+      - name: Print toolchain versions
+        run: |
+          clang-format --version
+          cppcheck --version
+          clang-tidy --version
+          doxygen --version
+
+      - name: Install Python deps (for datasets/check_simulated.py + requirements/check_reqs.py)
+        run: python3 -m pip install --user pyyaml numpy
+
+      - name: make check-all
+        run: make check-all
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage/
+          if-no-files-found: ignore
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/coverage.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload doxygen docs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doxygen-html
+          path: doc/doxygen/
+          if-no-files-found: ignore
+
+  asan:
+    name: test-asan (ASan/UBSan)
+    # Pinned (not ubuntu-latest): clang-format/cppcheck/doxygen results
+    # depend on their exact version, and ubuntu-latest silently moves to a
+    # newer Ubuntu release over time, which then reports new warnings on
+    # unrelated commits. Bump deliberately, not implicitly.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: make test-asan
+        run: make test-asan

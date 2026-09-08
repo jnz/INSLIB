@@ -1,0 +1,112 @@
+# Reference configuration for the ins CSV runner
+# (python3 -m INSLIB runner.yaml  /  inslib-run runner.yaml).
+#
+# Only the 'imu' section is required; everything else is optional and
+# falls back to the documented defaults. Relative file paths are
+# resolved against this YAML's directory.
+#
+# Column mappings: 'col'/'cols' take a 0-based index OR a header name
+# (if the CSV starts with a non-numeric header row). Lines starting
+# with '#' are skipped; comma / semicolon / whitespace delimited.
+
+imu:
+  file: imu.csv
+  # Defaults: time col 0 [us], gyr cols 1-3 [rad/s], acc cols 4-6 [m/s2].
+  time: {col: 0, unit: us}           # unit: s | ms | us
+  gyr:  {cols: [1, 2, 3], unit: rad/s}   # rad/s | deg/s
+  acc:  {cols: [4, 5, 6], unit: m/s2}    # m/s2  | g
+  # IMU noise (variance/PSD) fed to the filter each epoch:
+  acc_var: [0.01, 0.01, 0.01]        # [(m/s^2)^2]
+  gyr_var: [1.0e-4, 1.0e-4, 1.0e-4]  # [(rad/s)^2]
+
+gnss:
+  file: gnss.csv
+  format: llh_deg                    # llh_deg | llh_rad | ecef
+  time: {col: 0, unit: us}
+  pos:  {cols: [1, 2, 3]}            # lat, lon, h (or ECEF x,y,z)
+  # Per-epoch accuracy -- pick ONE of the following (priority top-down),
+  # or omit all and use the scalar fallback 'stddev' below:
+  stddev_ned: {cols: [4, 5, 6], unit: m}     # NED 1-sigma per epoch
+  # cov_ned:   {cols: [4,5,6,7,8,9,10,11,12]}  # full 3x3 row-major [m^2]
+  # Velocity (optional; same pattern):
+  # vel_ned:        {cols: [7, 8, 9], unit: m/s}
+  # vel_stddev_ned: {cols: [10, 11, 12]}
+  # vel_cov_ned:    {cols: [...9 cols...]}      # full 3x3 row-major
+  # cov_pos_vel:    {cols: [...9 cols...]}      # pos/vel cross block
+  #                 -> together: the full 6x6 covariance of [pos; vel]
+  stddev: {hor_m: 1.0, ver_m: 2.0, vel_mps: 0.2}  # fallback if no cols
+  leverarm_frd: [0.0, 0.0, 0.0]      # antenna lever arm, body FRD [m]
+  delay_ms: 0                        # fix age; >0 -> history-anchored fusion
+
+baro:
+  file: baro.csv
+  time: {col: 0, unit: us}
+  pressure: {col: 1, unit: Pa}       # Pa | hPa | mbar | kPa
+  stddev_m: 0.0                      # altitude 1-sigma [m]; 0 -> default
+
+mag:
+  file: mag.csv
+  time: {col: 0, unit: us}
+  mag: {cols: [1, 2, 3], unit: uT}   # uT | gauss | mGauss | nT
+  var: [1.0, 1.0, 1.0]               # measurement variance [uT^2]
+
+# World Magnetic Model: reference yaw to TRUE north + arm the field gate.
+# Either give a position, or leave lat/lon out to use the first GNSS fix.
+wmm:
+  year: 2026.5
+  # lat_deg: 48.783
+  # lon_deg: 9.181
+
+# Filter configuration -- any ins.Config field, plus _deg conveniences
+# (rpy_init_rad_deg, rpy_init_stddev_rad_deg, ...).
+# auto_init (default true) bootstraps from the first usable fix.
+filter:
+  auto_init: true
+  # estimate_mag_bias: true          # 18-state mag hard-iron estimation
+  # allow_unlimited_deadreckoning: true
+  # acc_bias_pred_stddev_mps2_sqrts: 1.0e-4     # [(m/s^2)/sqrt(s)] random walk
+  # gyr_bias_pred_stddev_rps_sqrts: 1.0e-6      # [(rad/s)/sqrt(s)] random walk
+  # Initial-state uncertainty (0/omitted -> ins's built-in default,
+  # tuned for a well-surveyed stationary start -- widen these if the
+  # initial position/attitude here is itself just a GNSS fix, not a
+  # surveyed/higher-grade reference):
+  # pos_init_stddev_m: 5.0           # [m]
+  # vel_init_stddev_mps: 0.2         # [m/s]
+  # rpy_init_stddev_rad_deg: [3.0, 3.0, 8.0]  # [deg] roll/pitch/yaw, independent
+  # acc_bias_init_stddev_mps2: 0.05  # [m/s^2]
+  # gyr_bias_init_stddev_rps_deg: 0.5 # [deg/s]
+  # Automotive mode (REQ-NAV-034): derive yaw from the GNSS course over
+  # ground (non-holonomic assumption -- the vehicle points where it goes).
+  # Off by default; only valid for a wheeled/tracked vehicle, NOT an
+  # aircraft (coordinated flight aligns heading with the *airspeed*
+  # vector, not GNSS's *ground* velocity vector -- wind drift breaks the
+  # assumption regardless of speed).
+  # automotive_mode: true
+  # automotive_min_speed_mps: 2.0    # 0/omitted -> ins's 2 m/s default
+  # Floor on the fused yaw stddev regardless of speed/velocity noise (0/
+  # omitted -> ins's 5 deg default). Raise this where course-over-
+  # ground isn't as trustworthy as a car's -- e.g. an aircraft still
+  # flying coordinated, where wind drift (crab angle) separates heading
+  # from ground track independent of speed: set it to a conservative
+  # estimate of that crab angle so the fusion only ever acts as a weak
+  # long-term anchor against free-yaw drift, never claiming car-grade
+  # heading precision.
+  # automotive_min_yaw_stddev_deg: 15.0  # illustrative only -- derive the
+                                          # actual number from YOUR
+                                          # platform (e.g. its wind-speed-
+                                          # to-airspeed ratio), not this
+                                          # example value
+  # Disable chi2-based outlier downweighting library-wide (REQ-VER-011).
+  # Diagnostics/analysis only (e.g. comparing raw vs. downweighted fusion
+  # on a known outlier) -- off by default, leave it off for normal use.
+  # chi2_disable: true
+
+output:
+  plotjuggler: true                  # UDP JSON on pj_port
+  pj_port: 9870
+  mavlink: false                     # ATTITUDE, LOCAL_POSITION_NED, ... on mav_port
+  mav_port: 14550
+  telemetry_hz: 50                   # max publish rate (sim time)
+  csv: solution.csv                  # per-epoch solution CSV ('' -> off)
+  csv_hz: 0                          # decimate the CSV; 0 -> every epoch
+  # flight_log: flight.ndjson        # mirror the PlotJuggler stream

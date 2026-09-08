@@ -1,0 +1,96 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "make (build all tests)",
+            "type": "shell",
+            "command": "make",
+            "args": [],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make test",
+            "type": "shell",
+            "command": "make",
+            "args": ["test"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make reqs",
+            "type": "shell",
+            "command": "make",
+            "args": ["reqs"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "make test_core",
+            "type": "shell",
+            "command": "make",
+            "args": ["test_core"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make test_math",
+            "type": "shell",
+            "command": "make",
+            "args": ["test_math"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make test_ahrs",
+            "type": "shell",
+            "command": "make",
+            "args": ["test_ahrs"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make test_baro",
+            "type": "shell",
+            "command": "make",
+            "args": ["test_baro"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make datasets-urbannav",
+            "type": "shell",
+            "command": "make",
+            "args": ["replay"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make insrcv",
+            "type": "shell",
+            "command": "make",
+            "args": ["insrcv"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make replay_i2nav",
+            "type": "shell",
+            "command": "make",
+            "args": ["replay_i2nav"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "make clean",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": []
+        }
+    ]
+}

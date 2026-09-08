@@ -1,0 +1,47 @@
+<svg viewBox="0 0 980 420" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="980" height="420" fill="#ffffff"/>
+
+  <!-- ===== Column 1: UDP input ===== -->
+  <text x="140" y="28" text-anchor="middle" font-size="15" font-weight="600" fill="#1e293b">Input</text>
+
+  <rect x="30" y="140" width="220" height="110" rx="10" fill="#eef1f5" stroke="#64748b" stroke-width="1.5"/>
+  <text x="140" y="180" text-anchor="middle" font-size="14" font-weight="700" fill="#1e293b">UDP sensor data</text>
+  <text x="140" y="200" text-anchor="middle" font-size="11" fill="#334155">UBX-based protocol</text>
+  <text x="140" y="217" text-anchor="middle" font-size="11" fill="#334155">port 29800 (default)</text>
+  <text x="140" y="236" text-anchor="middle" font-size="10" fill="#64748b">see tools/inslib_protocol.md</text>
+
+  <!-- ===== Column 2: live filter ===== -->
+  <text x="425" y="28" text-anchor="middle" font-size="15" font-weight="600" fill="#1e293b">Live filter</text>
+
+  <path d="M 250 195 H 310" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow2)"/>
+
+  <rect x="310" y="140" width="230" height="110" rx="10" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="425" y="180" text-anchor="middle" font-size="16" font-weight="700" fill="#1e3a8a">insrcv</text>
+  <text x="425" y="200" text-anchor="middle" font-size="12" fill="#1e3a8a">nav_suite, live</text>
+  <text x="425" y="217" text-anchor="middle" font-size="11" fill="#1e3a8a">listens on UDP :29800</text>
+  <text x="425" y="234" text-anchor="middle" font-size="10" fill="#3b5998">(default, --udp-port)</text>
+
+  <!-- ===== Column 3: telemetry output ===== -->
+  <text x="775" y="28" text-anchor="middle" font-size="15" font-weight="600" fill="#1e293b">Telemetry output</text>
+
+  <path d="M 540 195 H 600" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 600 95  V 305" stroke="#475569" stroke-width="1.5" fill="none"/>
+  <path d="M 600 95  H 650" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow2)"/>
+  <path d="M 600 305 H 650" stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow2)"/>
+
+  <rect x="650" y="60"  width="250" height="70" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="775" y="88"  text-anchor="middle" font-size="14" font-weight="700" fill="#14532d">PlotJuggler</text>
+  <text x="775" y="106" text-anchor="middle" font-size="11" fill="#166534">UDP :9870, JSON (default)</text>
+
+  <rect x="650" y="270" width="250" height="70" rx="10" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="775" y="298" text-anchor="middle" font-size="14" font-weight="700" fill="#14532d">MAVLink 2 ground station</text>
+  <text x="775" y="316" text-anchor="middle" font-size="11" fill="#166534">UDP :14550, opt-in --mavlink</text>
+
+  <text x="490" y="395" text-anchor="middle" font-size="12" fill="#64748b">UDP decouples the data source from the filter &#8212; any process that emits the protocol above can feed insrcv.</text>
+</svg>

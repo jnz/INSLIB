@@ -1,0 +1,29 @@
+# Runtime deps for python/replay.py (dataset YAML + MAVLink output + --plot).
+# Install with: pip install -r python/requirements-replay.txt
+# (equivalent to: pip install -e "python/[replay]")
+pyyaml
+pymavlink
+matplotlib
+simplekml
+
+# UBX/serial port related
+pyserial
+pyubx2
+
+# Runtime dep for tools/inslib_obd_speed.py --ble/--scan (BLE OBD-II
+# dongles). Not needed for a Bluetooth Classic/SPP dongle, which the OS
+# exposes as a serial port and pyserial above already covers.
+bleak
+
+# Runtime deps for python/inspostgui.py (post-processing GUI) and
+# tools/inslib_calib_gui.py (guided IMU calibration).
+# Install with: pip install -r python/requirements-inspostgui.txt
+pyyaml
+numpy
+PyQt6
+pyqtgraph
+PyOpenGL
+# optional extras:
+matplotlib    # "Export PDF" (ins_plots multi-page report)
+simplekml     # "Export KML" (ins_kml Google Earth track)
+# numpy-stl   # 3D vehicle model (vehicle.stl), a box is drawn without it

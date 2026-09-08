@@ -1,0 +1,50 @@
+# Packaging metadata for the INSLIB Python binding.
+#
+# STATUS: editable install works today against a PREBUILT shared library:
+#     make pylib               # builds python/INSLIB/libINSLIB.so
+#     pip install -e python/   # links the package (ships the built .so)
+#
+# The remaining step for a real `pip install INSLIB` (building the C sources
+# into per-platform wheels) needs a compiling backend such as
+# scikit-build-core or meson-python -- deliberately deferred. The ctypes +
+# flat-C-ABI design means one wheel per platform (not per Python version).
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "INSLIB"
+version = "0.1.0"
+description = "Python bindings and telemetry for the INSLIB navigation filter"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Jan Zwiener", email = "jan@zwiener.org" }]
+license = "AGPL-3.0-or-later"
+keywords = ["navigation", "kalman-filter", "ins", "gnss", "imu", "ahrs"]
+
+[project.optional-dependencies]
+mavlink = ["pymavlink"]
+plot = ["matplotlib"]
+kml = ["simplekml"]
+replay = ["pyyaml", "pymavlink", "matplotlib", "simplekml"]
+# The host-side tools in tools/: pyserial for the serial link,
+# pyubx2 for GNSS UBX decode, pymavlink for --mavlink.
+recv = ["pyserial", "pyubx2", "pymavlink"]
+
+# The YAML-configured CSV runner: inslib-run config.yaml
+# (equivalent: python3 -m INSLIB config.yaml). Needs the 'replay' extra
+# (PyYAML; pymavlink only for MAVLink output).
+[project.scripts]
+inslib-run = "INSLIB.runner:main"
+
+[project.urls]
+Homepage = "https://github.com/jnz/INSLIB"
+
+[tool.setuptools]
+packages = ["INSLIB"]
+
+# Ship the prebuilt shared library (from `make pylib`) as package data so
+# ctypes finds it next to the modules after install.
+[tool.setuptools.package-data]
+INSLIB = ["*.so", "*.dylib", "*.dll"]

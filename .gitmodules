@@ -1,0 +1,3 @@
+[submodule "KFCore"]
+	path = KFCore
+	url = https://github.com/jnz/KFCore.git

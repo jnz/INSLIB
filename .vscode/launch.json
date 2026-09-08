@@ -1,0 +1,42 @@
+{
+    // All configurations debug with gdb, so gdb must be on PATH:
+    //   Linux    apt install gdb
+    //   Windows  comes with MinGW-w64 / MSYS2. VS Code inherits PATH at
+    //            startup, so add the toolchain's bin directory to your USER
+    //            PATH (not just a shell) and restart VS Code -- otherwise
+    //            the preLaunchTask cannot find gcc either. `make` prints
+    //            the same hint when it cannot find a compiler.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // Live receiver: listens on UDP and publishes to PlotJuggler on
+            // 127.0.0.1:9870. It does NOT open the serial port -- start a
+            // sender alongside it, in a terminal:
+            //
+            //   python tools/inslib_hub.py COM4          (live hardware)
+            //   python tools/inslib_replay_udp.py cap.ubx  (recorded session)
+            //
+            // Without one it simply sits idle on the socket, which is a
+            // fine place to put a breakpoint and wait.
+            "name": "Debug insrcv (UDP -> PlotJuggler)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/insrcv.exe",
+            "args": ["--udp-port", "${input:udpPort}", "--config", "config.yaml"],
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "setupCommands": [
+                { "text": "-enable-pretty-printing", "ignoreFailures": true }
+            ],
+            "preLaunchTask": "make insrcv"
+        },
+    ],
+    "inputs": [
+        {
+            "id": "udpPort",
+            "type": "promptString",
+            "description": "UDP port to listen on (must match the hub's --fanout):",
+            "default": "29800"
+        }
+    ]
+}

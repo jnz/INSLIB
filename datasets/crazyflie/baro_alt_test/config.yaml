@@ -1,0 +1,36 @@
+# test for baro_alt
+name: baro_uavlab
+aiding: none    # analyze vertical channel only
+init: ref
+allow_unlimited_deadreckoning: 1    # aiding: no GNSS/lighthouse fix available, so without this INS would not start
+gyro_bias_window_sec: 0.5           # stationary at the start
+
+imu:
+  auto_zupt_dwell_sec: 1.0
+  auto_zupt_min_interval_sec: 1.0
+  rpy_pred_stddev_rad_sqrts: 1.745329252e-05
+  gyr_psd: 1.22e-07     # FIXME: generic default, not measured
+  acc_psd: 1.18e-05     # FIXME: generic default, not measured
+  gyr_bias_rw: 2.0e-06  # FIXME: generic default, not measured
+  acc_bias_rw: 3.0e-05  # FIXME: generic default, not measured
+
+baro:
+  enable: 1
+  stddev_m: 0.5
+
+score:
+  ahrs: 0    # only the baro_alt height channel is the target of this test
+  warmup_sec: 2
+  min_epochs: 1000
+  lim_att_bias_deg: 0.5     # observed 0.028
+  lim_att_std_deg: 1.2      # observed 0.569
+  lim_yaw_bias_deg: 14      # observed 6.736
+  lim_yaw_std_deg: 8        # observed 3.431
+  lim_pos_rms_m: 14.0       # observed 6.813
+  # the actual regression gate: baro_alt height vs. lighthouse ref_z
+  # (ref.csv h_m, see the converter's module docstring), ~2x an observed
+  # good-run baseline -> a trip means baro_alt got worse, not an absolute
+  # accuracy claim.
+  lim_baro_bias_m: 0.2      # observed 0.090
+  lim_baro_max_m: 0.45      # observed 0.214
+  lim_baro_rms_m: 0.22      # observed 0.104

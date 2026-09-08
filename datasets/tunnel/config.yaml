@@ -1,0 +1,76 @@
+# Car through a road tunnel: a u-blox NAV-PVT recording with a 94 s
+# total GNSS blackout (t=5122.7 to 5217.1 s), trimmed to +-3 min around it.
+# The only real-sensor recording here with a blackout long enough to drive the
+# filter through the whole sequence: coasting window expires -> inert
+# (REQ-NAV-064) -> the fixes come back too poor for the stay gate -> 3D given
+# up and re-armed (REQ-NAV-052) -> re-bootstrap keeping the n-frame origin
+# (REQ-NAV-062). A synthetic dataset can reproduce the arithmetic of that, not
+# the fix quality a receiver actually emits on the first seconds out of a
+# tunnel, which is what decides which of those branches is taken.
+#
+# WHAT THE REFERENCE IS. ref.csv is the GNSS solution again, i.e. the SAME
+# data that feeds gnss.csv, and its roll/pitch/yaw columns are a hardcoded
+# 0/0/0 placeholder.
+#
+#   - attitude is not scored (score: attitude: 0)
+#   - the position number is SELF-CONSISTENCY against the aiding, not
+#     independent accuracy, the same caveat datasets/fog carries.
+#
+# The chi2 outlier gate is active (no chi2_disable), which
+# also makes this the end-to-end gate for REQ-NAV-067. The recording starts
+# with the car already at 14 m/s and no heading source, so ins bootstraps with
+# yaw unknown - a case where a too-loose gyro-bias prior routes the initial
+# heading correction into the gyro z bias, and the gate then locks out the
+# corrections that would unwind it. REQ-NAV-067 is addressing such a situation.
+name: tunnel
+aiding: gnss
+init: auto
+automotive_mode: 1
+max_deadreckoning_sec: 40.0
+imu:
+  gyr_psd: 5.0e-07
+  acc_psd: 1.0e-05
+  gyr_bias_rw: 1.0e-05
+  acc_bias_rw: 0.0001
+  pos_pred_stddev_m_sqrts: 0.05
+  vel_pred_stddev_mps_sqrts: 0.01
+  rpy_pred_stddev_rad_sqrts: 1.745329252e-05    # rigid mount
+  zero_vel_stddev_mps: 0.02
+  zero_rot_stddev_deg: 0.5
+  auto_zupt_static_gyr_stddev_deg: 0.8
+  auto_zupt_static_acc_stddev_mps2: 0.25
+  auto_zupt_static_gyr_deg: 4.0
+  auto_zupt_static_acc_mps2: 0.5
+  auto_zupt_max_vel_mps: 1.5
+  auto_zupt_max_vel_stddev_mps: 0.5
+  auto_zupt_dwell_sec: 1.0
+  auto_zupt_min_interval_sec: 1.0
+  auto_zupt_disable: 0.0
+  auto_zupt_velocity_blind_disable: 0.0
+gnss:
+  leverarm_frd:
+  - -0.01
+  - 0.04
+  - -0.015
+  pos_stddev_fallback_m:
+  - 0.8
+  - 1.5
+  vel_stddev_fallback_mps: 0.2
+  delay_ms: 200.0
+baro:
+  enable: 1
+  stddev_m: 0.8
+  acc_bias_init_mps2: 0.08
+score:
+  warmup_sec: 30.0
+  min_epochs: 2000
+  ahrs: 0
+  attitude: 0
+  # The one meaningful gate on this dataset: how well the filter lands once
+  # fixes come back. It is a SELF-CONSISTENCY number (ref.csv IS the aiding),
+  # dominated by the re-acquisition transient at the tunnel exit rather than
+  # by steady-state tracking, which is exactly what makes it useful here.
+  # ~2x a known-good run, retune after an intentional change.
+  lim_pos_rms_m: 9              # observed 4.239
+  lim_ellipsoid_rms_m: 5        # observed 2.072
+automotive_min_yaw_stddev_deg: 15.0

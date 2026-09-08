@@ -1,0 +1,86 @@
+/** @file doxygen_modules.dox
+ *  @brief Doxygen-only: main page and the module (group) hierarchy.
+ *
+ *  This file carries no code. It defines the top-level @ref inslib module and
+ *  its per-component sub-modules so the generated HTML "Topics/Modules" page is
+ *  a useful table of contents. Each public header adds its declarations to the
+ *  matching group with `@addtogroup <name> ... @{ ... @}`.
+ */
+
+/**
+ * @mainpage INSLIB — Error-state Kalman filter library
+ *
+ * INSLIB is a portable C11 (no heap, no OS) navigation library:
+ *
+ * - @ref ins — 15/18-state error-state Kalman filter (ESKF) fusing
+ *   GNSS/IMU/magnetometer/local-position.
+ * - @ref ahrs — standalone 5/6-state attitude (AHRS) / rate (ARS) filter.
+ * - @ref baro_alt — baro/accelerometer vertical-channel filter plus the
+ *   baro-to-ellipsoid offset filter.
+ * - @ref nav_suite — wrapper running ins + two AHRS + baro_alt in parallel
+ *   with mode arbitration and a common vertical datum.
+ * - @ref geodetic — reusable geodesy and Hamilton-quaternion math.
+ * - @ref magnetic_model — World Magnetic Model lookup (declination /
+ *   inclination / NED reference field).
+ * - @ref log — optional, fully disable-able debug logging facility.
+ *
+ * Conventions: column-major matrices, Hamilton quaternions (q[0]=w), body
+ * frame FRD, navigation frame NED, Tait-Bryan ZYX roll/pitch/yaw, timestamps
+ * in int64 microseconds. See the design document (doc/INSLIB_design.pdf) for
+ * the full architecture.
+ *
+ * Start at the @ref inslib module for the grouped API reference.
+ */
+
+/**
+ * @defgroup inslib INSLIB API
+ * @brief Top-level grouping of the INSLIB public API by component.
+ */
+
+/**
+ * @defgroup ins ins — 15/18-state ESKF
+ * @ingroup inslib
+ * @brief GNSS/IMU/magnetometer/local-position fusion core (ins.h).
+ */
+
+/**
+ * @defgroup ahrs ahrs — 5/6-state attitude filter
+ * @ingroup inslib
+ * @brief Standalone AHRS/ARS attitude and gyro-bias estimation (ahrs.h).
+ */
+
+/**
+ * @defgroup baro_alt baro_alt — vertical channel
+ * @ingroup inslib
+ * @brief Baro/accelerometer height filter + baro-to-ellipsoid offset (baro_alt.h).
+ */
+
+/**
+ * @defgroup nav_suite nav_suite — multi-filter wrapper
+ * @ingroup inslib
+ * @brief ins + two AHRS + baro_alt with mode arbitration (nav_suite.h).
+ */
+
+/**
+ * @defgroup geodetic geodetic_toolbox — geodesy & quaternion math
+ * @ingroup inslib
+ * @brief Reusable geodesy and Hamilton-quaternion helpers (geodetic_toolbox.h).
+ */
+
+/**
+ * @defgroup magnetic_model magnetic_model — World Magnetic Model
+ * @ingroup inslib
+ * @brief WMM declination/inclination/field-strength lookup (magnetic_model.h).
+ */
+
+/**
+ * @defgroup sensor_defaults sensor_defaults — shared IMU noise fallbacks
+ * @ingroup inslib
+ * @brief Shared IMU noise fallback constants for ins and ahrs (sensor_defaults.h).
+ */
+
+/**
+ * @defgroup log log — optional debug logging
+ * @ingroup inslib
+ * @brief Compile-time/runtime-filtered, redirectable debug logging (log.h).
+ */
