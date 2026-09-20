@@ -3,9 +3,36 @@
 [![CI](https://github.com/jnz/INSLIB/actions/workflows/ci.yml/badge.svg)](https://github.com/jnz/INSLIB/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/jnz/INSLIB/branch/main/graph/badge.svg)](https://codecov.io/gh/jnz/INSLIB)
 
-![INSLIB Logo](doc/figures/inslib_logo.png)
+![INSLIB Logo](doc/figures/inslib_logo_transparent_small.png)
 
 > A portable C library for 3D navigation state estimation. Mail: jan.zwiener@h-da.de
+
+In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
+
+![Galileo HAS](doc/gif/galileo_has_01.gif)
+
+<!-- COVERAGE:START -->
+**Test coverage** of the core library (`src/`):
+
+| Metric | Coverage |
+|---|---|
+| C0 (Line) | 99.8% (3940/3946) |
+| C1 (Branch) | 92.3% (2625/2843) |
+| MC/DC | 92.3% (2604/2822) |
+<!-- COVERAGE:END -->
+
+<!-- STACK:START -->
+**Worst-case stack usage** in bytes, deepest call chain including KFCore and the C library, from static analysis (`make stack`):
+
+| Entry point | x86_64-linux-gnu, GCC 14.2.0 |
+|---|---:|
+| `nav_suite_update()` | 12864 |
+| `ins_update()` | 11840 |
+| `ahrs_update()` | 8240 |
+| `baro_alt_update()` | 7904 |
+| `nav_suite_init()` | 2704 |
+| `ins_init()` | 2688 |
+<!-- STACK:END -->
 
 ## Example Video
 
@@ -43,6 +70,7 @@ helper programs and GUI apps are included in this repository.
 * UAVs that only need roll/pitch, no yaw/heading, can skip the magnetometer entirely: the standalone `AHRS_MODE_ARS` mode (5-state, freely-integrated yaw) runs from IMU data alone
 * Robust UDU/Bierman-Thornton Kalman Filter routines for numerically robust square-root filtering (effective precision for covariance is increased)
 * Worst-Case-Execution Time (WCET) friendly: no unbounded loops, recursion, suitable for real-time control loops
+* **Bounded, known stack usage**: static worst-case stack analysis of every public API function (`make stack`, built on GCC's `-fcallgraph-info`), gated against budgets and failing on recursion, variable length arrays or unresolved function pointer calls, so the stack of the task running the filter can be sized from a number instead of a guess
 * Strong static code analysis tests (undefined behaviour sanitizer **UBSan, ASan**)
 * Built-in light-weight World Magnetic Model (WMM) for magnetometer declination compensation
 * No heap, no OS dependencies, portable code: runs on bare-metal **embedded** targets as well as on a desktop computer
@@ -85,12 +113,13 @@ GNSS/magnetometer/barometer/speed `.csv` files follow the same pattern. Example 
 * [Barometer example](datasets/crazyflie/dead_reckoning/baro.csv)
 * [GNSS example](datasets/tunnel/gnss.csv)
 * [Magnetometer example](datasets/pedestrian/07_outdoor_only/mag.csv)
+* [Wheel speed (odometry) example](datasets/tunnel_odometry/speed.csv)
 
 ### `config.yaml`
 
-A dataset directory with CSV files carries one `config.yaml` that
+A dataset directory with CSV files contains one `config.yaml` that
 tells the filter how to run: aiding mode, sensor noise, lever arms, which
-channels are enabled. Two annotated examples to start from:
+channels are enabled. Two examples to start from:
 [doc/example_conf/config_basic.yaml](doc/example_conf/config_basic.yaml)
 (GNSS+IMU+baro+mag) and
 [doc/example_conf/config_local_inertial.yaml](doc/example_conf/config_local_inertial.yaml)
@@ -100,8 +129,7 @@ configuration: config.yaml".
 
 ### `replay.py` Command Line Post-Processing Version
 
-`replay.py` is the command line counterpart to
-the `inspostgui.py` Python GUI above.
+`replay.py` is the command line version of the `inspostgui.py` Python GUI above.
 
 ```sh
 sh python/setup_venv.sh               # one-time (also runs `make pylib`)
@@ -113,9 +141,10 @@ Example PDF plot output from `replay.py`:
 
 ![PDF Plots](doc/figures/example_plot_pdf.png)
 
-Google Earth `.kml` output is also possible with `--kml output.kml`:
+Google Earth `.kml` output is also possible with `--kml output.kml`.
+Info: The Google Earth web version does not support track animations (yet?).
 
-![Google Earth kml Screenshot](doc/figures/google_earth_output.jpg)
+![Google Earth KML/KMZ Output](doc/gif/google_earth.gif)
 
 ## GNSS Latency Estimation
 
@@ -149,15 +178,11 @@ make insrcv
 ./build/insrcv --mavlink   # run and wait for UDP sensor input
 ```
 
-In action, fusing a live Galileo HAS-corrected GNSS fix:
-
-![Galileo HAS](doc/gif/galileo_has_01.gif)
-
 ## Tutorials
 
 * [tutorial/c_tutorial.md](tutorial/c_tutorial.md): use the library from **C/C++**: a full example
 * [tutorial/python_tutorial.md](tutorial/python_tutorial.md): the filter from Python in a few lines, including installation
-* [doc/INSLIB_manual.pdf](doc/INSLIB_manual.pdf): comprehensive documentation, including filter design and math background
+* [doc/INSLIB_manual.pdf](doc/INSLIB_manual.pdf): documentation, including filter design and math background
 
 ![Documentation](doc/figures/doc_screenshot.png)
 
@@ -183,6 +208,7 @@ In action, fusing a live Galileo HAS-corrected GNSS fix:
 * [UAV data](datasets/crazyflie): Crazyflie 2.1 Brushless UAV with accurate ground truth from Lighthouse mocap system
 * [Rotorcraft](datasets/fog): MEMS vs. FOG (Fiber Optic Gyro reference) INS comparision while airborne in a rotorcraft
 * [Car](datasets/tunnel): data with e.g. GNSS outages from a road tunnel or degraded satellite visibility in urban canyons
+* [Car with wheel speed](datasets/tunnel_odometry): a road tunnel GNSS outage bridged with OBD2 odometry
 * [Pedestrian](datasets/pedestrian): Handheld walking trials
 * [ArduPilot](datasets/pedestrian/06_outdoor_to_indoor): comparison with ArduPilot EKF3 solution from the same measurements
 * [kfgins](datasets/kfgins): comparison with navigation solution library from Wuhan University (i2Nav group)
@@ -193,6 +219,18 @@ In action, fusing a live Galileo HAS-corrected GNSS fix:
 
 ## Setup
 
+This repository uses the `KFCore` git submodule. Clone it recursively:
+
+```sh
+git clone --recursive <repo-url>
+```
+
+If you already cloned without `--recursive`, fetch the submodule with:
+
+```sh
+git submodule update --init --recursive
+```
+
 The core C library only needs a C11 compiler and `make` (see Quickstart
 above). The Python bindings, plotting and reference-board tools additionally
 need a virtual environment:
@@ -201,6 +239,11 @@ need a virtual environment:
 sh python/setup_venv.sh      # one-time (Windows: python\setup_venv.bat)
 . env.sh                     # activate the venv (POSIX/git-bash, any OS)
 ```
+
+`make check-all` (see `coding_style.md`) additionally wants `clang-format`,
+`cppcheck`, `clang-tidy`, `lcov` and `doxygen`. Their exact versions matter
+for `make format-check` in particular; on a non-Ubuntu-22.04 machine, run
+`scripts/fetch_ci_clang_format.sh` once to match CI bit-for-bit.
 
 ## Directory Structure
 
@@ -266,7 +309,7 @@ Live-Control center for reference INS board
 
 * `inslib_hub.py` Stream, forward and log input data from reference board
 * `inslib_convert_ubx_to_csv.py` Convert reference board to `.csv` files
-* `inslib_ubx_imu_calib.py` Command line IMU-calibration tool
+* `inslib_imu_calib.py` Command line IMU-calibration tool (live, or offline from any IMU's `.csv` log with `--csv`)
 * `inslib_cfg.py` Reference board config read/write
 * `inslib_clock_error.py` Estimate MCU-clock error from reference board `.csv` log
 * `inslib_obd_speed.py` Stream car velocity from OBD-II dongle
@@ -279,7 +322,8 @@ filtering, etc.) has to line up properly. A list of common mistakes:
 
 * **Magnetometer not calibrated** (the classic). Uncorrected hard-/soft-iron
   bias means wrong yaw, use the [calibration
-  GUI](#reference-board-calibration-gui).
+  GUI](#reference-board-calibration-gui) or the command line tool
+  `inslib_imu_calib.py` with `.csv` data.
 * **IMU calibrated on a magnetic surface**: the [calibration
   GUI](#reference-board-calibration-gui) fits the magnetometer from the same
   session of static poses as the IMU, not a separate one.
@@ -302,7 +346,7 @@ filtering, etc.) has to line up properly. A list of common mistakes:
   aligned to a single monotonic timebase (`t_us`). Clock issues break the
   library.
 * **GNSS antenna lever arm not set**: the offset between IMU and GNSS antenna
-  (`gnss: leverarm_frd`) has a significant impact on position and attitude,
+  (`gnss: leverarm_frd`) has an impact on position and attitude,
   especially during dynamic turns.
 * **IMU and magnetometer axes not in the same body frame**: INSLIB expects
   one consistent FRD body frame for every sensor (see
@@ -310,11 +354,11 @@ filtering, etc.) has to line up properly. A list of common mistakes:
 * **GNSS latency not measured**: a guessed `gnss: delay_ms` biases position
   during dynamic motion, see [GNSS Latency
   Estimation](#gnss-latency-estimation).
-* **Unexpected height source with GNSS + barometer**: with both wired up, the
-  filter prefers the barometer for height by default (fail-safe: it keeps
+* **Unexpected height source with GNSS + barometer**: with both connected, the
+  filter prefers the barometer for height by default (it keeps
   working through a GNSS outage). Set `baro_height_disable: 1` in
   `config.yaml` to force GNSS/local-position height instead.
-* **No anti-aliasing/low-pass filtering on a vibrating IMU**: propeller or
+* **No anti-aliasing/low-pass filtering on a vibrating IMU**: rotor or
   engine vibration aliases into the accelerometer/gyroscope band and breaks
   the noise model and introduce ghost accelerations. Must be filtered out before the data reaches INSLIB.
 * **Sensor data over-filtered**: heavy internal/firmware smoothing adds
@@ -334,7 +378,8 @@ filtering, etc.) has to line up properly. A list of common mistakes:
 * The code is extended and improved by Claude Opus and Sonnet, doxygen comments are improved and added
 * Code and comments written by Claude are reviewed by a human (no auto-commit)
 * `insrcv` is largely written by Claude
-* Unit tests, the build system and the Python GUI tools are basically written by Claude
+* Unit tests, the build system and the Python GUI tools are basically written 100% by Claude
+* Every commit is reviewed by a human
 
 ## References
 
@@ -346,3 +391,17 @@ filtering, etc.) has to line up properly. A list of common mistakes:
 * P. D. Groves, *Principles of GNSS, Inertial, and Multisensor Integrated Navigation Systems*, 2nd ed., Artech House, 2013.
 * J. R. Carpenter and C. N. D'Souza, *Navigation Filter Best Practices*, NASA/TP-2018-219822, NF1676L-29886, 2018. [PDF](https://ntrs.nasa.gov/api/citations/20180003657/downloads/20180003657.pdf)
 * J. Zwiener, *Robuste Zustandsschätzung zur Navigation und Regelung autonomer und bemannter Multikopter mit verteilten Sensoren*, Schriftenreihe der Fachrichtung Geodäsie, Fachbereich Bau- und Umweltingenieurwissenschaften, Technische Universität Darmstadt, ISBN 978-3-935631-43-3, Heft 54, Darmstadt, 2019.
+
+## Citation
+
+If you use INSLIB in academic work, please cite it (see [`CITATION.cff`](CITATION.cff),
+also picked up by GitHub's "Cite this repository" button):
+
+```bibtex
+@software{zwiener_inslib,
+  author = {Zwiener, Jan},
+  title  = {{INSLIB: A Portable C Library for 3D Navigation State Estimation}},
+  url    = {https://github.com/jnz/INSLIB},
+  year   = {2026}
+}
+```

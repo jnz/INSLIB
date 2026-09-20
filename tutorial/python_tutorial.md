@@ -45,29 +45,30 @@ once-per-second GNSS fix:
 
 ```python
 import math
-from INSLIB import Navigator, Config, llh_to_ecef, ecef_to_llh
+from INSLIB import Navigator, Config
 
 D2R = math.pi / 180.0
 
 # The (stationary) location: a spot in Munich, 520 m ellipsoidal.
 lat, lon, h = 48.1372 * D2R, 11.5756 * D2R, 520.0
-ecef = llh_to_ecef(lat, lon, h)
 
 nav = Navigator(Config(auto_init=True))
 
 dt = 0.01                                  # 100 Hz
-for k in range(1, 601):
+for k in range(1, 1201):                   # 12 s: the 3D entry dwell is 5 s
     t_us = int(k * dt * 1e6)
     nav.imu(t_us, dt, acc=(0.0, 0.0, -9.81), gyr=(0.0, 0.0, 0.0))
     if k % 100 == 0:                       # a 1 Hz GNSS fix
-        nav.gnss_pos(ecef, var_ned=(4.0, 4.0, 16.0))   # 2/2/4 m stddev
+        # As the receiver reports it. 2 m stddev per axis -> variance 4.
+        # The vertical one has to stay inside the 3D entry gate (3 m),
+        # otherwise the filter keeps the solution at ATTITUDE_ONLY.
+        nav.gnss_pos_llh((lat, lon, h), var_ned=(4.0, 4.0, 4.0))
     nav.update()                           # run the filter for this epoch
     sol = nav.solution()                   # read the result back
 
 print("mode:", sol.mode, " ready:", sol.ready)
-out = ecef_to_llh(*sol.pos_ecef)
 print("lat %.6f deg  lon %.6f deg  h %.1f m"
-      % (out[0] / D2R, out[1] / D2R, out[2]))
+      % (sol.lat_rad / D2R, sol.lon_rad / D2R, sol.alt_m))
 print("rpy  %.2f  %.2f  %.2f deg"
       % (sol.roll / D2R, sol.pitch / D2R, sol.yaw / D2R))
 ```
@@ -83,14 +84,14 @@ Expected output:
 ```
 mode: FULL  ready: True
 lat 48.137200 deg  lon 11.575600 deg  h 520.0 m
-rpy  -0.00  -0.00  0.00 deg
+rpy  -0.00  0.00  0.00 deg
 ```
 
 ## The per-epoch loop, in three moves
 
 ```python
-nav.imu(t_us, dt, acc, gyr)   # 1. begin the epoch with the IMU sample
-nav.gnss_pos(ecef, var_ned)   #    add whatever aiding you have this epoch
+nav.imu(t_us, dt, acc, gyr)      # 1. begin the epoch with the IMU sample
+nav.gnss_pos_llh(llh, var_ned)   #    add whatever aiding you have this epoch
 nav.update()                  # 2. run the filter
 sol = nav.solution()          # 3. read the result
 ```
@@ -104,8 +105,8 @@ Add only the sensors you have, each is a one-liner:
 
 ```python
 nav.imu(t_us, dt, acc, gyr)              # begins an epoch (var args optional)
-nav.gnss_pos(ecef, var_ned)              # ECEF fix + NED covariance
-nav.gnss_pos(ecef, var_ned, delay_ms=80) # ...or a late fix (80 ms here, history-anchored)
+nav.gnss_pos_llh(llh, var_ned)           # lat/lon/height fix + NED covariance
+nav.gnss_pos_llh(llh, var_ned, delay_ms=80) # ...or a late fix (80 ms, history-anchored)
 nav.gnss_vel(vel_ned, var_ned)           # NED velocity
 nav.mag(mag_uT, mag_var)                 # magnetometer
 nav.baro(pressure_pa)                    # static pressure -> vertical channel
@@ -208,6 +209,33 @@ and the fusion is throttled to 1 Hz (`Config(magnetometer_min_delay_ms=...)`,
 negative switches the throttle off). The magnetometer is there to keep yaw from
 drifting away over minutes, over seconds the gyro is the better instrument.
 
+## Calibrating your IMU (no fixture needed)
+
+Bias, scale factor and axis misalignment of a cheap MEMS IMU, and hard and
+soft iron of a magnetometer, can be measured from one recording of your
+own sensor, without a turntable: leave the unit still for about 20 s, then
+put it down in 20 to 30 different attitudes (any, not necessarily level)
+for a few seconds each. Log that as `imu.csv` (`t_us, gyr xyz [rad/s],
+acc xyz [m/s^2]`) and optionally `mag.csv` (`t_us, mag xyz [uT]`), FRD
+axes, one clock, and run
+
+```sh
+python3 tools/inslib_imu_calib.py --csv mysession/ -o config.yaml
+```
+
+The keys it writes map one to one onto `Config`, same model
+`corrected = M * (raw - fixed_bias)`, column-major 3x3:
+
+```python
+cfg = Config(imu_acc_misalignment=(...), imu_acc_fixed_bias=(...),
+             imu_gyr_misalignment=(...), imu_gyr_fixed_bias=(...),
+             mag_misalignment=(...), mag_fixed_bias=(...))
+```
+
+`python/replay.py` reads the `config.yaml` directly. In a `python -m INSLIB`
+run file the same values go under `filter:` with the `Config` names
+(`imu_acc_misalignment: [...]` and so on).
+
 ## The lean alternative: `Ins`
 
 If you do not need the AHRS/baro fallback, `Ins` is the bare 15-state ESKF
@@ -215,13 +243,13 @@ the same three-move loop, a little leaner. Note it uses `update()` and
 then plain accessors rather than a `Solution`:
 
 ```python
-from INSLIB import Ins, Config, llh_to_ecef
+from INSLIB import Ins, Config
 
 nav = Ins(Config(auto_init=True))
 nav.imu(t_us, dt, acc, gyr)
-nav.gnss_pos(llh_to_ecef(lat, lon, h), var_ned=(4.0, 4.0, 16.0))
+nav.gnss_pos_llh((lat, lon, h), var_ned=(4.0, 4.0, 4.0))
 nav.update()
-print(nav.rpy(), nav.is_ready(), nav.position_local())
+print(nav.rpy(), nav.is_ready(), nav.position_local(), nav.position_llh())
 ```
 
 Conventions match the C library exactly: body frame FRD, nav frame NED,

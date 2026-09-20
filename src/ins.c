@@ -34,6 +34,23 @@
 #define INS_US_PER_SEC (1000000LL)
 #define INS_US_PER_MS  (1000LL)
 
+/* KFCore sizes the scratch matrices of its Kalman backend from the
+   compile-time limits KALMAN_MAX_STATE_SIZE / KALMAN_MAX_NOISE_SIZE
+   (KFCore/c/kalman_udu.c). They default to 32, which costs several kB of
+   stack per predict step, so the build lowers them to what INSLIB
+   actually uses. Too small a value would overflow the scratchpads inside
+   kalman_udu_predict(), so turn it into a build error here rather than a
+   silent out-of-bounds write. Only checked when the build defines them,
+   otherwise KFCore's own (larger) defaults apply. */
+#ifdef KALMAN_MAX_STATE_SIZE
+_Static_assert(KALMAN_MAX_STATE_SIZE >= INS_UNKNOWNS_MAX,
+               "KALMAN_MAX_STATE_SIZE too small for INS_UNKNOWNS_MAX");
+#endif
+#ifdef KALMAN_MAX_NOISE_SIZE
+_Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
+               "KALMAN_MAX_NOISE_SIZE too small for INS_NOISE_COLS_MAX");
+#endif
+
 /* Guard against tiny/negative variances after UDU updates. */
 #define INS_MIN_VARIANCE (1e-12f)
 
@@ -129,16 +146,41 @@
 #define INS_AUTOMOTIVE_MIN_SPEED_MPS  (2.0f)
 #define INS_AUTOMOTIVE_MIN_YAW_STDDEV DEG2RAD(5.0f)
 
+/* Non-holonomic lateral constraint (REQ-NAV-077).
+   The interval is not a performance knob: the residual's correlation time is
+   on the order of a minute, so fusing faster adds confidence without adding
+   information. The yaw-rate ceiling is where the scatter starts growing. */
+#define INS_NHC_STDDEV_MPS       (0.1f)
+#define INS_NHC_MAX_YAW_RATE     DEG2RAD(3.0f)
+#define INS_NHC_AFTER_SEC        (5.0f)
+#define INS_NHC_MIN_INTERVAL_SEC (1.0f)
+
 /* Magnetometer field-strength disturbance gate: relative |B| deviation
    from the WMM total field beyond which the sample is downweighted
    (used when opt.mag_field_tolerance == 0). */
 #define INS_DEFAULT_MAG_FIELD_TOL INS_DEFAULT_MAG_FIELD_TOLERANCE
 
 /* Magnetometer hard-iron bias states (18-state mode): initial stddev and
-   random walk defaults (unit = the mag/model unit, uT). The RW allows a
-   slow drift (temperature etc.). */
+   random walk defaults (unit = the mag/model unit, uT).
+
+   The initial sigma is a prior on how much hard iron there is to find. Ten uT
+   is deliberately loose: ten to twenty is ordinary once a unit is installed in
+   a vehicle, and a tighter prior would be a claim about an installation the
+   library knows nothing about.
+
+   The random walk is better read as how long the estimate keeps LISTENING
+   after it has settled than as a physical drift rate. Hard iron does not
+   wander continuously; it steps when ferrous mass moves, and drifts with
+   temperature otherwise. What the number decides is whether such a step is
+   still followed. Against a per-axis sigma of a few uT fused at ~1 Hz, a
+   random walk of q settles the state near (q^2*dt*R)^(1/4), and the drift it
+   admits over a time T is q*sqrt(T). At 0.129 that is 1 uT per minute, which
+   keeps the state correctable; the 0.01 this used to be settles near 0.14 uT
+   and then needs a quarter of an hour to admit one uT of genuine change, so a
+   payload that moves or a motor that switches on is a change the filter no
+   longer follows. */
 #define INS_DEFAULT_MAG_BIAS_STDDEV_UT (10.0f)
-#define INS_DEFAULT_MAG_BIAS_RW_UT     (0.01f)
+#define INS_DEFAULT_MAG_BIAS_RW_UT     (0.129f) /* 1 uT per minute */
 
 /* Magnetometer fusion rate limit used when opt.magnetometer_min_delay_ms is
    left at 0. The magnetometer is a long-term heading anchor, not a per-epoch
@@ -158,7 +200,7 @@
 #define INS_FUSE_MAX_MEAS (6)
 
 /* Refresh distance for the slowly-varying Earth-dependent quantities
-   (R_n_to_e, gravity, curvature terms): they change by ~d/R_earth,
+   (gravity, curvature terms): they change by ~d/R_earth,
    i.e. ~1.6e-5 relative per 100 m of travel. */
 #define INS_EARTH_REFRESH_DIST_M (100.0f)
 
@@ -256,8 +298,9 @@
 /* Absolute-speed aiding (REQ-NAV-068). The per-sample default is the
  * uniform-quantization 1-sigma of a 1 km/h resolution reading (1/sqrt(12)
  * km/h), as delivered by an OBD-II PID 0x0D speed. The relative default covers
- * the residual speedometer scale error left after speed_scale. The minimum
- * speed is where v_hat stops being a meaningful direction: walking pace. */
+ * the residual scale error of the vehicle speed signal left after
+ * speed_scale. The minimum speed is where v_hat stops being a meaningful
+ * direction: walking pace. */
 #define INS_DEFAULT_SPEED_STDDEV_MPS (0.080f)
 #define INS_DEFAULT_SPEED_STDDEV_REL (0.03f)
 #define INS_DEFAULT_SPEED_MIN_MPS    (1.0f)
@@ -371,6 +414,10 @@
 #define INS_DEFAULT_GNSS_STOP_MAX_HVEL_STDDEV_MPS  (0.4f)
 #define INS_DEFAULT_GNSS_STOP_MAX_VVEL_STDDEV_MPS  (0.5f)
 #define INS_DEFAULT_GNSS_STOP_DWELL_SEC            (10.0f)
+/* Most one epoch may add to the stop dwell [s]. Wide enough that a slow but
+   continuous fix stream still fills the dwell at close to real time, small
+   enough that an outage cannot (REQ-NAV-052). */
+#define INS_GNSS_STOP_MAX_STEP_SEC (2.0f)
 
 /* How much the carried IMU-bias 1-sigma is widened at the re-bootstrap
    after a quality-loss re-arm (REQ-NAV-061). The consumption site clamps
@@ -622,14 +669,14 @@ static inline float ins_kalman_dt(const ins_t* f)
 }
 
 /* ============================================================================
- * Meta-data: recompute cached helpers (R_b_to_n, latlonh, R_n_to_e, gravity)
+ * Meta-data: recompute cached helpers (R_b_to_n, latlonh, gravity)
  * ============================================================================
  */
 
-/* Recompute the slowly-varying Earth-dependent quantities: R_n_to_e,
- * gravity and the cached curvature terms for the incremental latlonh
- * book-keeping. Called at init, afterwards throttled to once every
- * INS_EARTH_REFRESH_DIST_M meters of travel (see ins_update_meta). */
+/* Recompute the slowly-varying Earth-dependent quantities: gravity and the
+ * cached curvature terms for the incremental latlonh book-keeping. Called at
+ * init, afterwards throttled to once every INS_EARTH_REFRESH_DIST_M meters of
+ * travel (see ins_update_meta). */
 static void ins_refresh_earth_params(ins_t* f)
 {
     /* Curvature terms: evaluate the dNED->dlatlonh mapping for unit
@@ -640,8 +687,6 @@ static void ins_refresh_earth_params(ins_t* f)
     f->meta_dlat_per_dN = dllh[0];
     f->meta_dlon_per_dE = dllh[1];
     f->meta_travel_m    = 0.0f;
-
-    ins_rotmat_n_to_e(f->latlonh[0], f->latlonh[1], f->R_n_to_e);
 
     /* Refresh gravity at the new position if the user did not supply one
      * explicitly (i.e. if the init gravity was zero). Otherwise keep
@@ -706,6 +751,18 @@ static void udu_get_diag(const float* U, const float* d, float* diag_out, int n)
         }
         diag_out[i] = s;
     }
+}
+
+/* Same equation as udu_get_diag(), for single index: O(n-idx) instead of
+ * O(n^2) when a caller only needs one element */
+static float udu_get_diag_one(const float* U, const float* d, int n, int idx)
+{
+    float s = d[idx];
+    for (int k = idx + 1; k < n; ++k)
+    {
+        s += MAT_ELEM(U, idx, k, n, n) * MAT_ELEM(U, idx, k, n, n) * d[k];
+    }
+    return s;
 }
 
 /* ============================================================================
@@ -789,7 +846,7 @@ static void ins_apply_correction(ins_t* f, const float dx[INS_UNKNOWNS_MAX])
         f->state.mag_bias[2] -= dx[INS_IDX_MAG + 2];
     }
 
-    /* Refresh cached helpers (R_b_to_n, latlonh, R_n_to_e, gravity). */
+    /* Refresh cached helpers (R_b_to_n, latlonh, gravity). */
     ins_update_meta(f, true, dpos_n_applied);
 }
 
@@ -1045,20 +1102,24 @@ static void ins_predict(ins_t* f, float dt_sec, const float Qll_acc_diag[3],
     /* Process noise in noise-input form, as the Thornton step wants it:
      *   P^- = Phi * P^+ * Phi' + G * diag(Q) * G'
      * G maps the 12 IMU noise inputs [acc, gyr, acc-bias-RW, gyr-bias-RW] plus
-     * n per-state extra-noise inputs onto the error states (the 18-state
-     * mag-bias random walk rides in the extra block via Qxx_noise_diag):
+     * one per-state extra-noise input for every state whose Qxx_noise_diag can
+     * be nonzero (POS/VEL/RPY, plus MAG in 18-state mode) onto the error
+     * states. ACC/GYR bias states have no Qxx_noise_diag setter (their process
+     * noise comes from the acc_bias_psd/gyr_bias_psd IMU-noise columns
+     * instead, see ins_init()), so their extra-noise column is always exactly
+     * zero and is skipped here rather than carried through the UDU predict:
      *
-     *        acc  gyr  aRW gRW | extra
+     *        acc  gyr  aRW gRW | extra (POS/VEL/RPY[/MAG])
      *   G = [  0    0    0   0 |  I  ]   POS
      *       [  R    0    0   0 |  I  ]   VEL  <- accel white noise
      *       [  0   -R    0   0 |  I  ]   RPY  <- gyro white noise
-     *       [  0    0    I   0 |  I  ]   ACC  <- accel bias random walk
-     *       [  0    0    0   I |  I  ]   GYR  <- gyro bias random walk
+     *       [  0    0    I   0 |  0  ]   ACC  <- accel bias random walk
+     *       [  0    0    0   I |  0  ]   GYR  <- gyro bias random walk
      *
      * with Q = [PSD] * dt per column. */
-    const int nr = 12 + n; /* noise inputs: 12 IMU + n per-state extra */
-    float     G[INS_UNKNOWNS_MAX * (12 + INS_UNKNOWNS_MAX)];
-    float     Q[12 + INS_UNKNOWNS_MAX];
+    const int nr = 12 + n - 6; /* 12 IMU + per-state extra, minus the always-zero ACC/GYR pair */
+    float     G[INS_UNKNOWNS_MAX * INS_NOISE_COLS_MAX];
+    float     Q[INS_NOISE_COLS_MAX];
     memset(G, 0, sizeof(G[0]) * (size_t)(n * nr));
     int i, j;
     for (i = 0; i < 3; ++i)
@@ -1071,7 +1132,6 @@ static void ins_predict(ins_t* f, float dt_sec, const float Qll_acc_diag[3],
         MAT_ELEM(G, INS_IDX_ACC + i, 6 + i, n, nr) = 1.0f;
         MAT_ELEM(G, INS_IDX_GYR + i, 9 + i, n, nr) = 1.0f;
     }
-    for (i = 0; i < n; ++i) { MAT_ELEM(G, i, 12 + i, n, nr) = 1.0f; }
 
     const float acc_bias_psd = qsquare(f->init.acc_bias_pred_stddev_mps2_sqrts);
     const float gyr_bias_psd = qsquare(f->init.gyr_bias_pred_stddev_rps_sqrts);
@@ -1082,7 +1142,14 @@ static void ins_predict(ins_t* f, float dt_sec, const float Qll_acc_diag[3],
         Q[6 + i] = acc_bias_psd * dt_sec;
         Q[9 + i] = gyr_bias_psd * dt_sec;
     }
-    for (i = 0; i < n; ++i) { Q[12 + i] = f->Qxx_noise_diag[i] * dt_sec; }
+    int col = 12;
+    for (i = 0; i < n; ++i)
+    {
+        if (i >= INS_IDX_ACC && i < INS_IDX_GYR + 3) { continue; } /* ACC+GYR: no extra column */
+        MAT_ELEM(G, i, col, n, nr) = 1.0f;
+        Q[col]                     = f->Qxx_noise_diag[i] * dt_sec;
+        ++col;
+    }
 
     /* State vector is handled by the error-state framework: Phi*x is not
        applied because x is implicitly zero (the nominal state has been
@@ -1227,7 +1294,7 @@ static int ins_fuse(ins_t* f, float* z, float* R, float* Ht, int m_count, float 
 
     /* Apply whatever correction was accumulated (rows skipped by the
        chi2 outlier test simply contribute nothing). This also refreshes
-       the cached meta data (latlonh, R_b_to_n, R_n_to_e, gravity). */
+       the cached meta data (latlonh, R_b_to_n, gravity). */
     ins_apply_correction(f, dx);
     if (rc != 0) f->diag.n_fuse_fail++;
     return rc;
@@ -1290,6 +1357,9 @@ static int ins_fuse_yaw_residual(ins_t* f, float dyaw, float R_yaw, float chi2_t
 static void ins_fuse_mag(ins_t* f, const ins_measurements_t* m)
 {
     if (!m->mag.is_valid) return;
+    /* Dip pole exclusion zone: magnetic_n carries a meaningless declination
+       here, so the yaw it would imply is not usable (REQ-SYS-018). */
+    if (!f->mag_heading_usable) return;
     if (time_diff_ms(m->timestamp, f->t_last_mag_fusion) < f->opt.magnetometer_min_delay_ms)
     {
         return;
@@ -1745,8 +1815,8 @@ static void ins_reacquire(ins_t* f, const ins_measurements_t* m, const float pos
        cross term, which is ~ d_north * d_east * tan(lat) / R_earth (hundreds
        of metres once the origin is a hundred kilometres behind). A caller who
        already knows the exact latitude/longitude hands them in and skips it. */
-    double origin_llh[3], dllh[3];
-    ins_ecef_to_latlonh(f->origin_ecef, &origin_llh[0], &origin_llh[1], &origin_llh[2]);
+    double        dllh[3];
+    const double* origin_llh = f->origin_llh;
     ins_dned_to_dlatlonh(f->state.pos_local, origin_llh[0], origin_llh[2], dllh);
     f->latlonh[0] = (latlonh_new != NULL) ? latlonh_new[0] : (origin_llh[0] + dllh[0]);
     f->latlonh[1] = (latlonh_new != NULL) ? latlonh_new[1] : (origin_llh[1] + dllh[1]);
@@ -2143,8 +2213,10 @@ static void ins_track_gnss_mode_gates(ins_t* f, const ins_measurements_t* m)
         ins_track_gnss_entry_dwell(f, m);
         if (ins_entry_dwell_satisfied(f, m->timestamp))
         {
-            f->gnss_quality_ok = true;
-            f->gnss_bad_since  = 0;
+            f->gnss_quality_ok    = true;
+            f->gnss_bad_since     = 0;
+            f->gnss_bad_last      = 0;
+            f->gnss_bad_accum_sec = 0.0f;
             LOG_INFO("ins: GNSS quality recovered, 3D solution re-entered");
         }
         return;
@@ -2154,17 +2226,35 @@ static void ins_track_gnss_mode_gates(ins_t* f, const ins_measurements_t* m)
 
     if (ins_gnss_stay_quality_ok(f, m))
     {
-        f->gnss_bad_since = 0;
+        f->gnss_bad_since     = 0;
+        f->gnss_bad_last      = 0;
+        f->gnss_bad_accum_sec = 0.0f;
         return;
     }
 
     if (f->gnss_bad_since == 0 || m->timestamp < f->gnss_bad_since)
     {
-        f->gnss_bad_since = m->timestamp;
+        f->gnss_bad_since     = m->timestamp;
+        f->gnss_bad_last      = m->timestamp;
+        f->gnss_bad_accum_sec = 0.0f;
         return;
     }
 
-    const float bad_sec   = time_diff_sec(m->timestamp, f->gnss_bad_since);
+    /* Accumulate over the epochs that actually offered aiding, not off the
+       wall clock: a wall-clock difference lets an OUTAGE fill the dwell, so
+       one bad fix before a tunnel and the first bad fix out of it would give
+       up a solution that coasted the whole way through. A single step
+       contributes at most INS_GNSS_STOP_MAX_STEP_SEC, which is what keeps a
+       gap from counting while still not breaking a run of bad fixes at the
+       gaps between them (REQ-NAV-052). */
+    {
+        const float step = time_diff_sec(m->timestamp, f->gnss_bad_last);
+        f->gnss_bad_accum_sec +=
+            (step < INS_GNSS_STOP_MAX_STEP_SEC) ? step : INS_GNSS_STOP_MAX_STEP_SEC;
+        f->gnss_bad_last = m->timestamp;
+    }
+
+    const float bad_sec   = f->gnss_bad_accum_sec;
     const float dwell_sec = (f->opt.gnss_stop_dwell_sec > 0.0f) ? f->opt.gnss_stop_dwell_sec
                                                                 : INS_DEFAULT_GNSS_STOP_DWELL_SEC;
     if (bad_sec >= dwell_sec)
@@ -2189,7 +2279,8 @@ static void ins_track_gnss_mode_gates(ins_t* f, const ins_measurements_t* m)
  * time-of-validity (from the history ring buffer), the covariance update is
  * applied to the *current* U,d. A good approximation for delayed measurements:
  * the error-state is nearly constant over the delay (Phi ~ I for a few 100 ms). */
-/* @satisfies REQ-NAV-005 REQ-NAV-006 REQ-NAV-008 REQ-NAV-023 REQ-NAV-024 REQ-NAV-055 */
+/* @satisfies REQ-NAV-005 REQ-NAV-006 REQ-NAV-008 REQ-NAV-023 REQ-NAV-024 REQ-NAV-055
+ * @satisfies REQ-NAV-079 */
 static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
 {
     const bool offered = m->gnss_pos.is_valid || m->gnss_vel.is_valid;
@@ -2290,11 +2381,11 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
            keeps the step short once it is not, and the tangent-plane mapping
            is only exact for a short step (see ins_reacquire). The absolute
            anchor is the fix itself and never runs through the mapping. */
-        double meas_llh[3], dllh[3];
-        ins_ecef_to_latlonh(m->gnss_pos.xyz_ecef, &meas_llh[0], &meas_llh[1], &meas_llh[2]);
-        dllh[0] = meas_llh[0] - f->latlonh[0];
-        dllh[1] = meas_llh[1] - f->latlonh[1];
-        dllh[2] = meas_llh[2] - f->latlonh[2];
+        double       dllh[3];
+        const double meas_llh[3] = {m->gnss_pos.llh[0], m->gnss_pos.llh[1], m->gnss_pos.llh[2]};
+        dllh[0]                  = meas_llh[0] - f->latlonh[0];
+        dllh[1]                  = meas_llh[1] - f->latlonh[1];
+        dllh[2]                  = meas_llh[2] - f->latlonh[2];
 
         float pos_new[3], la_n[3], pos_var[3], vel_var[3];
         ins_dlatlonh_to_dned(dllh, f->latlonh[0], f->latlonh[2], pos_new);
@@ -2338,8 +2429,6 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
 
     int delay_ms = 0;
     if (m->gnss_delay_ms > 0) { delay_ms = m->gnss_delay_ms; }
-    /* TODO: derive the latency from gps_week/gps_itow_ms once the filter
-       tracks a local-time <-> GPS-time mapping. */
     if (!f->log_state.gnss_delay_logged)
     {
         f->log_state.gnss_delay_logged = true;
@@ -2394,10 +2483,12 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
 
     if (use_pos)
     {
-        /* Measurement ECEF -> lat/lon/h. This is the only double-math
-           conversion in the fusion path and runs once per GNSS epoch. */
-        double meas_llh[3];
-        ins_ecef_to_latlonh(m->gnss_pos.xyz_ecef, &meas_llh[0], &meas_llh[1], &meas_llh[2]);
+        /* The fix in the geodetic form the residual below is built from,
+           which is the form it arrived in (REQ-NAV-079): nothing is
+           converted here, so the epoch path carries no coordinate
+           transformation at all. The doubles below are the geodetic
+           difference itself, not a conversion. */
+        const double meas_llh[3] = {m->gnss_pos.llh[0], m->gnss_pos.llh[1], m->gnss_pos.llh[2]};
 
         /* Residual (predicted antenna - measured) in the n-frame: from the
            lat/lon/h difference (meter scale, so the small-angle mapping is
@@ -2774,6 +2865,108 @@ static void ins_fuse_gnss_course_yaw(ins_t* f, const ins_measurements_t* m)
     }
 }
 
+/* Non-holonomic lateral velocity constraint: a wheeled vehicle does not
+ * travel sideways, so the body-frame lateral velocity is a measurement of
+ * zero. Unlike the course-over-ground aiding above this needs no GNSS, which
+ * is the whole point -- it is the only thing holding the lateral channel
+ * during an outage.
+ *
+ * Residual and rows, with the psi-angle convention of this filter
+ * (R_nominal = (I + [psi x]) R_true, see ins_quat_small_angle_correction):
+ *
+ *   v_b     = M v_n,  M = R_b_to_n^T
+ *   dv_b    = M dv + M [v_n x] psi
+ *
+ * so row y of M sits on the velocity states and row y of M [v_n x] on the
+ * attitude states. The second is what earns the constraint its keep: its
+ * gain is the ground speed, so at road speed a fraction of a degree of roll
+ * error is a measurable lateral velocity. Using the identity
+ * M [v_n x] == [v_b x] M, row y of it is (v_b_z, 0, -v_b_x) M, which needs
+ * no 3x3 product.
+ *
+ * Only the lateral row exists, see REQ-NAV-077 for why the vertical one is
+ * not a free addition. */
+/* @satisfies REQ-NAV-077 */
+static void ins_fuse_lateral_constraint(ins_t* f, const ins_measurements_t* m)
+{
+    if (!f->opt.automotive_lateral_constraint || !f->opt.automotive_mode) return;
+
+    /* Held off until the filter has actually been coasting: next to a live
+       GNSS velocity the constraint adds no information, only the risk that a
+       mounting misalignment reaches the state. */
+    const float cfg_after = f->opt.automotive_lateral_after_sec;
+    /* positive -> as given, negative -> no delay, zero -> default. Spelled
+       without an equality test on a float. */
+    const float after_sec =
+        (cfg_after > 0.0f) ? cfg_after : ((cfg_after < 0.0f) ? cfg_after : INS_NHC_AFTER_SEC);
+    if (after_sec > 0.0f)
+    {
+        if (f->diag.t_last_gnss_fusion == 0) return;
+        if (time_diff_sec(m->timestamp, f->diag.t_last_gnss_fusion) < after_sec) return;
+    }
+
+    const float min_speed = (f->opt.automotive_min_speed_mps > 0.0f)
+                                ? f->opt.automotive_min_speed_mps
+                                : INS_AUTOMOTIVE_MIN_SPEED_MPS;
+    const float vN        = f->state.vel_ned[0];
+    const float vE        = f->state.vel_ned[1];
+    const float speed     = SQRTF(vN * vN + vE * vE);
+    if (speed < min_speed) return;
+
+    /* Side slip grows with the turn, and with it a systematic residual the
+       constraint would read as an attitude error. */
+    const float max_yaw_rate = (f->opt.automotive_lateral_max_yaw_rate > 0.0f)
+                                   ? f->opt.automotive_lateral_max_yaw_rate
+                                   : INS_NHC_MAX_YAW_RATE;
+    if (fabsf(f->last_omega_b_nb[2]) > max_yaw_rate) return;
+
+    /* Rate limited because the residual is a slowly varying offset rather
+       than white noise (REQ-NAV-077), so a faster fusion rate would only
+       make the filter more certain of it, not better informed. */
+    const int min_dt_ms = (int)(INS_NHC_MIN_INTERVAL_SEC * 1000.0f);
+    if (f->t_last_nhc_fusion != 0 && time_diff_ms(m->timestamp, f->t_last_nhc_fusion) < min_dt_ms)
+    {
+        return;
+    }
+
+    float v_b[3];
+    mat3t_mul_vec3(f->R_b_to_n, f->state.vel_ned, v_b);
+
+    const float stddev = (f->opt.automotive_lateral_stddev_mps > 0.0f)
+                             ? f->opt.automotive_lateral_stddev_mps
+                             : INS_NHC_STDDEV_MPS;
+
+    float z[1];
+    float R[1];
+    float Ht[INS_UNKNOWNS_MAX];
+    int   j;
+    memset(Ht, 0, sizeof(float) * (size_t)f->n);
+    z[0] = v_b[1]; /* nominal minus the truth of zero */
+    R[0] = qsquare(stddev);
+    for (j = 0; j < 3; ++j)
+    {
+        /* velocity: row y of M, i.e. column y of R_b_to_n */
+        Ht[INS_IDX_VEL + j] = MAT_ELEM(f->R_b_to_n, j, 1, 3, 3);
+        /* attitude: row y of [v_b x] M */
+        Ht[INS_IDX_RPY + j] =
+            v_b[2] * MAT_ELEM(f->R_b_to_n, j, 0, 3, 3) - v_b[0] * MAT_ELEM(f->R_b_to_n, j, 2, 3, 3);
+    }
+
+    if (ins_fuse(f, z, R, Ht, 1, f->chi2_thr_gnss, 1) == 0)
+    {
+        f->t_last_nhc_fusion = m->timestamp;
+        if (!f->log_state.nhc_logged)
+        {
+            f->log_state.nhc_logged = true;
+            LOG_INFO("ins: lateral velocity constraint active (stddev %.2f m/s, %s, above "
+                     "%.1f m/s and below %.1f deg/s yaw rate)",
+                     (double)stddev,
+                     (after_sec > 0.0f) ? "only while coasting" : "whenever the gates pass",
+                     (double)min_speed, (double)RAD2DEG(max_yaw_rate));
+        }
+    }
+}
+
 /* ============================================================================
  * History: save current state to ring buffer
  * ============================================================================
@@ -2827,6 +3020,8 @@ static void ins_rearm_collecting(ins_t* f)
     f->gnss_dwell_since                  = 0; /* re-earn the stability dwell (REQ-NAV-045) */
     f->gnss_dwell_count                  = 0;
     f->gnss_bad_since                    = 0;
+    f->gnss_bad_last                     = 0;
+    f->gnss_bad_accum_sec                = 0.0f;
     f->gnss_quality_ok                   = true; /* the entry gate governs the restart */
     f->have_pending_imu                  = false;
     f->have_pending_fix                  = false;
@@ -2865,10 +3060,12 @@ static void ins_fail_gnss_quality(ins_t* f, ins_time_us_t t)
 {
     if (f->opt.auto_reacquire_disable || !f->opt.auto_init)
     {
-        f->gnss_quality_ok  = false;
-        f->gnss_bad_since   = 0;
-        f->gnss_dwell_since = 0; /* the entry dwell has to be re-earned */
-        f->gnss_dwell_count = 0;
+        f->gnss_quality_ok    = false;
+        f->gnss_bad_since     = 0;
+        f->gnss_bad_last      = 0;
+        f->gnss_bad_accum_sec = 0.0f;
+        f->gnss_dwell_since   = 0; /* the entry dwell has to be re-earned */
+        f->gnss_dwell_count   = 0;
         return;
     }
 
@@ -2887,19 +3084,20 @@ static void ins_fail_gnss_quality(ins_t* f, ins_time_us_t t)
 
     /* REQ-NAV-062: the origin of a running instance is sound by construction,
        but insisting on that here is cheaper than trusting it at the far end.
-       Same plausibility test as ins_init: a valid ECEF has norm ~ 6.4e6 m. */
-    const double ox = f->origin_ecef[0], oy = f->origin_ecef[1], oz = f->origin_ecef[2];
+       Geodetic form, so the test is the range of a latitude and a longitude
+       rather than the norm of a vector (REQ-NAV-080). */
+    const double ox = f->origin_llh[0], oy = f->origin_llh[1], oz = f->origin_llh[2];
     const bool   origin_ok =
-        vec3d_finite(f->origin_ecef) && ((ox * ox + oy * oy + oz * oz) >= (1000.0 * 1000.0));
+        vec3d_finite(f->origin_llh) && (fabs(ox) <= (0.5 * M_PI)) && (fabs(oy) <= (2.0 * M_PI));
 
     f->is_initialized = false;
     ins_rearm_collecting(f);
 
     if (origin_ok)
     {
-        f->origin_carry.origin_ecef[0] = ox;
-        f->origin_carry.origin_ecef[1] = oy;
-        f->origin_carry.origin_ecef[2] = oz;
+        f->origin_carry.origin_llh[0] = ox;
+        f->origin_carry.origin_llh[1] = oy;
+        f->origin_carry.origin_llh[2] = oz;
         /* Where this instance last thought it was (REQ-NAV-062), in both
            frames: the pair is what lets the bootstrap work in short
            baselines instead of against the possibly far-away origin. */
@@ -3016,8 +3214,8 @@ static void ins_check_overconfidence(ins_t* f)
  * Shared by the manual ins_init and the auto-init bootstrap. rpy_var lets the
  * caller widen the roll/pitch/yaw variance per axis when the bootstrap is less
  * certain (REQ-NAV-047). f->init/f->opt must already be populated. */
-/* @satisfies REQ-NAV-061 */
-static void ins_finalize_init(ins_t* f, const float rpy[3], const double origin_ecef[3],
+/* @satisfies REQ-NAV-061 REQ-NAV-080 */
+static void ins_finalize_init(ins_t* f, const float rpy[3], const double origin_llh[3],
                               const float pos_local[3], const double* latlonh_exact,
                               const float vel_ned[3], const float rpy_var[3], ins_time_us_t t)
 {
@@ -3034,13 +3232,17 @@ static void ins_finalize_init(ins_t* f, const float rpy[3], const double origin_
 
     ins_quat_from_rpy(rpy[0], rpy[1], rpy[2], f->state.qbn);
 
-    f->origin_ecef[0] = origin_ecef[0];
-    f->origin_ecef[1] = origin_ecef[1];
-    f->origin_ecef[2] = origin_ecef[2];
+    f->origin_llh[0] = origin_llh[0];
+    f->origin_llh[1] = origin_llh[1];
+    f->origin_llh[2] = origin_llh[2];
     vec3_copy(pos_local, f->state.pos_local);
 
-    ins_ecef_to_latlonh(f->origin_ecef, &f->latlonh[0], &f->latlonh[1], &f->latlonh[2]);
-    ins_refresh_earth_params(f); /* R_n_to_e, gravity, curvature cache */
+    /* The absolute anchor starts at the origin, no conversion in between
+       (REQ-NAV-080). */
+    f->latlonh[0] = f->origin_llh[0];
+    f->latlonh[1] = f->origin_llh[1];
+    f->latlonh[2] = f->origin_llh[2];
+    ins_refresh_earth_params(f); /* gravity, curvature cache */
 
     /* Keep latlonh consistent with a nonzero initial pos_local: the origin is
        the anchor, the absolute position is the origin offset by pos_local in
@@ -3134,6 +3336,8 @@ static void ins_finalize_init(ins_t* f, const float rpy[3], const double origin_
     f->is_initialized     = true;
     f->gnss_quality_ok    = true; /* entry gate passed (REQ-NAV-051) */
     f->gnss_bad_since     = 0;
+    f->gnss_bad_last      = 0;
+    f->gnss_bad_accum_sec = 0.0f;
     f->bias_carry.valid   = false; /* consumed (REQ-NAV-061) */
     f->origin_carry.valid = false; /* consumed (REQ-NAV-062) */
     if (carry)
@@ -3350,21 +3554,28 @@ static void ins_log_effective_config(const ins_t* f)
         LOG_INFO("ins: automotive mode: enabled, min speed %.1f m/s, min yaw stddev %.1f deg",
                  (double)min_speed, (double)RAD2DEG(min_yaw_stddev));
     }
+    if (opt->automotive_lateral_constraint && !opt->automotive_mode)
+    {
+        LOG_WARN("ins: lateral velocity constraint asked for without automotive mode, "
+                 "ignored (REQ-NAV-077)");
+    }
 #else
     (void)f;
 #endif
 }
 
+/* @satisfies REQ-NAV-081 */
 int ins_init(ins_t* f, const ins_init_t* init, const ins_options_t* opt)
 {
     if (f == NULL || init == NULL || opt == NULL) { return -1; }
 
-    /* Validate initial ECEF position (must be outside a tiny neighbourhood
-       of the origin, a valid ECEF has norm ~ 6.4e6 m). */
-    const double ex = init->x_ecef[0];
-    const double ey = init->x_ecef[1];
-    const double ez = init->x_ecef[2];
-    if ((ex * ex + ey * ey + ez * ez) < (1000.0 * 1000.0)) { return -1; }
+    /* Validate the initial position: a latitude and a longitude by their
+       range (REQ-NAV-081). All zero passes, it is a point on the equator. */
+    if (!vec3d_finite(init->llh) || fabs(init->llh[0]) > (0.5 * M_PI) ||
+        fabs(init->llh[1]) > (2.0 * M_PI))
+    {
+        return -1;
+    }
 
     /* Optional magnetometer-bias states need the max-sized arrays. With
        INS_UNKNOWNS_MAX overridden to 15 the option must fail loudly. */
@@ -3376,6 +3587,10 @@ int ins_init(ins_t* f, const ins_init_t* init, const ins_options_t* opt)
     f->n              = opt->estimate_mag_bias ? INS_UNKNOWNS_MAG : INS_UNKNOWNS;
     f->history_index  = 0;
     f->last_acc_valid = false;
+    /* No position known yet, so nothing says the magnetometer is unusable.
+       memset zeroed this, which would suppress fusion for a caller that only
+       supplies magnetic_n through ins_set_world_model(). */
+    f->mag_heading_usable = true;
 
     /* Overconfidence watchdog running-minima start "unseen" (REQ-NAV-040),
        memset zeroed them, which would pin the minimum at 0 forever. */
@@ -3667,14 +3882,16 @@ int ins_init(ins_t* f, const ins_init_t* init, const ins_options_t* opt)
     ins_log_effective_config(f);
 
     /* Both init modes defer the actual start to ins_update, once the streams
-       are coherent (REQ-NAV-033). x_ecef is kept as a provisional anchor,
+       are coherent (REQ-NAV-033). init->llh is kept as a provisional anchor,
        refined by the first GNSS fix under auto_init. */
-    f->t_init          = init->time; /* provisional, restamped at start */
-    f->is_collecting   = true;
-    f->is_initialized  = false;
-    f->autoinit_count  = 0;
-    f->gnss_quality_ok = true; /* until the running solution loses it (REQ-NAV-052) */
-    f->gnss_bad_since  = 0;
+    f->t_init             = init->time; /* provisional, restamped at start */
+    f->is_collecting      = true;
+    f->is_initialized     = false;
+    f->autoinit_count     = 0;
+    f->gnss_quality_ok    = true; /* until the running solution loses it (REQ-NAV-052) */
+    f->gnss_bad_since     = 0;
+    f->gnss_bad_last      = 0;
+    f->gnss_bad_accum_sec = 0.0f;
     return 0;
 }
 
@@ -3688,22 +3905,20 @@ static void ins_finalize_manual(ins_t* f, ins_time_us_t t_start)
     const float rpy[3] = {f->init.rpy_init_rad[0], f->init.rpy_init_rad[1],
                           f->init.rpy_init_rad[2]};
 
-    /* Convert the initial ECEF velocity to NED via the origin's n-frame
-       rotation. */
-    double llh[3];
-    ins_ecef_to_latlonh(f->init.x_ecef, &llh[0], &llh[1], &llh[2]);
-    float Rne[9];
-    ins_rotmat_n_to_e(llh[0], llh[1], Rne);
-    const float vel_ecef_f[3] = {(float)f->init.xdot_ecef[0], (float)f->init.xdot_ecef[1],
-                                 (float)f->init.xdot_ecef[2]};
-    float       vel_ned[3];
-    mat3t_mul_vec3(Rne, vel_ecef_f, vel_ned);
+    /* Position and velocity are already in the frames the filter works in
+       (REQ-NAV-081), so the start is a copy in both cases. */
+    const double* llh = f->init.llh;
+    float         vel_ned[3];
+    vec3_copy(f->init.vel_ned, vel_ned);
 
     const float pos_local0[3] = {0.0f, 0.0f, 0.0f};
     const float rpy_var[3]    = {qsquare(f->init.rpy_init_stddev_rad[0]),
                                  qsquare(f->init.rpy_init_stddev_rad[1]),
                                  qsquare(f->init.rpy_init_stddev_rad[2])};
-    ins_finalize_init(f, rpy, f->init.x_ecef, pos_local0, NULL, vel_ned, rpy_var, t_start);
+    /* The caller's own llh, handed straight through: the origin is held in
+       exactly the form it arrives in, so the manual init converts nothing
+       (REQ-NAV-080). */
+    ins_finalize_init(f, rpy, llh, pos_local0, NULL, vel_ned, rpy_var, t_start);
 }
 
 /* Startup stream-coherence check (REQ-NAV-033): true once the measurement
@@ -3749,6 +3964,22 @@ void ins_set_magnetic_model_from_position(ins_t* f, double lat_rad, double lon_r
         return; /* drop at the API boundary */
     }
 
+    /* Inside a dip pole exclusion zone the declination that orients the
+       reference field is meaningless, so magnetometer fusion is dropped until
+       the position leaves the zone (REQ-SYS-018). Keep the last reference
+       rather than overwriting it with a bogus one. */
+    const bool was_usable = f->mag_heading_usable;
+    f->mag_heading_usable = magnetic_heading_reference_valid(lat_deg, lon_deg);
+    if (!f->mag_heading_usable)
+    {
+        if (was_usable)
+        {
+            LOG_INFO("ins: magnetic dip pole zone entered, magnetometer fusion suspended");
+        }
+        return;
+    }
+    if (!was_usable) { LOG_INFO("ins: magnetic dip pole zone left, magnetometer fusion resumed"); }
+
     float b_ned[3];
     magnetic_field_ned_uT(lat_deg, lon_deg, year, b_ned);
     vec3_copy(b_ned, f->magnetic_n);
@@ -3758,20 +3989,21 @@ void ins_set_magnetic_model_from_position(ins_t* f, double lat_rad, double lon_r
     f->mag_field_expected_uT = magnetic_field_strength_uT(lat_deg, lon_deg);
 }
 
-/* Pure vertical datum shift: absolute position = origin + R_n_to_e * pos_local
- * stays constant because the origin moves down by exactly the amount
- * pos_local's down component shrinks. latlonh, the Earth-param cache and the
- * covariance stay untouched. History pos_local entries shift too. */
-/* @satisfies REQ-NAV-025 REQ-NAV-054 */
+/* Pure vertical datum shift: the absolute position stays constant because the
+ * origin height drops by exactly the amount pos_local's down component
+ * shrinks. Down is the ellipsoid normal, so only origin_llh[2] moves and the
+ * origin's latitude and longitude come out bit-for-bit unchanged
+ * (REQ-NAV-080). latlonh, the Earth-param cache and the covariance stay
+ * untouched. History pos_local entries shift too. */
+/* @satisfies REQ-NAV-025 REQ-NAV-054 REQ-NAV-080 */
 void ins_shift_origin_down(ins_t* f, float dz_m)
 {
     if (f == NULL || !f->is_initialized || !isfinite(dz_m)) { return; }
     int i;
-    for (i = 0; i < 3; ++i)
-    {
-        /* Local down direction in ECEF: third column of R_n_to_e. */
-        f->origin_ecef[i] += (double)dz_m * (double)MAT_ELEM(f->R_n_to_e, i, 2, 3, 3);
-    }
+    /* Down is along the ellipsoid normal, which is what the height is
+       measured along: the shift is the height alone, and latitude and
+       longitude come out bit-for-bit unchanged (REQ-NAV-080). */
+    f->origin_llh[2] -= (double)dz_m;
     f->state.pos_local[2] -= dz_m;
     for (i = 0; i < INS_HISTORY_ITEMS_MAX; ++i) { f->history[i].state.pos_local[2] -= dz_m; }
 
@@ -3938,7 +4170,16 @@ static float ins_autoinit_yaw(const ins_t* f, const ins_measurements_t* m, float
             mag_data = f->autoinit_mag.data;
         }
     }
-    if (mag_data != NULL && mh > 1e-6f)
+    /* Starting inside a dip pole exclusion zone: the model heading below would
+       seed yaw from a meaningless declination, so fall through to the unknown
+       heading case instead (REQ-SYS-018). The filter still starts, roll and
+       pitch are unaffected, and yaw carries an honest large covariance that
+       GNSS course pulls in. */
+    if (mag_data != NULL && mh > 1e-6f && !f->mag_heading_usable)
+    {
+        LOG_INFO("ins: magnetometer yaw bootstrap skipped, inside a magnetic dip pole zone");
+    }
+    else if (mag_data != NULL && mh > 1e-6f)
     {
         float q0[4], R0[9], m_l[3];
         ins_quat_from_rpy(roll, pitch, 0.0f, q0);
@@ -3960,7 +4201,7 @@ static float ins_autoinit_yaw(const ins_t* f, const ins_measurements_t* m, float
 }
 
 /* May the pending origin carry (REQ-NAV-062) be used for a bootstrap on
- * fix_ecef at time t, and if so, where does that fix sit in the inherited
+ * fix_llh at time t, and if so, where does that fix sit in the inherited
  * n-frame? On true, pos_local_out holds the fix expressed in the inherited
  * frame. On false it is untouched and the caller anchors a fresh origin.
  *
@@ -3978,13 +4219,10 @@ static float ins_autoinit_yaw(const ins_t* f, const ins_measurements_t* m, float
  * outage could have covered. Distance to the origin does not enter it.
  *
  * @satisfies REQ-NAV-062 */
-static bool ins_autoinit_origin_carry_usable(const ins_t* f, const double fix_ecef[3],
+static bool ins_autoinit_origin_carry_usable(const ins_t* f, const double fix_llh[3],
                                              ins_time_us_t t, float pos_local_out[3],
                                              double fix_llh_out[3])
 {
-    double fix_llh[3];
-    ins_ecef_to_latlonh(fix_ecef, &fix_llh[0], &fix_llh[1], &fix_llh[2]);
-
     /* Step from where the exiting instance last was to the fix. */
     const double dllh[3] = {fix_llh[0] - f->origin_carry.latlonh[0],
                             fix_llh[1] - f->origin_carry.latlonh[1],
@@ -4162,7 +4400,7 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
     const float rpy_var[3] = {roll_var, pitch_var, yaw_var};
 
     /* Origin + velocity from the fix. */
-    double origin_ecef[3];
+    double origin_llh[3];
     double fix_llh[3];
     /* Non-NULL only for a carried origin: a fresh origin IS the fix, so the
        offset mapping below is a no-op and needs no help. */
@@ -4175,35 +4413,38 @@ static bool ins_autoinit_try(ins_t* f, const ins_measurements_t* m)
            this bootstrap, so the local frame survives the outage. The fix then
            sets pos_local instead of the origin, via the same geodetic mapping
            the re-acquisition of REQ-NAV-023 uses. */
-        const bool carry = f->origin_carry.valid &&
-                           ins_autoinit_origin_carry_usable(f, m->gnss_pos.xyz_ecef, m->timestamp,
-                                                            pos_local, fix_llh);
+        const double* fix_llh_in = m->gnss_pos.llh;
+        const bool    carry =
+            f->origin_carry.valid &&
+            ins_autoinit_origin_carry_usable(f, fix_llh_in, m->timestamp, pos_local, fix_llh);
         if (carry)
         {
-            origin_ecef[0] = f->origin_carry.origin_ecef[0];
-            origin_ecef[1] = f->origin_carry.origin_ecef[1];
-            origin_ecef[2] = f->origin_carry.origin_ecef[2];
-            anchor_llh     = fix_llh;
+            origin_llh[0] = f->origin_carry.origin_llh[0];
+            origin_llh[1] = f->origin_carry.origin_llh[1];
+            origin_llh[2] = f->origin_carry.origin_llh[2];
+            anchor_llh    = fix_llh;
         }
         else
         {
-            origin_ecef[0] = m->gnss_pos.xyz_ecef[0];
-            origin_ecef[1] = m->gnss_pos.xyz_ecef[1];
-            origin_ecef[2] = m->gnss_pos.xyz_ecef[2];
+            /* The fix becomes the origin as it stands: both are geodetic, so
+               there is nothing to convert (REQ-NAV-080). */
+            origin_llh[0] = fix_llh_in[0];
+            origin_llh[1] = fix_llh_in[1];
+            origin_llh[2] = fix_llh_in[2];
             LOG_INFO("ins: Reset of local NED frame");
         }
         if (ins_gnss_vel_usable(f, &m->gnss_vel)) { vec3_copy(m->gnss_vel.vel_ned, vel_ned); }
     }
-    else /* have_local: keep the caller's n-frame origin (init.x_ecef) so the
-            local measurements stay consistent, the fix sets pos_local. */
+    else /* have_local: keep the caller's n-frame origin (the init block) so
+            the local measurements stay consistent, the fix sets pos_local. */
     {
-        origin_ecef[0] = f->init.x_ecef[0];
-        origin_ecef[1] = f->init.x_ecef[1];
-        origin_ecef[2] = f->init.x_ecef[2];
+        origin_llh[0] = f->init.llh[0];
+        origin_llh[1] = f->init.llh[1];
+        origin_llh[2] = f->init.llh[2];
         vec3_copy(m->local_pos.pos_ned, pos_local);
     }
 
-    ins_finalize_init(f, rpy, origin_ecef, pos_local, anchor_llh, vel_ned, rpy_var, m->timestamp);
+    ins_finalize_init(f, rpy, origin_llh, pos_local, anchor_llh, vel_ned, rpy_var, m->timestamp);
     /* Bootstrap: cap the hinted 1-sigma at the cold-start prior
        (REQ-NAV-048, REQ-NAV-067). */
     ins_apply_gyr_bias_hint(f, &m->att_hint, true);
@@ -4873,7 +5114,7 @@ static void ins_sanitize_measurements(ins_t* f, const ins_measurements_t* in,
        passed the finiteness gates above. */
     ins_apply_calibration(&f->opt, out);
     if (out->gnss_pos.is_valid &&
-        (!vec3d_finite(out->gnss_pos.xyz_ecef) || !mat33_finite(out->gnss_pos.Qll_ned)))
+        (!vec3d_finite(out->gnss_pos.llh) || !mat33_finite(out->gnss_pos.Qll_ned)))
     {
         out->gnss_pos.is_valid = false;
         f->diag.n_invalid_input++;
@@ -5226,6 +5467,12 @@ void ins_correct_step(ins_t* f)
             ins_fuse_yaw(f, m);
             ins_fuse_zero_velocity(f, m, m->zero_velocity_update || auto_zupt);
             ins_fuse_zero_rotation(f, m, m->zero_rotation_update || auto_zupt);
+            /* Before the position channels below: the constraint is about the
+               state the coasting produced, and it decides whether to act on
+               how long that coasting has lasted (REQ-NAV-077). Running it
+               after ins_fuse_gnss would let the fix that ends an outage reset
+               that clock in the same epoch. */
+            ins_fuse_lateral_constraint(f, m);
         }
 
         /* The two position channels run either way: while inert (REQ-NAV-064)
@@ -5258,9 +5505,15 @@ void ins_correct_step(ins_t* f)
     if (f->is_initialized)
     {
         const float yaw_aid_gap_sec = time_diff_sec(m->timestamp, f->log_state.t_last_yaw_aid);
-        float       diag[INS_UNKNOWNS_MAX];
-        udu_get_diag(f->U, f->d, diag, f->n);
-        const float yaw_stddev_deg = RAD2DEG(SQRTF(diag[INS_IDX_RPY + 2]));
+        /* Only the yaw element of the diagonal is used below (both here and
+         * by the runaway tracker further down, so this can't be skipped when
+         * yaw_aid_gap_sec is small) -- extract that one element instead of
+         * the full O(n^2) diagonal. */
+        const float yaw_var_rad2 = udu_get_diag_one(f->U, f->d, f->n, INS_IDX_RPY + 2);
+        /* Split off the variance above instead of nesting the call inside RAD2DEG:
+         * cppcheck 2.7, the version the CI image pins, cannot build an AST for a
+         * _Generic whose controlling expression is a call taking struct members. */
+        const float yaw_stddev_deg = RAD2DEG(SQRTF(yaw_var_rad2));
         if (yaw_aid_gap_sec >= INS_LOG_YAW_AID_GAP_WARN_SEC &&
             yaw_stddev_deg >= INS_LOG_YAW_STDDEV_WARN_DEG)
         {
@@ -5450,6 +5703,16 @@ bool ins_get_position_ecef(const ins_t* f, double p[3])
     return true;
 }
 
+/* @satisfies REQ-NAV-078 */
+bool ins_get_latlonh(const ins_t* f, double llh[3])
+{
+    if (!f || !f->is_initialized) return false;
+    llh[0] = f->latlonh[0];
+    llh[1] = f->latlonh[1];
+    llh[2] = f->latlonh[2];
+    return true;
+}
+
 bool ins_get_position_local(const ins_t* f, float p[3])
 {
     if (!f || !f->is_initialized) return false;
@@ -5464,10 +5727,18 @@ bool ins_get_velocity_ned(const ins_t* f, float v[3])
     return true;
 }
 
+/* @satisfies REQ-NAV-080 */
 bool ins_get_velocity_ecef(const ins_t* f, float v[3])
 {
     if (!f || !f->is_initialized) return false;
-    mat3_mul_vec3(f->R_n_to_e, f->state.vel_ned, v);
+    /* Built here rather than cached, for the same reason
+       ins_get_position_ecef() converts here: nothing on the epoch path uses
+       the n-frame to ECEF rotation, so refreshing it with the other Earth
+       parameters would put four trigonometric calls into the worst-case
+       epoch to serve a caller that may never ask (REQ-NAV-080). */
+    float R_n_to_e[9];
+    ins_rotmat_n_to_e(f->latlonh[0], f->latlonh[1], R_n_to_e);
+    mat3_mul_vec3(R_n_to_e, f->state.vel_ned, v);
     return true;
 }
 

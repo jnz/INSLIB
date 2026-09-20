@@ -12,7 +12,7 @@
 
 #include "nav_suite.h"
 #include "geodetic_toolbox.h"
-#include "linalg.h" /* MAT_ELEM for the n-frame <-> ECEF rotation */
+#include "linalg.h" /* SQRTF */
 #include "log.h"
 
 /* Diagnostics only (see log.h): how far the ARS's independently
@@ -99,15 +99,26 @@
  * for? A carried origin (REQ-NAV-062) is copied verbatim, so the difference is
  * exactly zero there; the tolerance only keeps this off exact float equality.
  * Only meaningful once an alignment has happened (vertical_datum_aligned),
- * which is what fills datum_origin_ecef; every caller checks that first. */
+ * which is what fills datum_origin_llh; every caller checks that first.
+ *
+ * ins holds its origin geodetically (REQ-NAV-080), so the comparison runs on
+ * latitude, longitude and height. The horizontal pair is turned into metres
+ * before it meets the tolerance, since a millimetre of latitude and a
+ * millimetre of longitude are not the same angle. */
 #define NAV_SUITE_DATUM_ORIGIN_EPS_M (1.0e-3)
 
 static bool nav_suite_ins_origin_is_datum(const nav_suite_t* s)
 {
-    int i;
+    const double dllh[3] = {s->ins.origin_llh[0] - s->datum_origin_llh[0],
+                            s->ins.origin_llh[1] - s->datum_origin_llh[1],
+                            s->ins.origin_llh[2] - s->datum_origin_llh[2]};
+    float        dned[3];
+    int          i;
+
+    ins_dlatlonh_to_dned(dllh, s->datum_origin_llh[0], s->datum_origin_llh[2], dned);
     for (i = 0; i < 3; ++i)
     {
-        if (fabs(s->ins.origin_ecef[i] - s->datum_origin_ecef[i]) > NAV_SUITE_DATUM_ORIGIN_EPS_M)
+        if (!isfinite(dned[i]) || fabsf(dned[i]) > (float)NAV_SUITE_DATUM_ORIGIN_EPS_M)
         {
             return false;
         }
@@ -137,7 +148,7 @@ static bool nav_suite_ins_origin_is_datum(const nav_suite_t* s)
 static void nav_suite_latch_datum_origin(nav_suite_t* s)
 {
     int i;
-    for (i = 0; i < 3; ++i) { s->datum_origin_ecef[i] = s->ins.origin_ecef[i]; }
+    for (i = 0; i < 3; ++i) { s->datum_origin_llh[i] = s->ins.origin_llh[i]; }
     s->vertical_datum_aligned = true;
     /* A datum just fixed has not drifted yet, whatever the previous one had
        done: the anchor is re-established against this one (REQ-SUITE-008). */
@@ -378,8 +389,10 @@ static void nav_suite_update_local_gnss(nav_suite_t* s, const ins_measurements_t
     ins_gnss_condition_pos_cov(&s->ins.opt, m->gnss_pos.Qll_ned, gnss_pos_Qll_fuse);
     const float var_v = gnss_pos_Qll_fuse[8];
     if (!(var_v > 0.0f) || !isfinite(var_v)) { return; }
-    double lat, lon, h_ell;
-    ins_ecef_to_latlonh(m->gnss_pos.xyz_ecef, &lat, &lon, &h_ell);
+    /* The ellipsoidal height of the fix, as the caller stated it
+       (REQ-NAV-079). Nothing to convert and nothing to share with ins: both
+       consumers read the same number. */
+    const double h_ell = m->gnss_pos.llh[2];
 
     /* If the GNSS measurement is delayed, evaluate the local height at
        the GNSS time of validity using the reference's climb rate: both
@@ -681,10 +694,10 @@ void nav_suite_set_init_att_hint(nav_suite_t* s, float roll_rad, float pitch_rad
 /* @satisfies REQ-SUITE-001 REQ-SUITE-003 REQ-SUITE-021 */
 int nav_suite_predict_step(nav_suite_t* s, const ins_measurements_t* m, float* phi_out)
 {
-    /* A usable GNSS fix anchors the ins origin to WGS84: at bootstrap (origin =
-       GNSS ECEF) or by later fusion. Latch it so the ellipsoid accessors know
-       the absolute solution is real and not the prescribed init origin
-       (REQ-SUITE-008). */
+    /* A usable GNSS fix anchors the ins origin to WGS84: at bootstrap (the
+       origin becomes the fix) or by later fusion. Latch it so the ellipsoid
+       accessors know the absolute solution is real and not the prescribed
+       init origin (REQ-SUITE-008). */
     if (m->gnss_pos.is_valid && m->gnss_pos.Qll_ned[8] > 0.0f && isfinite(m->gnss_pos.Qll_ned[8]))
     {
         s->wgs84_anchor_seen = true;
@@ -1248,18 +1261,15 @@ bool nav_suite_local_to_wgs84(const nav_suite_t* s, const float ned[3], double* 
     if (s == NULL || ned == NULL) { return false; }
     if (!s->ins.is_initialized || !nav_suite_wgs84_anchored(s)) { return false; }
 
-    /* ECEF = origin_ecef + R_n_to_e * ned. The local offset is small
-       (metres..km), so accumulating the float rotation product into the
-       double origin loses nothing that matters. */
-    double ecef[3];
-    for (int i = 0; i < 3; ++i)
-    {
-        const float d = MAT_ELEM(s->ins.R_n_to_e, i, 0, 3, 3) * ned[0] +
-                        MAT_ELEM(s->ins.R_n_to_e, i, 1, 3, 3) * ned[1] +
-                        MAT_ELEM(s->ins.R_n_to_e, i, 2, 3, 3) * ned[2];
-        ecef[i] = s->ins.origin_ecef[i] + (double)d;
-    }
-    ins_ecef_to_latlonh(ecef, lat_rad, lon_rad, h_m);
+    /* The same geodetic step ins moves its own anchor with (REQ-NAV-080):
+       origin plus the local offset mapped through the curvature radii. Going
+       via ECEF would answer the same question with a different approximation
+       than the filter's own position book-keeping uses. */
+    double dllh[3];
+    ins_dned_to_dlatlonh(ned, s->ins.origin_llh[0], s->ins.origin_llh[2], dllh);
+    *lat_rad = s->ins.origin_llh[0] + dllh[0];
+    *lon_rad = s->ins.origin_llh[1] + dllh[1];
+    *h_m     = s->ins.origin_llh[2] + dllh[2];
     return true;
 }
 
@@ -1270,17 +1280,11 @@ bool nav_suite_wgs84_to_local(const nav_suite_t* s, double lat_rad, double lon_r
     if (s == NULL || ned == NULL) { return false; }
     if (!s->ins.is_initialized || !nav_suite_wgs84_anchored(s)) { return false; }
 
-    double ecef[3];
-    ins_latlonh_to_ecef(lat_rad, lon_rad, h_m, ecef);
-    /* NED = R_n_to_e' * (ecef - origin_ecef). The difference is taken in
-       double (nearby points), then rotated by the float DCM. */
-    const double de[3] = {ecef[0] - s->ins.origin_ecef[0], ecef[1] - s->ins.origin_ecef[1],
-                          ecef[2] - s->ins.origin_ecef[2]};
-    for (int i = 0; i < 3; ++i)
-    {
-        ned[i] = (MAT_ELEM(s->ins.R_n_to_e, 0, i, 3, 3) * (float)de[0] +
-                  MAT_ELEM(s->ins.R_n_to_e, 1, i, 3, 3) * (float)de[1] +
-                  MAT_ELEM(s->ins.R_n_to_e, 2, i, 3, 3) * (float)de[2]);
-    }
+    /* Exact inverse of nav_suite_local_to_wgs84 above: the difference against
+       the origin is taken in double, where the cancellation happens, and
+       mapped back through the same curvature radii. */
+    const double dllh[3] = {lat_rad - s->ins.origin_llh[0], lon_rad - s->ins.origin_llh[1],
+                            h_m - s->ins.origin_llh[2]};
+    ins_dlatlonh_to_dned(dllh, s->ins.origin_llh[0], s->ins.origin_llh[2], ned);
     return true;
 }

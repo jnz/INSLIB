@@ -27,14 +27,19 @@
 #                      not part of `make test`, run on demand or in CI
 #   make clang-tidy    static analysis (clang-tidy, config: .clang-tidy)
 #                      over the same file set, also not part of `make test`
-#   make coverage      (Linux only) build with gcov instrumentation, run
+#   make stack         worst-case stack usage of every public API function,
+#                      gated against the budgets in scripts/stack_usage.cfg
+#                      (needs gcc >= 10), not part of `make test`
+#   make readme-stack  refresh readme.md's stack usage block from the JSON
+#                      of `make stack` (release process step 4)
+#   make coverage     (Linux only) build with gcov instrumentation, run
 #                      every host test binary (incl. KFCore's own
 #                      KFCore/tests/test.c and the firmware config/UBX
 #                      tests, so embedded/stm32f429 shows up in the
 #                      report too) and render an lcov HTML report
 #   make check-all     (POSIX) run everything above that's a quality gate
 #                      (test, reqs, format-check, cppcheck, clang-tidy,
-#                      doxygen -- treating any doc warning as failure --
+#                      stack, doxygen -- treating any doc warning as failure --
 #                      and coverage), prints a pass/fail summary, exits 1
 #                      if anything failed. Pre-push / CI use.
 #   make clean         remove the built binaries and (on POSIX) the
@@ -86,6 +91,16 @@ CFLAGS   := -Wall -Wextra -std=c11 -D_GNU_SOURCE -g \
             -Wpointer-arith -Wwrite-strings -Wnull-dereference \
             -Wduplicated-cond -Wduplicated-branches -Wlogical-op \
             -Wbad-function-cast -Wswitch-enum
+
+# KFCore's Kalman backend dimensions its scratch matrices from these two
+# compile-time limits, which default to 32 each (KFCore/c/kalman_udu.c).
+# INSLIB's largest filter is the 18-state INS, whose process noise input
+# matrix G has 12 + 18 - 6 = 24 columns (INS_NOISE_COLS_MAX), so the
+# defaults leave several kB of stack unused on every predict step. src/ins.c
+# static-asserts both values against INS_UNKNOWNS_MAX/INS_NOISE_COLS_MAX: a
+# value too small for the filters is a build error, not a silent overflow.
+KFCORE_LIMITS := -DKALMAN_MAX_STATE_SIZE=18 -DKALMAN_MAX_NOISE_SIZE=24
+CFLAGS   += $(KFCORE_LIMITS)
 
 HARNESS_CFLAGS := $(CFLAGS) -Wno-double-promotion
 INCLUDES := -Isrc -IKFCore/c -IKFCore/c/navigation_tools -IKFCore/tests
@@ -140,6 +155,7 @@ TEST_MATH := $(BUILD_DIR)/test_math$(EXE)
 TEST_AHRS := $(BUILD_DIR)/test_ahrs$(EXE)
 TEST_BARO := $(BUILD_DIR)/test_baro$(EXE)
 TEST_LOG  := $(BUILD_DIR)/test_log$(EXE)
+TEST_YAML := $(BUILD_DIR)/test_yaml$(EXE)
 TEST_CFG  := $(BUILD_DIR)/test_cfg$(EXE)
 REPLAY    := $(BUILD_DIR)/replay$(EXE)
 INSRCV    := $(BUILD_DIR)/insrcv$(EXE)
@@ -179,12 +195,13 @@ ifneq (1,$(words $(shell gcc -dumpmachine 2>&1)))
 # Goals that actually compile. clean/reqs/format/doc must keep working
 # without a compiler, so only abort for these (no goal at all means the
 # default target, which builds).
-CC_GOALS := all test test-asan check-all coverage \
+CC_GOALS := all test test-asan check-all coverage readme-coverage \
             $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_BARO) $(TEST_LOG) \
             test_core test_math test_ahrs test_baro test_log \
             $(REPLAY) replay $(INSRCV) insrcv \
             pylib pytest datasets datasets-fog datasets-kfgins \
-            datasets-tunnel datasets-pedestrian simulated crazyflie
+            datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
+            datasets-pedestrian simulated crazyflie
 
 define CC_MISSING_MSG
 
@@ -218,11 +235,13 @@ endif
 endif
 endif
 
-.PHONY: all test clean coverage coverage-clean datasets datasets-kfgins \
-        datasets-fog datasets-tunnel datasets-pedestrian \
+.PHONY: all test clean coverage coverage-clean readme-coverage datasets datasets-kfgins \
+        datasets-fog datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
+        datasets-pedestrian \
         simulated crazyflie reqs pylib pytest wmm doc doxygen test-asan \
-        format format-check cppcheck clang-tidy check-all insrcv \
-        test_core test_math test_ahrs test_baro test_log test_cfg replay
+        format format-check cppcheck clang-tidy stack readme-stack check-all insrcv \
+        test_core test_math test_ahrs test_baro test_log test_cfg test_yaml \
+        replay
 
 # --- Build output directory --------------------------------------------------
 # Order-only prerequisite (the "|" below) on every binary rule: it only
@@ -242,6 +261,7 @@ test_math: $(TEST_MATH)
 test_ahrs: $(TEST_AHRS)
 test_baro: $(TEST_BARO)
 test_log:  $(TEST_LOG)
+test_yaml: $(TEST_YAML)
 ifneq ($(HAVE_EMBEDDED),)
 test_cfg:  $(TEST_CFG)
 else
@@ -262,7 +282,8 @@ replay:    $(REPLAY)
 # this repo's own noisy fault-injection tests opt out.
 TEST_LOG_LEVEL_CFLAGS := -DLOG_LEVEL=LOG_LEVEL_NONE
 
-all: $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_BARO) $(TEST_LOG) $(ALL_TEST_CFG)
+all: $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_BARO) $(TEST_LOG) $(TEST_YAML) \
+     $(ALL_TEST_CFG)
 
 $(TEST_CORE): $(NAV_SRC) $(KFCORE_SRC) tests/test_ins_core.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
@@ -279,6 +300,11 @@ $(TEST_BARO): $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(NAV_HDR) | $(BUILD_
 $(TEST_LOG): src/log.c tests/test_log.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
+# The YAML subset reader the two harnesses share. Header only, so this
+# needs nothing but -Itools and the test file itself.
+$(TEST_YAML): tests/test_yaml.c tools/mini_yaml.h | $(BUILD_DIR)
+	$(CC) $(HARNESS_CFLAGS) -Itools $(filter %.c,$^) $(LDLIBS) -o $@
+
 $(TEST_CFG): $(FW_CFG_SRC) tests/test_cfg.c $(FW_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(FW_INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
@@ -288,6 +314,7 @@ test: all
 	$(RUN)$(TEST_AHRS)
 	$(RUN)$(TEST_BARO)
 	$(RUN)$(TEST_LOG)
+	$(RUN)$(TEST_YAML)
 	$(RUN_TEST_CFG)
 	@$(MAKE) --no-print-directory simulated
 	@$(MAKE) --no-print-directory crazyflie
@@ -328,6 +355,37 @@ else
 endif
 endif
 
+# --- Worst-case stack usage (scripts/stack_usage.py) --------------------------
+# Compiles the library with the compiler at hand and takes GCC's
+# -fcallgraph-info=su output (frame size of every function plus the call
+# graph, after inlining) to compute the deepest call chain of every public
+# API function. Fails on recursion, VLA/alloca, a call through a function
+# pointer or into a library function without a stack figure, and on a
+# budget overrun. Figures for library functions, function pointer targets
+# and the budgets live in scripts/stack_usage.cfg, the budgets there are for
+# x86_64. Needs GCC >= 10.
+# Fortify-source and stack-protector are distro-injected hardening a
+# from-source embedded build does not carry, they add calls to libc
+# helpers (__memcpy_chk, __stack_chk_fail, ...) under names the cfg does
+# not track, so both are turned off to measure the library's own frames.
+STACK_CC     ?= $(CC)
+STACK_CFLAGS := -std=c11 -O2 -D_GNU_SOURCE -U_FORTIFY_SOURCE -fno-stack-protector \
+                $(KFCORE_LIMITS) $(INCLUDES)
+
+stack: $(SUITE_SRC) $(KFCORE_SRC) $(NAV_HDR) scripts/stack_usage.cfg scripts/stack_usage.py | $(BUILD_DIR)
+	python3 scripts/stack_usage.py --config scripts/stack_usage.cfg --cc $(STACK_CC) \
+	    --cflags="$(STACK_CFLAGS)" --build-dir $(BUILD_DIR)/stack \
+	    --json $(BUILD_DIR)/stack/stack_usage.json $(SUITE_SRC) $(KFCORE_SRC)
+
+# Refresh the "Worst-case stack usage" block in readme.md from the JSON of
+# `make stack` (scripts/update_readme_stack.py). Host (x86_64) figures only,
+# on purpose - the readme is public and only needs to show stack usage is
+# under control; embedded/stm32f429's own cross-compiled numbers from its
+# `make stack` stay an embedded/ concern. Release process step 4 in
+# CLAUDE.md.
+readme-stack: stack
+	python3 scripts/update_readme_stack.py
+
 # --- Requirements database (see requirements/README.md) ----------------------
 # requirements/ is internal-only (see scripts/public_export.exclude in the
 # source repo) - the public repo and its CI build without it, so this gate
@@ -343,16 +401,25 @@ endif
 # Covers all C sources we own; excludes the KFCore submodule
 # (never edited here) and the generated WMM lookup tables (make wmm
 # rewrites them, so formatting would just churn).
-CLANG_FORMAT := clang-format
+#
+# clang-format's verdict depends on its exact version (ci.yml pins
+# ubuntu-22.04 for this reason). If scripts/fetch_ci_clang_format.sh has
+# vendored a copy matching that pinned version, use it instead of whatever
+# is on PATH, so `make format`/`format-check` agree with CI even on a
+# machine whose system clang-format is newer (e.g. Debian, Ubuntu 24.04).
+CLANG_FORMAT := $(if $(wildcard .tools/clang-format-14/bin/clang-format), \
+                 .tools/clang-format-14/bin/clang-format,clang-format)
 FORMAT_SRC   := $(filter-out src/wmm_lut.h src/wmm_test_vectors.h, \
                 $(wildcard src/*.c src/*.h tests/*.c tests/*.h \
                            datasets/*.c datasets/*.h \
                            python/csrc/*.c python/csrc/*.h))
 
 format:
+	@echo "using $$($(CLANG_FORMAT) --version)"
 	$(CLANG_FORMAT) -i $(FORMAT_SRC)
 
 format-check:
+	@echo "using $$($(CLANG_FORMAT) --version)"
 	$(CLANG_FORMAT) --dry-run -Werror $(FORMAT_SRC)
 
 # --- Static analysis (cppcheck) -----------------------------------------------
@@ -402,6 +469,16 @@ doxygen:
 # the model is updated - the generated headers are committed, so this is
 # deliberately NOT part of the normal build/test path. Needs pygeomag:
 #   pip install -r magneticmodel/requirements.txt
+#
+# After regenerating, run the error analysis and read its numbers before
+# committing the new tables:
+#   python3 magneticmodel/wmm_error_analysis.py --step 1 --years 5
+# It re-measures the interpolated table against the exact spherical-harmonics
+# model and reports the residual error outside the dip pole exclusion zone,
+# which is what REQ-SYS-018 and MAGNETIC_DIP_POLE_EXCLUSION_DEG rest on. The
+# dip poles drift (the northern one by ~33 km per year), so the radius wants a
+# fresh look at every epoch. It reports rather than passes or fails, hence a
+# separate manual step and not a recipe line here.
 wmm:
 	python3 magneticmodel/generate_wmm_grid.py
 	python3 magneticmodel/generate_test_vectors.py
@@ -413,7 +490,8 @@ wmm:
 # the list below. Every dataset here is committed and deterministic, so
 # `make test` runs the whole list as a regression gate -- a new entry
 # below is picked up by `make test` without a second edit.
-datasets: datasets-fog datasets-kfgins datasets-tunnel datasets-pedestrian
+datasets: datasets-fog datasets-kfgins datasets-tunnel datasets-tunnel-nhc \
+          datasets-tunnel-odometry datasets-pedestrian
 
 $(REPLAY): $(SUITE_SRC) $(KFCORE_SRC) tools/replay.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
@@ -487,6 +565,23 @@ datasets-kfgins: $(REPLAY)
 # datasets/tunnel/config.yaml for what the numbers do and do not mean.
 datasets-tunnel: $(REPLAY)
 	$(RUN)$(REPLAY) datasets/tunnel
+
+# The same tunnel again, but the branch where the filter keeps its 3D
+# solution for the whole outage instead of giving it up: gated on the
+# coasting re-acquisition error (REQ-VER-029, REQ-VER-031), not on the
+# whole-run RMS, which on such a dataset rewards abandoning the coast. Also
+# the only committed dataset running the non-holonomic lateral constraint
+# (REQ-NAV-077). Same tunnel as datasets/tunnel, driven the other way, and
+# therefore not independent evidence about tunnels, see REQ-VER-031.
+datasets-tunnel-nhc: $(REPLAY)
+	$(RUN)$(REPLAY) datasets/tunnel_nhc
+
+# The same Wattkopf tunnel once more, in the direction of datasets/tunnel, but
+# with OBD2 wheel speed: the only real-data check of the absolute speed aiding
+# (REQ-NAV-068). Gated tight enough that the exit error fails when the
+# odometry stops helping, see REQ-VER-032.
+datasets-tunnel-odometry: $(REPLAY)
+	$(RUN)$(REPLAY) datasets/tunnel_odometry
 
 # Hand-carried pedestrian, three recordings on one route: with corrections,
 # without corrections, and outdoors only. The reference is a second estimator
@@ -599,6 +694,11 @@ endif
 
 COV_DIR    := coverage
 COV_OBJDIR := $(COV_DIR)/obj
+# KFCore's own tests build the same KFCore/c sources as the INSLIB tests,
+# but with different flags (see $(COV_KFCORE_OBJ) below), so they need
+# their own object tree -- a shared object would silently take whichever
+# flags make happened to build it with first.
+COV_KFCORE_OBJDIR := $(COV_DIR)/obj-kfcore
 COV_CFLAGS := $(HARNESS_CFLAGS) -O0 -g --coverage
 
 # Branch coverage: the --rc option was renamed in lcov 2.x
@@ -658,7 +758,7 @@ COV_BARO_OBJ   := $(addprefix $(COV_OBJDIR)/,$(SUITE_SRC:.c=.o) $(KFCORE_SRC:.c=
                                              tests/test_baro.o)
 COV_LOG_OBJ    := $(addprefix $(COV_OBJDIR)/,src/log.o tests/test_log.o)
 COV_CFG_OBJ    := $(addprefix $(COV_OBJDIR)/,$(FW_CFG_SRC:.c=.o) tests/test_cfg.o)
-COV_KFCORE_OBJ := $(addprefix $(COV_OBJDIR)/,$(KFCORE_TEST_SRC:.c=.o))
+COV_KFCORE_OBJ := $(addprefix $(COV_KFCORE_OBJDIR)/,$(KFCORE_TEST_SRC:.c=.o))
 
 # The firmware config store builds against embedded/stm32f429/Core/Inc,
 # not against src/ - see $(TEST_CFG).
@@ -666,11 +766,20 @@ $(COV_CFG_OBJ): INCLUDES := $(FW_INCLUDES)
 
 # KFCore/c/kalman_takasu.c and KFCore/tests/test.c is submodule code.
 # Relax flags for this coverage-only build instead of fixing upstream code.
+# The -U also drops $(KFCORE_LIMITS): KFCore's own tests exercise the backend
+# beyond what INSLIB's filters need (15 states with 27 noise columns), so
+# they run against KFCore's larger defaults. The -U wins over the -D because
+# it comes later on the command line.
 $(COV_KFCORE_OBJ): COV_CFLAGS += -Wno-missing-prototypes -Wno-sign-conversion \
                                  -Wno-conversion -Wno-float-conversion \
-                                 -Wno-unused-parameter -Wno-format-nonliteral
+                                 -Wno-unused-parameter -Wno-format-nonliteral \
+                                 -UKALMAN_MAX_STATE_SIZE -UKALMAN_MAX_NOISE_SIZE
 
 $(COV_OBJDIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(COV_CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(COV_KFCORE_OBJDIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COV_CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -708,10 +817,12 @@ coverage: $(COV_TEST_CORE) $(COV_TEST_MATH) $(COV_TEST_AHRS) $(COV_TEST_BARO) \
 	@# Drop coverage artifacts of renamed/deleted sources: their stale
 	@# .gcno/.gcda would otherwise feed lcov/genhtml dead source paths
 	@# ("genhtml: ERROR: cannot read ...").
-	@find $(COV_OBJDIR) -name '*.gcno' | while read -r g; do \
-	    rel=$${g#$(COV_OBJDIR)/}; \
-	    test -f "$${rel%.gcno}.c" || \
-	        rm -f "$${g%.gcno}.gcno" "$${g%.gcno}.gcda" "$${g%.gcno}.o"; \
+	@for d in $(COV_OBJDIR) $(COV_KFCORE_OBJDIR); do \
+	    find "$$d" -name '*.gcno' | while read -r g; do \
+	        rel=$${g#$$d/}; \
+	        test -f "$${rel%.gcno}.c" || \
+	            rm -f "$${g%.gcno}.gcno" "$${g%.gcno}.gcda" "$${g%.gcno}.o"; \
+	    done; \
 	done
 	./$(COV_TEST_CORE)
 	./$(COV_TEST_MATH)
@@ -724,7 +835,8 @@ else
 	@echo "test_cfg coverage: skipped, embedded/ not present (public repo)"
 endif
 	./$(COV_TEST_KFCORE)
-	lcov --capture --directory $(COV_OBJDIR) --output-file $(COV_DIR)/coverage.info \
+	lcov --capture --directory $(COV_OBJDIR) --directory $(COV_KFCORE_OBJDIR) \
+	     --output-file $(COV_DIR)/coverage.info \
 	     $(LCOV_BRANCH_RC) $(LCOV_MCDC)
 	@# Exclude test/benchmark harness sources themselves, no coverage.
 	lcov --remove $(COV_DIR)/coverage.info '/usr/*' '*/tests/*' \
@@ -734,13 +846,30 @@ endif
 	genhtml $(COV_DIR)/coverage.info --output-directory $(COV_DIR)/html \
 	        --branch-coverage $(LCOV_MCDC)
 	@echo "Coverage report: $(COV_DIR)/html/index.html"
+	@# Core library only (src/): the >90% coverage claim (readme.md) is
+	@# about the released library, not KFCore/ (separately versioned
+	@# submodule) or embedded/ (reference board firmware, not part of the
+	@# public release) - both drag the combined number above from the
+	@# genhtml summary. Report src/ on its own so the two don't get
+	@# conflated.
+	lcov --extract $(COV_DIR)/coverage.info '*/src/*.c' \
+	     --ignore-errors unused \
+	     --output-file $(COV_DIR)/coverage-core.info $(LCOV_BRANCH_RC) $(LCOV_MCDC)
+	@echo "==== src/ (core library) coverage ===="
+	lcov --summary $(COV_DIR)/coverage-core.info $(LCOV_BRANCH_RC) $(LCOV_MCDC)
 
 coverage-clean:
 	$(RM) -r $(COV_DIR)
+
+# Refresh the "Test coverage" block in readme.md from coverage-core.info's
+# machine-readable LF/LH/BRF/BRH/MCF/MCH fields (scripts/
+# update_readme_coverage.sh) - release process step 4 in CLAUDE.md.
+readme-coverage: coverage
+	scripts/update_readme_coverage.sh
 endif
 
-# --- Aggregate check (tests + reqs + format + static analysis + doxygen +
-#     coverage) ---------------------------------------------------------------
+# --- Aggregate check (tests + reqs + format + static analysis + stack +
+#     doxygen + coverage) -----------------------------------------------------
 # Runs every gate independently, one failure doesn't stop the others.
 # Prints a pass/fail summary at the end. exits 1 if anything failed.
 # POSIX only (coverage is Linux-only).
@@ -767,9 +896,57 @@ check-all:
 	run "clang-format" $(MAKE) format-check; \
 	run "cppcheck"     $(MAKE) cppcheck; \
 	run "clang-tidy"   $(MAKE) clang-tidy; \
-	run "doxygen"      sh -c '$(MAKE) doxygen 2>&1 | tee /tmp/ins-check-all-doxygen.log; ! grep -q "warning:" /tmp/ins-check-all-doxygen.log'; \
+	run "stack"        $(MAKE) stack; \
+	run "doxygen"      bash -c 'set -o pipefail; $(MAKE) doxygen 2>&1 | tee /tmp/ins-check-all-doxygen.log; mst=$$?; ! grep -q "warning:" /tmp/ins-check-all-doxygen.log; gst=$$?; [ "$$mst" -eq 0 ] && [ "$$gst" -eq 0 ]'; \
 	run "coverage"     $(MAKE) coverage; \
 	echo "==== check-all summary ===="; \
+	cat "$$log"; \
+	rm -f "$$log"; \
+	exit $$failed
+endif
+
+# --- Everything check-all doesn't cover (release process step 3) -----------
+# check-all's "tests" gate already runs `make test`, whose last step
+# replays the real datasets (datasets-fog/kfgins/tunnel/tunnel-nhc/
+# tunnel-odometry/pedestrian) against ground truth, so this does not call
+# `datasets` again. Adds the sanitizer build (ASan/UBSan) and the Python
+# binding's test suite, both deliberately outside check-all/`make test` (see
+# their own target comments), plus the STM32 target's cross-compiled stack
+# analysis, best-effort: skipped without embedded/ (public repo) or an ARM
+# toolchain (embedded/stm32f429/config.mk). Still leaves out `make doc`
+# (needs LaTeX, only required when doc/*.tex changed) and the public-repo
+# export (release process steps 5 and 7) - those stay manual.
+# POSIX only, same reason as check-all/test-asan.
+ifeq ($(OS),Windows_NT)
+release-check:
+	@echo "make release-check is POSIX-only (see check-all/test-asan)." && exit 1
+else
+release-check:
+	@log=$$(mktemp); \
+	failed=0; \
+	run() { \
+	    name="$$1"; shift; \
+	    echo "=== $$name ==="; \
+	    if "$$@"; then \
+	        echo "  ok    $$name" >> "$$log"; \
+	    else \
+	        echo "  FAIL  $$name" >> "$$log"; \
+	        failed=1; \
+	    fi; \
+	    echo; \
+	}; \
+	run "check-all" $(MAKE) check-all; \
+	run "test-asan" $(MAKE) test-asan; \
+	run "pytest"    $(MAKE) pytest; \
+	if [ -n "$(HAVE_EMBEDDED)" ] && [ -f embedded/stm32f429/config.mk ]; then \
+	    run "arm-stack" $(MAKE) -C embedded/stm32f429 stack; \
+	else \
+	    echo "=== arm-stack ==="; \
+	    echo "skipped, embedded/ or embedded/stm32f429/config.mk not present"; \
+	    echo "  skip  arm-stack" >> "$$log"; \
+	    echo; \
+	fi; \
+	echo "==== release-check summary ===="; \
 	cat "$$log"; \
 	rm -f "$$log"; \
 	exit $$failed

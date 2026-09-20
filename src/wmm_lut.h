@@ -15,6 +15,18 @@
 #define WMM_EPOCH_START 2025.0f
 #define WMM_EPOCH_END 2030.0f
 
+// Magnetic dip poles (horizontal field = 0), located by a global scan
+// on the exact spherical-harmonics model. Each row is {lat, lon} in
+// degrees, taken at mid-epoch: the poles drift ~1.5 deg over the five
+// years, so this is at most ~0.8 deg off at either end, which the
+// exclusion radius absorbs. The count is what the scan found, it is
+// not a fixed property of the field.
+#define WMM_DIP_POLE_COUNT 2
+const float wmm_dip_pole[2][2] = {
+    {    85.245f,   131.659f },
+    {   -63.752f,   134.684f },
+};
+
 // Declination values for Epoch 2025.0
 const int16_t wmm_decl_start[37][73] = {
     {  14847,  14347,  13847,  13347,  12847,  12347,  11847,  11347,  10847,  10347,   9847,   9347,   8847,   8347,   7847,   7347,   6847,   6347,   5847,   5347,   4847,   4347,   3847,   3347,   2847,   2347,   1847,   1347,    847,    347,   -153,   -653,  -1153,  -1653,  -2153,  -2653,  -3153,  -3653,  -4153,  -4653,  -5153,  -5653,  -6153,  -6653,  -7153,  -7653,  -8153,  -8653,  -9153,  -9653, -10153, -10653, -11153, -11653, -12153, -12653, -13153, -13653, -14153, -14653, -15153, -15653, -16153, -16653, -17153, -17653,  17847,  17347,  16847,  16347,  15847,  15347,  14847 }, // Lat: -90°

@@ -1,0 +1,82 @@
+# Car with X20P (Galileo HAS active), ICM-45686 IMU and OBD2 wheel speed
+# driving through the Wattkopf tunnel, in the same direction as
+# datasets/tunnel (REQ-VER-032). Main goal of this test: absolute speed
+# aiding (REQ-NAV-068) on real data across a total GNSS outage.
+#
+# Cut out of a 45 min drive: from inside the standstill before the tunnel
+# (auto-ZUPT) to 30 s after the tunnel exit. IMU block-averaged from 800 Hz
+# to 200 Hz to save Git repo storage space (tools/inslib_decimate_dataset.py).
+#
+# Outage is 100.6 s, 1875 m chord.
+#
+# ref.csv is the original GNSS data (the same data as in gnss.csv).
+# No true reference in the tunnel.
+# Scoring metric is the first fix after the tunnel exit (REQ-VER-029).
+
+name: tunnel_odometry
+aiding: gnss
+init: auto
+chi2_disable: 0
+
+# Longer than default dead reckoning time required
+max_deadreckoning_sec: 150.0
+
+# Automotive Mode is important
+automotive_mode: 1
+# Stronger believe in the automotive mode heading from GNSS velocity
+automotive_min_yaw_stddev_deg: 5.0
+# Enable non-holonomic lateral constraints (REQ-NAV-077)
+automotive_lateral_constraint: 1
+
+mag:
+  enable: 1
+  wmm_year: 2026.7  # WMM epoch, from the capture's own NAV-PVT date
+
+baro:
+  acc_bias_init_mps2: 0.05
+  stddev_m: 2.0
+  enable: 1
+
+gnss:
+  leverarm_frd: [0.12, 0.6, -0.7]  # IMU to Antenna offset
+  delay_ms: 200
+
+imu:
+  gyr_psd: 2.5e-08
+  acc_psd: 2.0e-05
+  # FIXME bias random walk not measured for this sensor
+  gyr_bias_rw: 1.0e-06
+  acc_bias_rw: 1.0e-05
+
+  pos_pred_stddev_m_sqrts: 0.05         # more process noise helps a bit
+  auto_zupt_static_gyr_stddev_deg: 0.2  # engine vibration ZUPT tuning
+
+speed:
+  enable: 1    # 0x40/0x80 odometry frames in the capture
+  # OBD2 PID 0x0D reads about 1.8 percent LOW against the GNSS horizontal
+  # speed on this car, estimated from the stretch BEFORE the tunnel only
+  # (above 5 m/s), so the value is not tuned on the scored outage. Left at
+  # 1.0 the odometry makes the tunnel exit worse than no odometry at all.
+  scale: 1.018
+  stddev_mps: 0.0802    # median of the per-sample 1-sigma the producer reported
+  stddev_rel: 0     # speed-proportional 1-sigma, 0 -> library default
+  min_speed_mps: 0  # below this FILTERED speed a sample is skipped, 0 -> library default
+  delay_ms: 87      # median reported age of a sample at its timestamp
+
+score:
+  warmup_sec: 30.0
+  min_epochs: 1000
+  ahrs: 0
+  attitude: 0
+  ref_delay_ms: 200.0 # ref.csv has a 200 ms delay
+  # Don't score total RMS (no ground truth in tunnel available)
+  lim_pos_rms_m: 0
+  lim_ellipsoid_rms_m: 0
+  # Score position after tunnel exit (REQ-VER-029).
+  coast_gap_min_sec: 30.0
+  # Regression tripwire: observed 22.7 m with the odometry, limit 1 m above
+  # that, so a change that costs the coast a metre fails. It also fails with
+  # speed.enable 0 (29.2 m) and with an uncalibrated scale (55.4 m). The
+  # number is reproducible to the millimetre across gcc 11/15, clang 14 and
+  # -O0 to -O3 with FMA. Retighten after an intentional improvement.
+  lim_coast_exit_err_m: 23.7

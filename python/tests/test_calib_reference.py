@@ -24,7 +24,7 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "tools"))
 import inslib_mag_calib as mc          # noqa: E402
-import inslib_ubx_imu_calib as calib   # noqa: E402
+import inslib_imu_calib as calib       # noqa: E402
 
 # Only the NAV-PVT test needs the calibration window, and only for the
 # demo frame builder it happens to own. That window needs PyQt6 and

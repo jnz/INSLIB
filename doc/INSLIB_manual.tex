@@ -89,7 +89,8 @@
     pos_init_stddev_m,vel_init_stddev_mps,rpy_init_stddev_rad_deg,
     yaw_init_stddev_rad_deg,acc_bias_init_stddev_mps2,gyr_bias_init_stddev_rps_deg,
     roll_deg,pitch_deg,rpy_stddev_deg,yaw_deg,yaw_stddev_deg,
-    enable,stddev_ut,min_delay_ms,wmm_year,estimate_bias,fixed_bias,misalignment,stddev_m,acc_bias_rw,
+    enable,stddev_ut,min_delay_ms,wmm_year,estimate_bias,bias_init_ut,bias_rw_ut_sqrts,
+    fixed_bias,misalignment,stddev_m,acc_bias_rw,
     h_process_noise,acc_bias_init_mps2,acc_noise_mps2_sqrthz,gyr_noise_psd,acc_noise_mps2,
     local_gnss_rw_stddev_mps,local_gnss_chi2_threshold,
     local_gnss_min_update_interval_sec,local_gnss_stddev_inflation_factor,
@@ -98,7 +99,9 @@
     lim_baro_rms_m,lim_baro_bias_m,lim_baro_max_m,
     lim_ellipsoid_rms_m,lim_ellipsoid_bias_m,lim_ellipsoid_max_m,
     lim_ars_att_bias_deg,lim_ars_roll_std_deg,lim_ars_pitch_std_deg,
-    lim_ars_yaw_drift_deg_min,inputs},
+    lim_ars_yaw_drift_deg_min,coast_gap_min_sec,lim_coast_exit_err_m,ref_delay_ms,
+    automotive_lateral_constraint,automotive_lateral_stddev_mps,
+    automotive_lateral_max_yaw_rate_deg,automotive_lateral_after_sec,inputs},
   otherkeywords={gnss,ref,none,auto,true,false},
   keywordstyle=\color{cfgKey},
   comment=[l]{\#},
@@ -122,8 +125,9 @@
        \large Software Documentation and Mathematical Models\\[1cm]
        \includegraphics[width=0.33\textwidth]{figures/inslib_logo.pdf}
 }
+\newcommand{\inslibversion}{1.1.0}
 \author{Jan Zwiener \\ \texttt{jan@zwiener.org}}
-\date{\today}
+\date{Version \inslibversion\\[2mm] \today}
 
 \begin{document}
 \maketitle
@@ -168,9 +172,10 @@ robots, indoor platforms) with aerospace-style engineering constraints:
         per-epoch path.
   \item \textbf{Single-precision hot path.} Strapdown, prediction and
         fusion run in 32-bit IEEE 754 \code{float}. 64-bit \code{double} is confined to the
-        absolute-position anchor (ECEF origin, latitude/longitude/height
-        bookkeeping), touched only at initialisation, once per GNSS
-        epoch and in accessors.
+        absolute-position anchor (the geodetic origin, the
+        latitude/longitude/height bookkeeping and the geodetic differences
+        formed against them), touched only at initialisation, in the GNSS
+        residual and in accessors.
   \item \textbf{Fail-operational robustness.} Non-finite inputs (NaN, Inf) are
         dropped at the API boundary, implausible measurements are
         statistically screened, and rejections are counted
@@ -783,9 +788,10 @@ $\vect{b}_m$ & \code{mag\_\allowbreak{}bias} & body (for 18-state mode) & \si{\m
 \bottomrule
 \end{tabular}
 \end{center}
-The absolute position is anchored in double precision: the n-frame
-origin in ECEF, and the current latitude/longitude/height
-$(\varphi,\lambda,h)$ bookkept incrementally (\S\ref{sec:llh}).
+The absolute position is anchored in double precision, geodetically in
+both places: the n-frame origin as $(\varphi,\lambda,h)_{\text{origin}}$,
+and the current latitude/longitude/height $(\varphi,\lambda,h)$ bookkept
+incrementally from it (\S\ref{sec:llh}).
 
 \paragraph{Error state.} 15 elements, extended to 18 when magnetometer
 hard-iron bias estimation is enabled per instance at init:
@@ -897,9 +903,12 @@ $(\varphi, \lambda, h)$ is maintained in double precision from the
   \Delta\lambda = \frac{\Delta p_E}{(R_N + h)\cos\varphi}, \qquad
   \Delta h = -\Delta p_D .
 \end{equation}
-The curvature terms (and $\Rne$, gravity) change only by
+The curvature terms (and gravity) change only by
 $\sim d / R_{\text{earth}}$ per metre of travel and are cached,
-refreshed after every \SI{100}{\metre} of accumulated travel. This keeps
+refreshed after every \SI{100}{\metre} of accumulated travel. $\Rne$ is
+deliberately not among them: no epoch-path computation uses it, so it is
+built on demand in \code{ins\_\allowbreak{}get\_\allowbreak{}velocity\_\allowbreak{}ecef()}
+rather than refreshed inside the worst-case epoch. This keeps
 the double-precision cost at two multiply-adds per step while avoiding
 the classic float breakdown of absolute coordinates ($\sim$\SI{0.5}{\metre}
 resolution at Earth radius in single precision).
@@ -973,11 +982,14 @@ $\delta\vect{x}$ from the nominal state.
 \subsubsection{GNSS position}
 \label{sec:gnss-pos}
 
-The measurement arrives in ECEF (double) with a full $3\times 3$ NED
-covariance. It is converted to $(\varphi,\lambda,h)$ once per epoch (the
-only double-precision math in the fusion path), differenced against the
-filter's anchor at the measurement's time of validity, and mapped to
-metres with the curvature radii. With the GNSS antenna lever arm
+The measurement arrives as geodetic $(\varphi,\lambda,h)$ in double
+precision, the form receivers report, with a full $3\times 3$ NED
+covariance. No coordinate conversion runs on the epoch path: the fix is
+differenced against the filter's anchor at the measurement's time of
+validity directly, and the difference is mapped to metres with the
+curvature radii. A source that is natively ECEF (RTK, UBX-NAV-HPPOSECEF)
+converts once in the caller, outside the filter's worst case. With the
+GNSS antenna lever arm
 $\vect{l}^\bframe$:
 \begin{equation}
   \vect{z}_p = \underbrace{\mathcal{M}\!\left(
@@ -1166,12 +1178,16 @@ Second, the error budget has two parts that scale differently, and
 lumping them together would bias the filter. An OBD-II \code{PID 0x0D}
 value is quantised to \SI{1}{\kilo\metre\per\hour}, a
 \SI{0.080}{\metre\per\second} $1\sigma$ that does not grow with speed.
-The vehicle's speedometer calibration does: EU type approval forbids
-reading low, so a production speedometer reads \SIrange{2}{5}{\percent}
-high, and tyre wear moves it further -- \SI{0.83}{\metre\per\second} at
-\SI{100}{\kilo\metre\per\hour}, ten times the quantisation noise and
-\emph{systematic}. A constant scale factor removes the calibrated part
-and a relative variance prices what is left:
+The scale error of the vehicle's speed signal does: rolling radius, tyre
+wear and the scaling the ECU applies are a few percent, which at the
+library's default \SI{3}{\percent} is \SI{0.83}{\metre\per\second} at
+\SI{100}{\kilo\metre\per\hour} -- ten times the quantisation noise and
+\emph{systematic}. Its sign is not predictable from the type-approval
+margin that keeps an indicated speed from ever falling below the true
+one: that constrains the dashboard, whereas \code{PID 0x0D} is the ECU's
+own value and a different number from the one the cluster shows. A
+constant scale factor removes the calibrated part and a relative variance
+prices what is left:
 \begin{equation}
   z_{\text{meas}} = s_{\text{scale}}\, z_{\text{raw}} , \qquad
   R = \sigma_{\text{sample}}^2 + \left(k_{\text{rel}}\,
@@ -1179,6 +1195,9 @@ and a relative variance prices what is left:
 \end{equation}
 No scale-factor state is estimated: this stays a measurement-boundary
 feature and leaves the runtime-selected state size untouched.
+\code{tools/inslib\_\allowbreak{}speed\_\allowbreak{}scale.py} fits
+$s_{\text{scale}}$ against GNSS speed and prints the \code{config.yaml}
+value.
 
 The reading is unsigned by contract (an OBD-II speed PID cannot express
 reverse), so a negative value is treated as a unit or sign error and dropped
@@ -1314,6 +1333,26 @@ why the bias is estimated \emph{inside} the filter, where the yaw/bias
 cross-covariance is maintained, instead of in an external calibration
 estimator.
 
+\paragraph{Tuning the hard-iron states.} Two parameters govern them:
+\code{mag\_bias\_init\_stddev\_ut} (\SI{10}{\micro\tesla} by default),
+the prior on how much hard iron the filter should be prepared to find,
+and \code{mag\_bias\_pred\_stddev\_ut\_sqrts}
+(\SI{0.129}{\micro\tesla\per\sqrt\second} by default, which is
+\SI{1}{\micro\tesla} per minute), the random walk. Neither is right
+everywhere. The initial sigma is the stronger lever: a recording whose
+magnetometer was calibrated where it sits wants a tight prior, while a
+unit just installed in an unknown vehicle does not, since
+\SIrange{10}{20}{\micro\tesla} of vehicle hard iron is ordinary. The
+random walk is better read as how long the estimate keeps listening
+after it has settled than as a physical drift rate: hard iron steps
+when ferrous mass moves rather than wandering continuously, and what
+the number decides is whether such a step is still followed. Against a
+per-axis sigma of a few \si{\micro\tesla} fused at about \SI{1}{\hertz}
+the state settles near $(q^2\,\dt\,R)^{1/4}$ and admits $q\sqrt{T}$ of
+drift over a time $T$; too small a value converges to a confidence it
+then cannot be talked out of. Both are exposed to the replay harness as
+\code{mag.bias\_init\_ut} and \code{mag.bias\_rw\_ut\_sqrts}.
+
 \paragraph{Field-strength disturbance gate.} Once a position is known
 (\S\ref{sec:wmm}), the measured magnitude is compared against the WMM
 total field $B_{\text{WMM}}$. With relative deviation
@@ -1325,7 +1364,9 @@ gate is defense-in-depth over the vector chi-square test (it bites when
 the measurement noise is set loose) and can be disabled for
 uncalibrated magnetometers. Fusion requires per-axis variances
 (no default) and is rate-limited: it is skipped when the horizontal
-reference field is unusable (magnetic poles).
+reference field is unusable, either because the reference vector itself
+is degenerate or because the position lies inside a dip pole exclusion
+zone (\S\ref{sec:wmm-dipzone}).
 
 \paragraph{Weight and rate limit: a long-term anchor, not a yaw sensor.}
 Since only the yaw column survives, the length of that column is the
@@ -1440,7 +1481,7 @@ point:
         letting the running fusion pull it in (e.g.\ from lever-arm or
         velocity coupling).
   \item \textbf{Position/velocity} from the fix; with a local-position
-        fix the caller's ECEF anchor is kept as origin and the fix sets
+        fix the caller's geodetic anchor is kept as origin and the fix sets
         \code{pos\_\allowbreak{}local}, so subsequent local measurements stay
         consistent.
   \item \textbf{Height source} is latched once here, for a GNSS bootstrap only,
@@ -1776,9 +1817,11 @@ configuration cannot invert it.
 \label{sec:origin-shift}
 
 \code{ins\_\allowbreak{}shift\_\allowbreak{}origin\_\allowbreak{}down($\Delta z$)} moves the n-frame origin
-along the local down axis without changing the absolute solution: the
-ECEF origin moves by $\Delta z \cdot \vect{e}_D^{\,\eframe}$ (third
-column of $\Rne$), \code{pos\_\allowbreak{}local[2]} (state and history) shifts by
+along the local down axis without changing the absolute solution. Down is
+the ellipsoid normal, which is the axis the height is measured along, so
+the shift touches the origin height alone: $h_{\text{origin}}$ decreases by
+$\Delta z$ while $\varphi_{\text{origin}}$ and $\lambda_{\text{origin}}$ stay
+bit-for-bit unchanged, \code{pos\_\allowbreak{}local[2]} (state and history) shifts by
 $-\Delta z$, and $(\varphi,\lambda,h)$, covariance and Earth caches are
 untouched -- the shift is deterministic, so no uncertainty is added.
 The suite uses this to align the ins vertical datum with an
@@ -1896,7 +1939,11 @@ and fused as a scalar heading residual
 Only yaw is observed; magnetic disturbances cannot tilt roll/pitch.
 Fusion is skipped near gimbal lock, for near-zero fields, and when the
 de-tilted horizontal component is unusably small relative to the total
-field (magnetic poles).
+field. The latter is a measurement-side guard and only bites within
+about a degree of a dip pole, so it is backed by the position-side
+exclusion zone (\S\ref{sec:wmm-dipzone}), which withdraws the heading
+reference over the surrounding region where the declination is already
+unusable.
 
 In contrast to ins's vector fusion (\S\ref{sec:ins-mag}), the scalar
 heading uses only the field \emph{direction} and is therefore
@@ -1924,6 +1971,31 @@ slewing there over subsequent magnetometer updates. Covariance and gyro
 bias are untouched -- a known rotation adds no uncertainty. The
 $+\delta_{\text{decl}}$ term stays in the measurement model, holding the
 steady state at true north.
+
+The step is only sound while the yaw is \emph{magnetically anchored},
+which is what makes the rotation a known one. Inside a dip pole
+exclusion zone (\S\ref{sec:wmm-dipzone}) the AHRS suspends magnetometer
+yaw fusion and keeps its previous declination, so the yaw is carried by
+the gyro instead. On the position that leaves the zone the new
+declination is therefore adopted \emph{without} re-framing the
+attitude, and the fusion pulls the accumulated drift out through the
+ordinary covariance weighting. Re-framing there would be actively
+harmful: the declination on the far side of a dip pole differs by tens
+of degrees (about $80^\circ$ for a typical crossing), and applying that
+as a rotation would corrupt an otherwise sound estimate rather than
+correct it. Roll and pitch are unaffected throughout, only the heading
+reference is withdrawn.
+
+The one case with no previous declination to keep is a first position
+that already lies inside a zone, after the yaw has been fused against
+magnetic north. That yaw is a magnetic heading, and no re-framing will
+ever make it a true one, so the AHRS widens its yaw variance to
+``heading unknown'' there instead of letting the covariance of that
+fusion stand. While the attitude-precision restart watchdog is armed the
+widened value stays just below its yaw threshold, since a restart would
+discard the zone state together with the position. Otherwise the nav\_suite attitude hint would hand the
+magnetic heading to ins as a converged true heading. A yaw that was
+never fused against the magnetometer keeps its variance.
 
 % ==============================================================================
 \section{Vertical channel: height systems, baro\_alt and the offset filter}
@@ -2310,19 +2382,24 @@ bootstrap, then frozen, and survives \code{ins} resets.
 \paragraph{WGS84 (the GNSS side).} \code{nav\_\allowbreak{}suite\_\allowbreak{}local\_\allowbreak{}to\_\allowbreak{}wgs84()}
 and its inverse \code{nav\_\allowbreak{}suite\_\allowbreak{}wgs84\_\allowbreak{}to\_\allowbreak{}local()} convert between a
 local NED position (relative to the datum origin) and geodetic
-lat/lon/ellipsoid-height, using the $n$-frame origin
-$\vect{r}_{\text{origin}}^{\,e}$ and the $n\!\rightarrow\!e$ rotation:
+lat/lon/ellipsoid-height. Both directions use the same curvature-radii
+mapping $\mathcal{M}$ that the filter moves its own anchor with
+(\S\ref{sec:llh}), applied around the geodetic origin
+$(\varphi,\lambda,h)_{\text{origin}}$:
 \begin{equation}
-  \vect{r}^{\,e} = \vect{r}_{\text{origin}}^{\,e}
-    + \mat{R}^e_n\,\vect{p}_{\text{local}}^{\,n},
+  (\varphi,\lambda,h) = (\varphi,\lambda,h)_{\text{origin}}
+    + \mathcal{M}^{-1}\!\left(\vect{p}_{\text{local}}^{\,n}\right),
   \qquad
-  \vect{p}_{\text{local}}^{\,n} = \mat{R}^n_e
-    \left( \vect{r}^{\,e} - \vect{r}_{\text{origin}}^{\,e} \right),
+  \vect{p}_{\text{local}}^{\,n} = \mathcal{M}\!\left(
+    (\varphi,\lambda,h) - (\varphi,\lambda,h)_{\text{origin}} \right).
 \end{equation}
-followed by the usual ECEF\,$\leftrightarrow$\,geodetic step. This is the
-GNSS-side counterpart of the local-position offset: it turns the local
-solution into WGS84 for telemetry, or WGS84 waypoints into the frame a
-controller flies in.
+There is deliberately no detour through ECEF here: routing it that way
+would answer the same question with a different approximation than the
+filter's own position bookkeeping uses, so the local frame and the
+absolute solution would disagree at the metre level far from the origin.
+This is the GNSS-side counterpart of the local-position offset: it turns
+the local solution into WGS84 for telemetry, or WGS84 waypoints into the
+frame a controller flies in.
 
 Both WGS84 converters, like \code{nav\_\allowbreak{}suite\_\allowbreak{}get\_\allowbreak{}height\_\allowbreak{}ellipsoid}
 (\S\ref{sec:heightsystems}), are available only once a real GNSS fix has
@@ -2360,6 +2437,75 @@ and arms the field-strength gate,
 step and $F$ for the opt-in gate. Like geodetic\_toolbox, the module
 carries no filter policy -- ``is this measurement trustworthy'' is
 decided in the filters.
+
+\subsection{Declination is a wrapped angle}
+\label{sec:wmm-wrap}
+
+$D$ lives in $(-180^\circ, +180^\circ]$, so two neighbouring grid nodes
+can sit on opposite sides of that cut while being a few degrees apart
+(for example $-176.5^\circ$ and $+178.5^\circ$). Interpolating the
+tabulated numbers directly would then run the long way round and return
+a value off by up to $180^\circ$. Both the spatial and the temporal
+interpolation therefore put the operands on a common branch first: the
+secular change per node is taken the short way, and the three
+neighbouring nodes are shifted next to the first before the bilinear
+blend. The affected cells lie along the agonic line trailing each dip
+pole, which is where the filters are most in need of a trustworthy
+heading reference.
+
+\subsection{Dip pole exclusion zones}
+\label{sec:wmm-dipzone}
+
+At a magnetic dip pole the horizontal field vanishes, so $D$ is not
+merely inaccurate there but ill-conditioned: it rotates through the full
+circle around the pole, and no regular grid resolves that. The exact
+model puts the residual interpolation error at roughly $179^\circ$
+within a degree of a pole; outside the $7^\circ$ exclusion radius the
+worst case is about $10^\circ$, for $0.75\,\%$ of the Earth's surface. A
+magnetometer is no better off, because the horizontal component it needs
+has fallen to a few percent of the total field.
+
+\code{magnetic\_\allowbreak{}dip\_\allowbreak{}pole\_\allowbreak{}distance\_\allowbreak{}deg()} reports the
+great-circle distance to the nearest dip pole and
+\code{magnetic\_\allowbreak{}heading\_\allowbreak{}reference\_\allowbreak{}valid()} is false within
+\code{MAGNETIC\_\allowbreak{}DIP\_\allowbreak{}POLE\_\allowbreak{}EXCLUSION\_\allowbreak{}DEG} of one. Inclination
+and total field strength stay usable inside a zone, only the heading
+reference is withdrawn. Three properties are worth stating explicitly:
+
+\begin{description}
+  \item[Great circle, not latitude and longitude.] Near the northern
+    pole a degree of longitude covers about a twelfth of the ground a
+    degree of latitude does ($46$\,km against $555$\,km at
+    $85^\circ$\,N), so a box in coordinates would be wrong by an order
+    of magnitude in one direction.
+  \item[Not a latitude limit.] The southern dip pole sits near
+    $64^\circ$\,S, far from the geographic pole, so no cutoff on
+    latitude separates the zones from ordinary terrain without
+    discarding the whole subantarctic.
+  \item[The count is data, not an invariant.] The number of dip poles
+    and their positions are measured per epoch by the generator and
+    tabulated (\code{WMM\_\allowbreak{}DIP\_\allowbreak{}POLE\_\allowbreak{}COUNT}), and the runtime
+    walks whatever it finds. Today's field has two, both drifting, the
+    northern one by roughly $33$\,km per year. That is a property of the
+    present dipole dominance rather than something the code may assume.
+  \item[No interpolation in time.] Positions are tabulated once at
+    mid-epoch and the query takes no year, unlike the declination. Over
+    five years the poles move about $1.5^\circ$, so a fixed mid-epoch
+    position is at most $\sim0.8^\circ$ off at either end -- smaller
+    than the slack in the radius, and smaller than the uncertainty in
+    picking that radius in the first place. Interpolating would compute
+    a correction finer than the quantity it feeds. The generator
+    measures the drift on every regeneration and refuses to emit
+    positions that exceed the budgeted margin.
+\end{description}
+
+Because the poles move, the exclusion radius wants re-examining whenever
+the tables are regenerated. \code{magneticmodel/wmm\_\allowbreak{}error\_\allowbreak{}analysis.py}
+re-measures the shipped table against the exact model and reports the
+residual error outside the zones for exactly that purpose. Sample it at
+$0.5^\circ$ or finer: the worst points sit on a thin ridge at the
+exclusion boundary, and a coarser grid steps over them and understates
+the maximum.
 
 % ==============================================================================
 \section{Design decisions}
@@ -2427,7 +2573,16 @@ one place, the detailed context is in the sections above.
     known rotation, so it is applied as an instantaneous re-frame of
     the nominal quaternion, not learned through the fusion (which would
     slew the heading over seconds and, transiently, disagree with the
-    covariance).
+    covariance). It is skipped on leaving a dip pole exclusion zone,
+    where the yaw was carried by the gyro rather than the field and the
+    rotation would therefore not be a known one
+    (\S\ref{sec:wmm-dipzone}).
+  \item[Dip pole zones are excluded by distance, not by latitude.] The
+    southern dip pole sits near $64^\circ$\,S, so a latitude cutoff
+    cannot separate the degenerate region from ordinary terrain. The
+    number of poles and their drifting positions are measured per epoch
+    and tabulated rather than assumed in code, because both are
+    properties of the present field and not invariants.
   \item[Conservative defaults everywhere.] A zero/unset noise field
     never means ``no noise'' -- it means ``use a conservative
     consumer-MEMS placeholder''. An overconfident filter fails
@@ -2497,7 +2652,8 @@ one place, the detailed context is in the sections above.
 
 A dataset directory carries the neutral CSV streams
 (\code{imu.csv}, \code{ref.csv}, and optionally \code{gnss.csv}, \code{mag.csv},
-\code{baro.csv}, the column contract lives in \code{datasets/replay\_\allowbreak{}format.py})
+\code{baro.csv}, \code{speed.csv}, the column contract lives in
+\code{datasets/replay\_\allowbreak{}format.py})
 plus one \code{config.yaml} that tells the harness \emph{how} to run the filter:
 aiding source, initialisation mode, the sensor noise model, sensor calibration
 and lever arms, aiding-quality gates, the (non-filter) scoring thresholds, and
@@ -2799,6 +2955,8 @@ mag:
                              # negative -> fuse every sample)
   wmm_year: 2025.0          # decimal year for the declination lookup
   estimate_bias: 0          # 18-state hard-iron bias
+  bias_init_ut: 0.0         # INITIAL hard-iron stddev [uT], 0 -> default
+  bias_rw_ut_sqrts: 0.0     # hard-iron random walk [uT/sqrt(s)], 0 -> default
   fixed_bias: [0,0,0]       # hard-iron [uT],  misalignment: soft-iron 3x3
   misalignment: [1,0,0, 0,1,0, 0,0,1]
 
@@ -2854,6 +3012,7 @@ inputs:                     # optional per-stream CSV filename overrides
   gnss: gnss_f9p.csv        # e.g. swap only the receiver, keep the rest shared
   mag:  mag.csv
   baro: baro.csv
+  speed: speed.csv
 \end{lstlisting}
 
 \paragraph{Top level.}
@@ -3133,9 +3292,15 @@ consume the same physical gyro/accelerometer.
     exposed to the platform (a synthesized or externally validated heading
     stream) is the case for switching the limit off.
   \item[\code{mag: wmm\_\allowbreak{}year}] \emph{decimal year.} Epoch for the World Magnetic
-    Model declination lookup. Optional: without it the epoch comes from GPS
-    time in the stream, failing that from the UTC date the receiver reports
-    in NAV-PVT, and failing that from the host clock.
+    Model declination lookup. For the live receiver (\code{insrcv}) it is
+    optional: without it the epoch comes from GPS time in the stream,
+    failing that from the UTC date the receiver reports in NAV-PVT, and
+    failing that from the host clock. The replay harnesses have no date
+    source of their own, so there it is required whenever \code{mag: enable}
+    is set: without it no reference field is built, the magnetometer is
+    not fused, and the harness warns once at start-up.
+    \code{tools/inslib\_\allowbreak{}convert\_\allowbreak{}ubx\_\allowbreak{}to\_\allowbreak{}csv.py} fills it in
+    from the capture's NAV-PVT date.
   \item[\code{mag: estimate\_\allowbreak{}bias}] \emph{0/1, default 0.} Run \code{ins} in its
     18-state mode estimating a hard-iron bias online.
     Observable only under rotation.
@@ -3187,6 +3352,20 @@ consume the same physical gyro/accelerometer.
     noise source.
 \end{description}
 
+\paragraph{Non-holonomic lateral constraint (top level, optional).}
+\code{automotive\_\allowbreak{}lateral\_\allowbreak{}constraint} [0/1, default 0] fuses a synthetic
+measurement stating that a wheeled vehicle does not travel sideways: the
+body-frame lateral velocity against a truth of zero (REQ-NAV-077). It needs
+\code{automotive\_\allowbreak{}mode} and shares its \code{automotive\_\allowbreak{}min\_\allowbreak{}speed\_\allowbreak{}mps}.
+What the constraint is for is its attitude row, whose gain is the ground
+speed: at 20\,m/s one degree of roll error is 0.35\,m/s of lateral body
+velocity, and during a GNSS outage that channel is otherwise unobserved.
+\code{automotive\_\allowbreak{}lateral\_\allowbreak{}stddev\_\allowbreak{}mps} [m/s] is the
+measurement noise, \code{automotive\_\allowbreak{}lateral\_\allowbreak{}max\_\allowbreak{}yaw\_\allowbreak{}rate\_\allowbreak{}deg}
+[deg/s] skips the fusion in turns where side slip breaks the
+assumption, and \code{automotive\_\allowbreak{}lateral\_\allowbreak{}after\_\allowbreak{}sec} [s] holds it off until the filter has been that long
+without a GNSS fusion.
+
 \paragraph{\code{score:} --- evaluation only (never touches the filter).}
 Used by the accuracy summary, the plots and the regression gates. \code{warmup\_\allowbreak{}sec}
 [s, default 60] delays scoring after the first fix, \code{ahrs} [0/1] also scores
@@ -3207,6 +3386,38 @@ ellipsoidal height the suite reports (\S\ref{sec:heightsystems}), and the
 \code{ahrs: 1}. \code{attitude} [0/1, default 1] is the opt-out for a
 dataset whose \code{ref.csv} carries no attitude truth: with it at 0 the
 attitude columns are neither scored nor gated.
+
+\code{ref\_\allowbreak{}delay\_\allowbreak{}ms} [ms, default 0] states that a reference row
+timestamped $T$ describes the state at $T$ minus that delay, and the harness
+scores every comparison at that time of validity (REQ-VER-030). Set it to
+mirror \code{gnss: delay\_\allowbreak{}ms} whenever \code{ref.csv} comes out of the same
+receiver output as the aiding: \code{gnss: delay\_\allowbreak{}ms} tells the filter how old
+a fix is so that it reports where the vehicle is NOW, while the reference row
+still describes where it was, so comparing both at a shared timestamp
+penalises the filter by speed times delay --- and penalises it more the
+better it compensates. Leave it at 0 for an independent reference (Lighthouse,
+synthetic truth) and for a dataset that models the latency in its data rather
+than its config. A nonzero value with \code{aiding: ref} is refused, since
+there the reference is the aiding.
+
+\code{coast\_\allowbreak{}gap\_\allowbreak{}min\_\allowbreak{}sec} [s, 0 $	o$ off] turns on the
+coasting re-acquisition metric (REQ-VER-029): every gap in the aiding file
+longer than it is reported with its duration, the straight-line distance
+across it and the filter's position error at the first IMU epoch at or after
+its end, scored against the reference epoch nearest to that IMU epoch (none
+further than half a second, or half the gap, away), and \code{lim\_\allowbreak{}coast\_\allowbreak{}exit\_\allowbreak{}err\_\allowbreak{}m} [m, 0 $	o$ not
+gated] is the guard-rail on that error. This is the metric for a dataset with
+a real outage, where the whole-run \code{lim\_\allowbreak{}pos\_\allowbreak{}rms\_\allowbreak{}m} cannot
+answer the question: no fixes means no reference inside the gap, and a filter
+that gives the coasting solution up scores BETTER on the RMS than one that
+coasts through, because it contributes no epochs where the error is large.
+The error is sampled before that epoch's measurements are fused --- the
+returning fix snaps the position onto the truth in the same epoch it arrives,
+so a sample taken afterwards reports how good the fix was rather than how far
+the coasting drifted. Having no solution when aiding returns counts as a
+failure of this gate rather than as a skipped epoch. The gaps are taken from the aiding file,
+not from what the filter chose to fuse, so the number stays comparable across
+configurations that gate fixes differently.
 
 \paragraph{\code{inputs:} --- CSV filename overrides (optional).}
 Per-stream keys \code{imu}, \code{ref}, \code{gnss}, \code{mag}, \code{baro},
@@ -3518,9 +3729,9 @@ format (REQ-VER-003), written by the shared helpers in
 harnesses read the same bytes. Only \code{imu.csv} drives the filter,
 \code{ref.csv} is the independent ground truth (used for scoring, for
 \code{init: ref}, and to synthesise fixes under \code{aiding: ref}),
-\code{gnss.csv}, \code{mag.csv} and \code{baro.csv} are consumed only when the
-matching \code{aiding}/sensor option is on. The first line of each file is a
-\code{\#} header, every column layout:
+\code{gnss.csv}, \code{mag.csv}, \code{baro.csv} and \code{speed.csv} are
+consumed only when the matching \code{aiding}/sensor option is on. The
+first line of each file is a \code{\#} header, every column layout:
 
 \begin{lstlisting}[basicstyle=\ttfamily\footnotesize,columns=fixed,keepspaces=true]
 # imu.csv    (required, drives the filter)
@@ -3542,6 +3753,10 @@ matching \code{aiding}/sensor option is on. The first line of each file is a
 
 # baro.csv   (optional, baro: enable)
   t_us, static_pressure [Pa]
+
+# speed.csv  (optional, speed: enable) -- any further columns are the
+#            producer's own record, both harnesses read the first two
+  t_us, speed_mps
 \end{lstlisting}
 
 \noindent Conventions shared by all streams:
@@ -3644,6 +3859,21 @@ For completeness -- the process itself is documented in
   \item \textbf{Static analysis} (\code{make cppcheck}, \code{make
     clang-tidy}): complements the compiler warnings (\code{-Wall -Wextra} plus
     a wider set) with two independent tools over the production sources.
+  \item \textbf{Stack usage} (\code{make stack}): compiles the library with
+    GCC's \code{-fcallgraph-info=su}, which reports the frame size of every
+    function and the call graph after inlining, and computes the worst-case
+    stack of every public API function along its deepest call chain
+    (\code{scripts/stack\_usage.py}). It fails on recursion, variable length
+    arrays, calls through function pointers or into library functions that
+    \code{scripts/stack\_usage.cfg} does not give a figure for, and on a
+    worst case above its budget in that file. The budgets there are for an
+    x86\_64 host. For a target, run the script with its cross compiler and
+    build flags and a config holding the figures of its C library: the
+    script reads several config files and, given the stack a program
+    reserves, checks the main task plus nested interrupt handlers and
+    exception frames against it. Frame sizes depend on the architecture and
+    the optimization level, so a host figure is no substitute for the
+    target's.
     \code{make check-all} runs every gate above (plus \code{make coverage}
     and a \code{make doxygen} pass that treats any undocumented function or
     parameter as a failure) independently and prints a pass/fail summary,

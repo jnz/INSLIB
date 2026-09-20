@@ -48,12 +48,14 @@ quantised to 1 km/h, so the floor is the uniform-quantisation sigma
 1/sqrt(12) km/h = 0.080 m/s. Added to it in quadrature is what the delay
 uncertainty costs, |dv/dt| * sigma_delay: misdating a constant speed is
 free, so that term vanishes at cruise and dominates under braking. The
-SYSTEMATIC error - a speedometer that by EU type approval may
-never read low and in practice reads 2..5% high, plus tyre wear - is
-deliberately NOT folded in here: it is a property of the vehicle, not of
-the sample, and belongs in the filter's speed_scale / speed_stddev_rel
-(see ins_options_t). Mixing the two would hide a constant bias inside a
-per-sample noise figure.
+SYSTEMATIC error - rolling radius, tyre wear and whatever scaling the ECU
+applies - is deliberately NOT folded in here: it is a property of the
+vehicle, not of the sample, and belongs in the filter's speed_scale /
+speed_stddev_rel (see ins_options_t). Do not assume its sign: the
+type-approval margin that forbids an indicated speed below the true one
+applies to the DASHBOARD, while this PID is the ECU's own value, and
+which of the two is larger differs from vehicle to vehicle. Mixing the
+two would hide a constant bias inside a per-sample noise figure.
 
 WHAT THE DELAY FIGURE MEANS. The value is sampled somewhere between the
 request going out and the response coming back, so the best estimate of

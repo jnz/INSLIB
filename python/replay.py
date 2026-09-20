@@ -22,6 +22,8 @@ Usage:
         --plot --plot-out /tmp/plots.pdf  # save a multi-page PDF instead
     python3 python/replay.py datasets/some/dataset \\
         --kml /tmp/flight.kml           # Google Earth output
+    python3 python/replay.py datasets/some/dataset \\
+        --map-frames /tmp/frames        # OpenStreetMap PNG frame sequence
 
 --plot draws the filter's state history (position/velocity/attitude) with
 a 1-σ band from its own error-state covariance, the ground truth overlaid on
@@ -40,7 +42,14 @@ sampling-rate page, each input stream's Hz bucketed over time (bucket width
 time-animated gx:Track (drag Google Earth's time slider to fly the replay)
 with a small 3D model banking/pitching along the real roll/pitch/yaw, plus
 static ground-track lines for the estimate (draped down to the ground so
-climbs/descents are visible) and the ground truth.
+climbs/descents are visible), the ground truth and the raw GNSS fix.
+
+--map-frames writes a portrait PNG frame sequence (see ins_map_frames.py):
+raw GNSS fix and INSLIB estimate revealed over time on an OpenStreetMap
+background, with a band marking the real tunnel/underpass geometry pulled
+from the Overpass API -- meant for a stretch of a drive a Google Earth
+flyover cannot show (no hollow tunnel interior there). Prints the ffmpeg
+command to stitch the frames into a video; does not run ffmpeg itself.
 
 The GNSS-delay estimate cross-correlates baro_alt's own
 down-velocity (assumed ~zero latency) against the held GNSS down-velocity
@@ -55,7 +64,10 @@ reference used for scoring). Needs a trial with real vertical motion
 peak.
 
 Requires the converted dataset (datasets/), PyYAML,
-pymavlink for --mavlink, matplotlib for --plot and simplekml for --kml.
+pymavlink for --mavlink, matplotlib for --plot, simplekml for --kml
+(plus optional pyproj for its real-altitude geoid correction), and
+matplotlib/Pillow for --map-frames (plus network access for its
+OpenStreetMap tiles and tunnel geometry -- degrades gracefully without).
 --estimate-gnss-delay needs no extra dependency.
 
 (c) Jan Zwiener (jan@zwiener.org)
@@ -90,6 +102,13 @@ DEFAULTS = {
     "automotive_mode": 0,
     "automotive_min_speed_mps": 0.0,
     "automotive_min_yaw_stddev_deg": 0.0,
+    # Non-holonomic lateral velocity constraint (REQ-NAV-077). A filter
+    # option, so this harness applies it rather than only accepting it:
+    # one config.yaml has to mean the same thing to both.
+    "automotive_lateral_constraint": 0,
+    "automotive_lateral_stddev_mps": 0.0,
+    "automotive_lateral_max_yaw_rate_deg": 0.0,
+    "automotive_lateral_after_sec": 0.0,
     "chi2_disable": 0,  # REQ-SYS-015/REQ-VER-011: disable chi2 outlier
                         # downweighting library-wide (diagnostics only)
     "chi2_reject_alpha": 0.0,  # REQ-NAV-046: global chi2 gate significance;
@@ -353,6 +372,12 @@ DEFAULTS = {
         "lim_ellipsoid_max_m": 0.0,
         "lim_ars_att_bias_deg": 0.0, "lim_ars_roll_std_deg": 0.0,
         "lim_ars_pitch_std_deg": 0.0, "lim_ars_yaw_drift_deg_min": 0.0,
+        # Coasting re-acquisition (REQ-VER-029). Scored by replay.c, which
+        # owns the regression gates; this harness only has to accept the
+        # keys so one config.yaml stays readable by both (REQ-VER-025).
+        "coast_gap_min_sec": 0.0, "lim_coast_exit_err_m": 0.0,
+        # Time of validity of a reference row (REQ-VER-030).
+        "ref_delay_ms": 0.0,
         # check_simulated.py: "ins pos rms <= this x the Groves textbook
         # filter's own rms". Needs ref_groves_kf_sol.csv, which only the
         # simulated datasets carry, so this harness has nothing to do with it
@@ -668,7 +693,7 @@ def ref_overlay_tree(ref_now, ref_local):
 def meas_overlay_tree(acc_mps2, gyr_rps, fix, mag, baro,
                       origin_ecef, origin_lat, origin_lon):
     """PlotJuggler view of the raw input measurements (everything fed to
-    nav.imu()/gnss_pos()/mag()/baro() this epoch), alongside the estimate
+    nav.imu()/gnss_pos_llh()/mag()/baro() this epoch), alongside the estimate
     and ground truth published in the same publish() call:
 
       meas/imu    -> raw acc/gyro this epoch (vs. INSLIB/acc_n, INSLIB/rate_dps)
@@ -1302,6 +1327,11 @@ def build_config(spec, ref0, t0_us, lat0, lon0, h0, gyr_bias):
         automotive_mode=bool(spec["automotive_mode"]),
         automotive_min_speed_mps=spec["automotive_min_speed_mps"],
         automotive_min_yaw_stddev=math.radians(spec["automotive_min_yaw_stddev_deg"]),
+        automotive_lateral_constraint=bool(spec["automotive_lateral_constraint"]),
+        automotive_lateral_stddev_mps=spec["automotive_lateral_stddev_mps"],
+        automotive_lateral_max_yaw_rate=math.radians(
+            spec["automotive_lateral_max_yaw_rate_deg"]),
+        automotive_lateral_after_sec=spec["automotive_lateral_after_sec"],
         chi2_disable=bool(spec["chi2_disable"]),
         chi2_reject_alpha=float(spec["chi2_reject_alpha"]),
         # Absolute speed aiding calibration (REQ-NAV-068). 0 keeps the
@@ -2359,7 +2389,25 @@ def main():
                          "time slider) plus static ground-track lines for "
                          "the estimate and the ground truth")
     ap.add_argument("--kml-hz", type=float, default=2.0,
-                    help="sampling rate for the --kml track (in sim time)")
+                    help="sampling rate for the --kml/--map-frames track "
+                         "(in sim time); raise it for smoother --map-frames "
+                         "motion at a high --map-fps")
+    ap.add_argument("--map-frames", default=None,
+                    help="write a portrait PNG frame sequence to this "
+                         "directory: raw GNSS fix (red) and INSLIB estimate "
+                         "(cyan) revealed over time on an OpenStreetMap "
+                         "background, with real tunnel geometry (Overpass "
+                         "API) shaded in -- see ins_map_frames.py. Prints "
+                         "the ffmpeg command to stitch the frames into a "
+                         "video")
+    ap.add_argument("--map-fps", type=float, default=20.0,
+                    help="frame rate for --map-frames")
+    ap.add_argument("--map-t-start", type=float, default=None,
+                    help="--map-frames: seconds into the replay to start "
+                         "at (default: the start of the recorded track)")
+    ap.add_argument("--map-t-end", type=float, default=None,
+                    help="--map-frames: seconds into the replay to end at "
+                         "(default: the end of the recorded track)")
     ap.add_argument("--estimate-gnss-delay", action="store_true",
                     help="force the GNSS-delay estimate on "
                          "even outside the auto-detected case (aiding: "
@@ -2435,6 +2483,20 @@ def main():
     ref = load_ref(ref_path)
     if not ref:
         sys.exit(f"no reference epochs in {ref_path}")
+
+    # Move every reference row onto its own time of validity (REQ-VER-030),
+    # the same shift tools/replay.c applies at load, so one config.yaml scores
+    # the same in both harnesses.
+    ref_delay_ms = float(spec["score"].get("ref_delay_ms", 0.0))
+    if ref_delay_ms:
+        if spec["aiding"] == "ref":
+            sys.exit(f"{data_dir}: score: ref_delay_ms cannot be used with "
+                     "aiding: ref")
+        shift_us = int(ref_delay_ms * 1000.0)
+        for r in ref:
+            r["t_us"] -= shift_us
+        print(f"reference time of validity: {ref_delay_ms:.0f} ms earlier "
+              "than its timestamps (score: ref_delay_ms)")
 
     gnss_cfg = spec["gnss"]
     gnss_delay_ms = int(gnss_cfg.get("delay_ms", 0.0))
@@ -2641,6 +2703,13 @@ def main():
         # Both attitude sources agree on true north (WMM declination).
         nav.set_magnetic_model(ref[0]["lat_rad"], ref[0]["lon_rad"],
                                float(mag_cfg["wmm_year"]))
+    elif mags:
+        # Same up-front warning as tools/replay.c: without an epoch there is
+        # no reference field and every magnetometer sample is rejected.
+        print("  WARNING: mag.enable is set but mag.wmm_year is missing, no"
+              " magnetic reference field is built and the magnetometer will"
+              " not be fused (tools/inslib_convert_ubx_to_csv.py derives it"
+              " from NAV-PVT)")
     tele = Telemetry(plotjuggler=args.plotjuggler, mavlink=args.mavlink,
                      pj_port=args.pj_port, mav_port=args.mav_port,
                      pj_log=args.flight_log)
@@ -2803,8 +2872,12 @@ def main():
     last_track_us = None
     track_period_us = US_PER_SEC / max(args.plot_track_hz, 1e-3)
 
-    kml_est_track = [] if args.kml else None
-    kml_ref_track = [] if args.kml else None
+    # Shared by --kml and --map-frames: both consume the same recorded
+    # geodetic track, just render it differently.
+    do_kml_track = bool(args.kml) or bool(args.map_frames)
+    kml_est_track = [] if do_kml_track else None
+    kml_ref_track = [] if do_kml_track else None
+    kml_fix_track = [] if do_kml_track else None
     last_kml_us = None
     kml_period_us = US_PER_SEC / max(args.kml_hz, 1e-3)
 
@@ -2856,13 +2929,13 @@ def main():
     # reach the filter (same key and same meaning as tools/insrcv.c).
     gnss_enable = bool(spec["gnss"]["enable"])
     fi_spec = spec["free_inertial_start"]
-    fi_ecef = fi_cov = None
+    fi_llh = fi_cov = None
     fi_next_t_us = 0
     n_fi_offers = 0
     if fi_spec["enable"]:
-        fi_ecef = llh_to_ecef(math.radians(fi_spec["lat_deg"]),
-                              math.radians(fi_spec["lon_deg"]),
-                              float(fi_spec["height_m"]))
+        fi_llh = (math.radians(fi_spec["lat_deg"]),
+                  math.radians(fi_spec["lon_deg"]),
+                  float(fi_spec["height_m"]))
         fi_var = float(fi_spec["stddev_m"]) ** 2
         fi_cov = [fi_var, 0.0, 0.0, 0.0, fi_var, 0.0, 0.0, 0.0, fi_var]
 
@@ -2887,20 +2960,20 @@ def main():
         # solution to it instead of dead reckoning. Never in an epoch that
         # already carries a real fix: a measured position beats a declared
         # one. Mirrors fi_offer_start_position() in tools/insrcv.c.
-        if (fi_ecef is not None and fix_now is None
+        if (fi_llh is not None and fix_now is None
                 and nav.deadreckoning_ms() < 0 and t >= fi_next_t_us):
             fi_next_t_us = t + US_PER_SEC // 2   # 2 Hz: entry dwell wants >= 1
-            nav.gnss_pos(fi_ecef, fi_cov)
+            nav.gnss_pos_llh(fi_llh, fi_cov)
             n_fi_offers += 1
 
         if (gnss_enable and fix_now is not None
                 and fix_now["cov_pos"] is not None):
-            ecef = llh_to_ecef(fix_now["lat_rad"], fix_now["lon_rad"],
-                               fix_now["h_m"])
             # REQ-VER-008: assumed fixed processing/telemetry latency,
             # applied uniformly regardless of aiding source; history-
             # anchors the fusion via ins's existing gnss_delay_ms.
-            nav.gnss_pos(ecef, fix_now["cov_pos"], delay_ms=gnss_delay_ms)
+            nav.gnss_pos_llh((fix_now["lat_rad"], fix_now["lon_rad"],
+                              fix_now["h_m"]),
+                             fix_now["cov_pos"], delay_ms=gnss_delay_ms)
             if fix_now["vel_ok"] and fix_now["cov_vel"] is not None:
                 nav.gnss_vel(fix_now["vel_ned"], fix_now["cov_vel"])
             nav.gnss_leverarm(leverarm)
@@ -3292,6 +3365,25 @@ def main():
                     kml_ref_track.append((math.degrees(last_ref["lat_rad"]),
                                           math.degrees(last_ref["lon_rad"]),
                                           last_ref["h_m"]))
+                if last_fix is not None:
+                    fx = (math.degrees(last_fix["lat_rad"]),
+                         math.degrees(last_fix["lon_rad"]),
+                         last_fix["h_m"])
+                    # North/East/(North-East) position covariance in m^2,
+                    # for --map-frames' error ellipses; NaN if this fix
+                    # carries none (drawn as no ellipse there).
+                    cov_p = last_fix.get("cov_pos")
+                    cov_ne = ((cov_p[0][0], cov_p[0][1], cov_p[1][1])
+                             if cov_p is not None
+                             else (math.nan, math.nan, math.nan))
+                    # Dedup repeats (fix rate is usually slower than
+                    # --kml-hz) so a stale fix during an outage draws as
+                    # one held point, not a cluster of identical vertices.
+                    # t_rel is kept even on a repeat (--map-frames uses it to
+                    # tell "still the last fix" from "no fix yet at all").
+                    if not kml_fix_track or fx != kml_fix_track[-1][1:4]:
+                        kml_fix_track.append(
+                            ((t - t0_us) / US_PER_SEC,) + fx + cov_ne)
 
         # --dump-solution: the filter's own trajectory in the dataset ref
         # format. Independent of the reference (there may not be one), and of
@@ -3683,8 +3775,15 @@ def main():
 
     if args.kml:
         from ins_kml import write_kml
-        write_kml(args.kml, kml_est_track, kml_ref_track,
+        write_kml(args.kml, kml_est_track, kml_ref_track, kml_fix_track,
                  spec["name"] or args.dataset)
+
+    if args.map_frames:
+        from ins_map_frames import write_frames
+        write_frames(args.map_frames, kml_est_track, kml_fix_track,
+                    spec["name"] or args.dataset,
+                    fps=args.map_fps, t_start=args.map_t_start,
+                    t_end=args.map_t_end)
 
     if do_gnss_delay_estimate:
         if gnss_delay_curve is None:

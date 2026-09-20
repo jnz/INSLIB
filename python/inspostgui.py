@@ -14,6 +14,8 @@ same feed order as replay.py's main loop) and evaluate the result:
 * post-run error plots (estimate vs. ground truth with the filter's own
   1-sigma band), a North-East map view, bias convergence and outlier
   counters,
+* a Map tab: the same track over an optional OpenStreetMap background
+  (tiles cached on disk and shared with tools/inslib_gui.py's Track tab),
 * the same accuracy / data-quality summary replay.py prints,
 * multi-page PDF export via ins_plots and Google Earth KML export via
   ins_kml.
@@ -86,6 +88,29 @@ CONFIG_SECTIONS = [
          None, "0 -> default"),
         (("automotive_min_yaw_stddev_deg",), "Automotive min yaw stddev "
          "[deg]", FLOAT, None, "0 -> default"),
+        (("automotive_lateral_constraint",), "Lateral velocity constraint",
+         BOOL, None,
+         "Non-holonomic constraint (REQ-NAV-077): fuse the body-frame "
+         "LATERAL velocity against a truth of zero. Needs automotive mode. "
+         "Its value is the attitude row, whose gain is the ground speed, so "
+         "it holds roll and yaw while GNSS is out. Only the lateral row "
+         "exists: the vertical one states v_D + pitch*v_fwd == 0 rather "
+         "than level travel and drives any mounting pitch into the pitch "
+         "estimate"),
+        (("automotive_lateral_stddev_mps",), "Lateral constraint stddev "
+         "[m/s]", FLOAT, None,
+         "Measurement noise of the lateral constraint; 0 -> default. Set it "
+         "by the vehicle's lateral mounting offset rather than by the "
+         "residual's scatter: a bound costs what its systematic part costs"),
+        (("automotive_lateral_max_yaw_rate_deg",), "Lateral constraint max "
+         "yaw rate [deg/s]", FLOAT, None,
+         "Skip the constraint above this |yaw rate|, where side slip breaks "
+         "the assumption; 0 -> default"),
+        (("automotive_lateral_after_sec",), "Lateral constraint after [s]",
+         FLOAT, None,
+         "Hold the constraint off until this long without a GNSS fusion; "
+         "0 -> default, negative -> no delay. Next to a live GNSS velocity "
+         "it adds little and risks feeding a mounting error into the state"),
         (("chi2_disable",), "Disable chi2 downweighting", BOOL, None,
          "diagnostics/analysis only"),
         (("chi2_reject_alpha",), "Chi2 reject alpha", FLOAT, None,
@@ -395,6 +420,24 @@ CONFIG_SECTIONS = [
         (("score", "min_epochs"), "Min scored epochs", INT, None,
          "Minimum number of scored epochs a run must produce; 0 -> not "
          "gated"),
+        (("score", "coast_gap_min_sec"), "Coasting gap threshold [s]", FLOAT,
+         None,
+         "Report the position error at the first reference epoch after every "
+         "aiding gap longer than this (REQ-VER-029); 0 -> off. On a dataset "
+         "with a real outage this is the number that means something: the "
+         "whole-run RMS scores a filter that gives the coasting up BETTER "
+         "than one that coasts through, because it contributes no epochs "
+         "where the error is large"),
+        (("score", "ref_delay_ms"), "Reference delay [ms]", FLOAT, None,
+         "The reference row timestamped T actually describes T minus this "
+         "(REQ-VER-030). Set it to mirror gnss: delay_ms when ref.csv comes "
+         "out of the same receiver output as the aiding, otherwise the score "
+         "penalises the filter by speed times delay for compensating "
+         "correctly. 0 for an independent reference"),
+        (("score", "lim_coast_exit_err_m"), "Limit coasting exit error [m]",
+         FLOAT, None,
+         "Regression gate on that error; 0 -> not gated. Having no solution "
+         "when aiding returns counts as a failure, not as a skipped epoch"),
     ]),
     ("Inputs (optional CSV overrides)", [
         (("inputs", "imu"), "IMU CSV", STR, None,
@@ -525,6 +568,8 @@ from PyQt6 import QtCore, QtGui, QtWidgets  # noqa: E402
 import numpy as np  # noqa: E402
 import pyqtgraph as pg  # noqa: E402
 import pyqtgraph.opengl as gl  # noqa: E402
+
+from ins_map_view import MapView  # noqa: E402
 
 # The window icon. It lives with the documentation rather than with the
 # tools, so the path is taken relative to THIS FILE and not to the working
@@ -758,7 +803,7 @@ class ReplayWorker(QtCore.QThread):
         live_period_us = US_PER_SEC / 30.0
         last_kml_us = None
         kml_period_us = US_PER_SEC / 2.0
-        kml_est, kml_ref = [], []
+        kml_est, kml_ref, kml_fix = [], [], []
         wall0 = time.perf_counter()
         t_warmup_end = ((fixes[0] if fixes else ref[0])["t_us"]
                         + int(spec["score"]["warmup_sec"] * US_PER_SEC))
@@ -811,10 +856,9 @@ class ReplayWorker(QtCore.QThread):
                 fix_now = fixes[ifix]
                 ifix += 1
             if fix_now is not None and fix_now["cov_pos"] is not None:
-                ecef = replay.llh_to_ecef(fix_now["lat_rad"],
-                                          fix_now["lon_rad"], fix_now["h_m"])
-                nav.gnss_pos(ecef, fix_now["cov_pos"],
-                             delay_ms=gnss_delay_ms)
+                nav.gnss_pos_llh((fix_now["lat_rad"], fix_now["lon_rad"],
+                                  fix_now["h_m"]),
+                                 fix_now["cov_pos"], delay_ms=gnss_delay_ms)
                 if fix_now["vel_ok"] and fix_now["cov_vel"] is not None:
                     nav.gnss_vel(fix_now["vel_ned"], fix_now["cov_vel"])
                 nav.gnss_leverarm(leverarm)
@@ -945,6 +989,17 @@ class ReplayWorker(QtCore.QThread):
                         kml_ref.append((math.degrees(last_ref["lat_rad"]),
                                         math.degrees(last_ref["lon_rad"]),
                                         last_ref["h_m"]))
+                    if last_fix is not None:
+                        fx = (math.degrees(last_fix["lat_rad"]),
+                             math.degrees(last_fix["lon_rad"]),
+                             last_fix["h_m"])
+                        cov_p = last_fix.get("cov_pos")
+                        cov_ne = ((cov_p[0][0], cov_p[0][1], cov_p[1][1])
+                                 if cov_p is not None
+                                 else (math.nan, math.nan, math.nan))
+                        if not kml_fix or fx != kml_fix[-1][1:4]:
+                            kml_fix.append(
+                                ((t - t0_us) / US_PER_SEC,) + fx + cov_ne)
 
             if ref_now is not None and nav.is_ready() and t >= t_warmup_end:
                 err = replay.pos_error_ecef(nav, ref_now, score_la)
@@ -1197,6 +1252,7 @@ class ReplayWorker(QtCore.QThread):
             if t0_us is not None else 0.0,
             "kml_est": kml_est,
             "kml_ref": kml_ref,
+            "kml_fix": kml_fix,
             "aborted": aborted,
             "mode": final_mode,
             "pos_rms_m": e_pos.rms(),
@@ -2328,6 +2384,10 @@ class MainWindow(QtWidgets.QMainWindow):
         plots_scroll.setWidget(self.plots_widget)
         self.tabs.addTab(plots_scroll, "Plots")
 
+        # --- Map tab ---
+        self.map_view = MapView()
+        self.tabs.addTab(self.map_view, "Map")
+
         # --- Summary tab ---
         self.summary_text = QtWidgets.QPlainTextEdit()
         self.summary_text.setReadOnly(True)
@@ -2615,6 +2675,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.summary_text.setPlainText(results["text"])
         populate_plots(self.plots_widget, results["rec"],
                        results.get("warmup_end_sec", 0.0))
+        self.map_view.set_tracks(
+            [(row[1], row[2]) for row in results["kml_est"]],
+            [(row[0], row[1]) for row in results["kml_ref"]])
         self.pdf_btn.setEnabled(True)
         self.kml_btn.setEnabled(bool(results["kml_est"]))
         rms = results["pos_rms_m"]
@@ -2677,7 +2740,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             from ins_kml import write_kml
             write_kml(path, self.results["kml_est"], self.results["kml_ref"],
-                      self.results["name"])
+                      self.results["kml_fix"], self.results["name"])
             self.statusBar().showMessage(f"wrote {path}")
         except ImportError:
             QtWidgets.QMessageBox.warning(
@@ -2898,6 +2961,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(3000)
+        self.map_view.shutdown()
         super().closeEvent(event)
 
 

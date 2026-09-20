@@ -23,9 +23,11 @@
  *   - acc/gyr bias in body frame
  *
  * Double precision is only used for the absolute-position anchor: the n-frame
- * origin (origin_ecef) and the current lat/lon/height (latlonh, book-kept
- * incrementally from the float n-frame deltas). The hot path (strapdown,
- * predict, fusion corrections) is float-only.
+ * origin (origin_llh) and the current lat/lon/height (latlonh, book-kept
+ * incrementally from the float n-frame deltas), both geodetic. The hot path
+ * (strapdown, predict, fusion corrections) is float-only, and ECEF is a form
+ * of the interface rather than of the filter: it is converted where a caller
+ * hands one in or asks for one, never per epoch (REQ-NAV-080).
  *
  * The filter keeps a ring-buffer history of recent states to support delayed
  * GNSS measurements (time-of-validity up to INS_MAX_DELAY_MS in the past).
@@ -65,6 +67,12 @@
 #ifndef INS_UNKNOWNS_MAX
 #define INS_UNKNOWNS_MAX INS_UNKNOWNS_MAG
 #endif
+
+/** Compile-time maximum column count r of the process noise input matrix
+ *  G (n x r) handed to kalman_udu_predict(): 12 IMU noise columns plus one
+ *  extra column per error state, minus the 6 accelerometer/gyroscope bias
+ *  states that are already covered by the IMU columns. */
+#define INS_NOISE_COLS_MAX (12 + INS_UNKNOWNS_MAX - 6)
 
 /** Maximum tolerated measurement delay (history buffer size). */
 #define INS_MAX_DELAY_MS 500
@@ -128,15 +136,23 @@ typedef struct
     bool is_valid;     /**< is this measurement usable? */
 } ins_meas3_t;
 
-/** @brief GNSS position measurement (ECEF, with n-frame covariance). */
+/** @brief GNSS position measurement (geodetic, with n-frame covariance).
+ *
+ *  The fix is stated the way receivers report it and the way the fusion works
+ *  in: the residual is the geodetic difference to the filter's own anchor, so
+ *  nothing is converted on the epoch path (REQ-NAV-079). A source that is
+ *  natively ECEF, an RTK solution or UBX-NAV-HPPOSECEF, converts once with
+ *  ins_ecef_to_latlonh() before offering the fix, which keeps that cost out of
+ *  the filter's worst-case epoch instead of making it depend on the caller. */
 typedef struct
 {
-    double xyz_ecef[3];    /**< position in ECEF [m] (double for precision) */
-    float  Qll_ned[3 * 3]; /**< full covariance in NED frame [m^2]
-                                (3x3, column-major, symmetric). For a
-                                diagonal-only receiver just set the
-                                diagonal entries (rest zero). */
-    bool is_valid;         /**< is this measurement usable? */
+    double llh[3];        /**< latitude [rad], longitude [rad], height above
+                               the WGS84 ellipsoid [m] */
+    float Qll_ned[3 * 3]; /**< full covariance in NED frame [m^2]
+                               (3x3, column-major, symmetric). For a
+                               diagonal-only receiver just set the
+                               diagonal entries (rest zero). */
+    bool is_valid;        /**< is this measurement usable? */
 } ins_meas_gnss_pos_t;
 
 /** @brief Local NED position measurement (e.g. indoor tracking systems:
@@ -268,9 +284,9 @@ typedef struct
     float gnss_leverarm_b[3]; /**< GNSS antenna lever arm,
                                    body frame [m] */
 
-    /* GNSS time-of-validity. NOT USED TO COMPENSATE latency (tracked as
-     * REQ-NAV-030), the fields are currently ignored. Use gnss_delay_ms
-     * instead: it states how old the measurement is and is history-anchored. */
+    /* GNSS time-of-validity, informational only. The filter does not use
+     * it for latency compensation: set gnss_delay_ms, which states how old
+     * the measurement is and is history-anchored. */
     int gps_week;      /**< 0 if unknown */
     int gps_itow_ms;   /**< 0 if unknown */
     int gnss_delay_ms; /**< >0: this many ms old. 0 = now. */
@@ -321,14 +337,24 @@ typedef struct
 /** @brief Initial values supplied to ins_init(). */
 typedef struct
 {
-    ins_time_us_t time;            /**< initial timestamp [us] */
-    double        x_ecef[3];       /**< initial position ECEF [m] */
-    double        xdot_ecef[3];    /**< initial velocity ECEF [m/s] */
-    float         rpy_init_rad[3]; /**< initial roll/pitch/yaw [rad],
-                                        same convention as ahrs_config_t.rpy_init_rad */
-    float acc_bias_init_mps2[3];   /**< initial accelerometer bias [m/s^2] */
-    float gyr_bias_init_rps[3];    /**< initial gyroscope bias [rad/s],
-                                      same convention as ahrs_config_t.gyr_bias_init_rps */
+    ins_time_us_t time; /**< initial timestamp [us] */
+    /* Start position and velocity, in the frames the filter works in: it
+       anchors geodetically and mechanizes in NED (REQ-NAV-081). A caller
+       holding ECEF converts once at startup with ins_ecef_to_latlonh().
+
+       An all-zero block is a legal start, namely where the equator meets
+       the prime meridian at ellipsoid height 0, and is NOT rejected as
+       "forgotten". Under ins_options_t.auto_init, which is how most callers
+       run, the position is a provisional anchor that the first usable fix
+       replaces anyway. */
+    double llh[3];               /**< lat [rad], lon [rad], height over the WGS84
+                                      ellipsoid [m] */
+    float vel_ned[3];            /**< velocity in the local NED frame [m/s] */
+    float rpy_init_rad[3];       /**< initial roll/pitch/yaw [rad],
+                                      same convention as ahrs_config_t.rpy_init_rad */
+    float acc_bias_init_mps2[3]; /**< initial accelerometer bias [m/s^2] */
+    float gyr_bias_init_rps[3];  /**< initial gyroscope bias [rad/s],
+                                    same convention as ahrs_config_t.gyr_bias_init_rps */
 
     /* Initial std.-devs. A field left at (or explicitly set to) <= 0 is NOT
        "perfectly known": ins_init() resolves it to a generous default
@@ -554,6 +580,39 @@ typedef struct
      * crab-angle error a car does not have. */
     float automotive_min_yaw_stddev; /**< 0 -> 5 deg default */
 
+    /* Non-holonomic lateral velocity constraint (REQ-NAV-077): a synthetic
+     * measurement stating that a wheeled vehicle does not travel sideways,
+     * fused as the body-frame lateral velocity against a truth of zero. Its
+     * value is the attitude block of the measurement matrix, whose gain is
+     * the ground speed: during a GNSS outage the lateral channel is
+     * otherwise unobserved and a roll error leaks gravity sideways.
+     *
+     * Adding it needs a mounting calibration first.
+     *
+     * Requires automotive_mode, and shares its automotive_min_speed_mps. */
+    bool  automotive_lateral_constraint;   /**< true -> fuse the constraint */
+    float automotive_lateral_stddev_mps;   /**< measurement noise [m/s]. 0 ->
+                                                default. Set it ABOVE the
+                                                residual's scatter, not at it:
+                                                the residual is a slowly
+                                                varying offset, so repeated
+                                                fusions do not carry
+                                                independent information. */
+    float automotive_lateral_max_yaw_rate; /**< skip above this |yaw rate|
+                                                [rad/s], where side slip
+                                                breaks the assumption.
+                                                0 -> default. */
+    float automotive_lateral_after_sec;    /**< hold the constraint off until
+                                                this long without a GNSS
+                                                fusion. 0 -> default,
+                                                negative -> no delay. Next to
+                                                a live GNSS velocity the
+                                                constraint adds nothing, so
+                                                the delay costs no accuracy
+                                                and keeps a mounting error
+                                                out of the state while aiding
+                                                is up. */
+
     /* Global outlier-rejection override (REQ-SYS-015, diagnostics/analysis
      * only): every chi2-downweighted absolute reference is then fused at its
      * nominal variance regardless of the innovation size. Propagated by
@@ -720,11 +779,15 @@ typedef struct
      *
      * The error of this sensor class splits into a per-sample part that does
      * not grow with speed (an OBD-II PID 0x0D value is quantized to 1 km/h) and
-     * a multiplicative part that does (a speedometer reads a few percent high,
-     * plus tyre wear). Fusing the raw value against the per-sample noise alone
-     * would present that systematic bias as independent evidence and pull the
-     * velocity states permanently off, so speed_scale removes the calibrated
-     * part and speed_stddev_rel prices what is left:
+     * a multiplicative part that does (the vehicle's speed signal carries a
+     * scale error of a few percent from rolling radius, tyre wear and the
+     * scaling the ECU applies, and its sign is not predictable: the
+     * type-approval margin that keeps an indicated speed from ever falling
+     * below the true one constrains the DASHBOARD, not this reading). Fusing
+     * the raw value against the per-sample noise alone would present that
+     * systematic bias as independent evidence and pull the velocity states
+     * permanently off, so speed_scale removes the calibrated part and
+     * speed_stddev_rel prices what is left:
      *
      *     z = speed_scale * speed_mps
      *     R = stddev_mps^2 + (speed_stddev_rel * z)^2
@@ -1021,24 +1084,30 @@ typedef struct
     /* Process noise (diag only, per-second). Scaled by dt in Predict. */
     float Qxx_noise_diag[INS_UNKNOWNS_MAX]; /**< [unit^2/s], per error state */
 
-    /* Absolute-position anchor (double). origin_ecef is where
+    /* Absolute-position anchor (double). origin_llh is where
        pos_local == 0, latlonh is the current absolute position,
-       book-kept incrementally from the n-frame deltas. */
-    double origin_ecef[3]; /**< n-frame origin, ECEF [m] */
-    double latlonh[3];     /**< lat,lon [rad], h [m] */
+       book-kept incrementally from the n-frame deltas. Both geodetic, so
+       neither costs a conversion to keep up to date (REQ-NAV-080). */
+    double origin_llh[3]; /**< n-frame origin, lat,lon [rad], h [m] */
+    double latlonh[3];    /**< lat,lon [rad], h [m] */
 
     /* Cached Earth-curvature terms for the incremental latlonh book-keeping.
-       Together with R_n_to_e and gravity_n these change by only ~d/R_earth per
-       meter of travel, so they are refreshed every INS_EARTH_REFRESH_DIST_M. */
+       Together with gravity_n these change by only ~d/R_earth per meter of
+       travel, so they are refreshed every INS_EARTH_REFRESH_DIST_M. The
+       NED->ECEF rotation is deliberately NOT among them: nothing on the epoch
+       path needs it, so it is built on request in ins_get_velocity_ecef()
+       instead of being refreshed inside the worst-case epoch (REQ-NAV-080). */
     double meta_dlat_per_dN;      /**< 1/(Rm+h) */
     double meta_dlon_per_dE;      /**< 1/((Rn+h)*cos(lat)) */
     float  meta_travel_m;         /**< L1 travel since refresh [m] */
-    float  R_n_to_e[9];           /**< NED -> ECEF rotation */
     float  R_b_to_n[9];           /**< body -> NED rotation */
     float  gravity_n[3];          /**< gravity in NED [m/s^2] */
     float  magnetic_n[3];         /**< magnetic model in NED [uT] */
     float  mag_field_expected_uT; /**< WMM total field for the
                                        disturbance gate, 0 -> off */
+    bool mag_heading_usable;      /**< false inside a dip pole exclusion zone,
+                                       where magnetometer fusion is dropped.
+                                       True until a position says otherwise */
     float last_omega_b_nb[3];     /**< last computed omega_b_nb */
     float last_acc_n[3];          /**< last body accel in n-frame */
     float acc_n_avg[3];           /**< last_acc_n averaged over
@@ -1091,6 +1160,8 @@ typedef struct
     ins_time_us_t t_last_mag_fusion;      /**< last magnetometer fusion */
     ins_time_us_t t_last_zero_rot_fusion; /**< last zero-rotation fusion */
     ins_time_us_t t_last_zero_vel_fusion; /**< last zero-velocity fusion */
+    ins_time_us_t t_last_nhc_fusion;      /**< last lateral-constraint fusion
+                                               (REQ-NAV-077) */
     ins_time_us_t t_init;                 /**< ins_init() timestamp */
     unsigned      kalman_epochs;          /**< ins_update() calls since init */
     bool          is_initialized;         /**< false before init / after a health-check failure */
@@ -1197,6 +1268,18 @@ typedef struct
                                        down after a GNSS quality loss */
     ins_time_us_t gnss_bad_since; /**< t of the first fix in the current run of
                                        fixes failing the stop gate (0 = none) */
+    ins_time_us_t gnss_bad_last;  /**< t of the most recent fix in that run, so
+                                       the dwell can be accumulated over the
+                                       epochs that actually offered aiding
+                                       instead of read off the wall clock
+                                       (REQ-NAV-052) */
+    float gnss_bad_accum_sec;     /**< how much of the stop dwell that run has
+                                       filled [s]. A gap in the fix stream
+                                       contributes at most
+                                       INS_GNSS_STOP_MAX_STEP_SEC, so a plain
+                                       outage cannot fill it while a run of
+                                       bad fixes is not broken by the gaps
+                                       between them */
 
     /* IMU biases carried across a quality-loss re-arm (REQ-NAV-061). Only that
        re-arm populates this; ins_rearm_collecting clears it, so a health
@@ -1218,23 +1301,24 @@ typedef struct
     struct
     {
         bool   valid;
-        double origin_ecef[3]; /**< [m] the origin of the exiting instance */
-        float  pos_local[3];   /**< [m] where the exiting instance last thought
-                                    it was, in that origin's frame */
-        double latlonh[3];     /**< [rad, rad, m] the same position as an
-                                    absolute anchor. Paired with pos_local
-                                    above it turns the next bootstrap into a
-                                    SHORT-baseline geodetic step (fix minus
-                                    this position), which stays exact no
-                                    matter how far the origin has been left
-                                    behind (REQ-NAV-062) */
-        ins_time_us_t t;       /**< time of its last position aiding, i.e.
-                                    since when the platform has been
-                                    unobserved, so the next bootstrap can
-                                    price how far it could have got (see
-                                    ins_autoinit_origin_carry_usable) */
-    } origin_carry;            /**< n-frame origin carried across a quality-loss re-arm
-                                    (REQ-NAV-062) */
+        double origin_llh[3]; /**< [rad, rad, m] the origin of the exiting
+                                   instance */
+        float pos_local[3];   /**< [m] where the exiting instance last thought
+                                   it was, in that origin's frame */
+        double latlonh[3];    /**< [rad, rad, m] the same position as an
+                                   absolute anchor. Paired with pos_local
+                                   above it turns the next bootstrap into a
+                                   SHORT-baseline geodetic step (fix minus
+                                   this position), which stays exact no
+                                   matter how far the origin has been left
+                                   behind (REQ-NAV-062) */
+        ins_time_us_t t;      /**< time of its last position aiding, i.e.
+                                   since when the platform has been
+                                   unobserved, so the next bootstrap can
+                                   price how far it could have got (see
+                                   ins_autoinit_origin_carry_usable) */
+    } origin_carry;           /**< n-frame origin carried across a quality-loss re-arm
+                                   (REQ-NAV-062) */
 
     /* Height-source selection (REQ-NAV-053), latched once at bootstrap
        from autoinit_baro above and fixed for the lifetime of the filter
@@ -1372,6 +1456,9 @@ typedef struct
                                                         aiding" info has been
                                                         printed, see
                                                         ins_fuse_gnss_course_yaw */
+        bool nhc_logged;                           /**< same, for the lateral
+                                                        velocity constraint
+                                                        (REQ-NAV-077) */
         bool gnss_delay_logged;                    /**< true once the one-shot
                                                         "first GNSS delay seen" info
                                                         has been printed */
@@ -1400,7 +1487,8 @@ extern "C"
      *  @param[in,out] f The filter instance.
      *  @param[in] init Initial state and std.-devs.
      *  @param[in] opt  Filter options.
-     *  @return 0 on success, -1 on failure (e.g. invalid ECEF). */
+     *  @return 0 on success, -1 on failure (e.g. a latitude or longitude
+     *      outside its range, see REQ-NAV-081). */
     int ins_init(ins_t* f, const ins_init_t* init, const ins_options_t* opt);
 
     /** @brief Shut down the filter (marks it as uninitialised).
@@ -1605,6 +1693,20 @@ extern "C"
      *  @param[out] pos_ecef Position in ECEF [m].
      *  @return true if the filter is initialized. */
     bool ins_get_position_ecef(const ins_t* f, double pos_ecef[3]);
+
+    /** @brief Get current position as geodetic coordinates.
+     *
+     *  The absolute anchor the filter carries, handed out as it is held. Use
+     *  this rather than converting ins_get_position_ecef() back: that call
+     *  builds the ECEF vector FROM this one, so the round trip costs two
+     *  conversions for a value that needs none, and on a target without a
+     *  double-precision FPU those two are expensive (REQ-NAV-078).
+     *
+     *  @param[in] f The filter instance.
+     *  @param[out] llh Latitude [rad], longitude [rad], height above the
+     *                  WGS84 ellipsoid [m].
+     *  @return true if the filter is initialized. */
+    bool ins_get_latlonh(const ins_t* f, double llh[3]);
 
     /** @brief Get current position in the local NED frame (relative to the
      *  origin set at ins_init()).

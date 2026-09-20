@@ -526,9 +526,9 @@ uses the standard library only.
 Every sample carries a per-sample 1-sigma (the 1 km/h quantisation of PID
 0x0D, 0.080 m/s) and an estimated age (half the measured round trip plus a
 constant for the ECU's own update interval, `--ecu-delay-ms`). The
-*systematic* speedometer scale error is deliberately not folded into that
-sigma — it is a property of the vehicle, not of the sample, and belongs in
-the filter's `speed_scale` / `speed_stddev_rel`.
+*systematic* scale error of the vehicle's own speed signal is deliberately
+not folded into that sigma — it is a property of the vehicle, not of the
+sample, and belongs in the filter's `speed_scale` / `speed_stddev_rel`.
 
 Before polling starts the tool sends one `0100` handshake with a long
 timeout (`--search-timeout`): with `ATSP0` the first request to the vehicle
@@ -546,10 +546,17 @@ the characteristics it found so the pair can be added to `BLE_PROFILES`.
 ## inslib_convert_ubx_to_csv.py - capture to replay dataset
 
 Turns a recorded `.ubx` into the `datasets/` replay format (`config.yaml`
-+ `imu.csv` / `baro.csv` / `mag.csv` / `gnss.csv` / `ref.csv`) that
-`tools/replay.c` and `python/replay.py` score. With `--pos` it takes an
++ `imu.csv` / `baro.csv` / `mag.csv` / `gnss.csv` / `ref.csv` /
+`speed.csv`) that `tools/replay.c` and `python/replay.py` score. With `--pos` it takes an
 RTKLIB post-processed solution as an independent `ref.csv` instead of the
 receiver's own fix.
+
+`automotive_mode` defaults to whatever the capture is: on when it carries
+odometry (`0x40/0x80`), off otherwise -- a wheel/OBD speed source is
+itself evidence of a road vehicle, so this needs no flag on the usual
+case. `--automotive-mode`/`--no-automotive-mode` overrides it either way,
+and the console output says so only when the default actually decided it
+(an explicit choice is never second-guessed with a note).
 
 `mag.csv` and `mag: enable: 1` appear only when the capture actually
 carried `0x40/0x06` frames; a capture without them leaves no empty file
@@ -569,9 +576,39 @@ and yaw runs unaided. A capture that never got a dated fix leaves the key
 at 0 and says so. When an existing `config.yaml` is kept and turns out to
 have no `wmm_year` at all, the run prints the value to paste in.
 
-Odometry (`0x40/0x80`) in the capture is counted and reported but not
-converted: the replay format has no odometry stream and `replay.c` has no
-input for one.
+Odometry (`0x40/0x80`) becomes `speed.csv` with `speed: enable: 1`, on
+the same "only when the capture has it" rule as `mag.csv`. Only frames
+the hub already stamped with an MCU `t_us` convert: the replay format has
+a single timebase and there is nothing offline to map a bare host clock
+onto, so a producer's half that the hub never completed is dropped and
+counted. Frames arrive interleaved on the host clock rather than in MCU
+order, so the rows are sorted before writing -- `python/replay.py` sorts
+them again, `tools/replay.c` reads them in file order.
+
+The per-sample `stddev_mps` and `delay_ms` the producer reported become
+`config.yaml` constants at their medians, because that is where this
+format keeps them; the per-sample values stay in `speed.csv` as columns 3
+and 4 (both harnesses read only the first two), together with a direction
+column: `1` reverse, `0` forward, blank when the producer did not know.
+`speed: scale` is fitted against `gnss.csv`'s own velocity by
+`inslib_speed_scale.py` (used here as a library, see below) whenever the
+capture has enough of both to trust the result, and left at the library
+default of 1.0, otherwise: a short capture,
+one with no usable GNSS velocity fix, or a fit that does not clear that
+script's own trust bar (`trust_reason`, e.g. the weighted and robust
+estimates disagree, or the value falls outside a sane odometer range)
+never gets baked in silently. Note that the type-approval margin that
+keeps a speedometer from ever reading low applies to the **dashboard**:
+`PID 0x0D` is the ECU's own value, a different number from the one the
+cluster shows, and which of the two is larger is a property of the
+vehicle. The scale error is real and systematic, its sign is not
+predictable. Re-run `inslib_speed_scale.py` by hand after a mechanical
+change (tires, gearing). The converter only calibrates, when
+`config.yaml` does not exist yet.
+
+The hub also writes a `_speed.csv` sidecar next to the capture, with a
+named header carrying both timebases. `python/replay.py` reads that form
+directly (point `inputs: speed:` at it), `tools/replay.c` does not.
 
 ## inslib_parse_file.py - capture health check
 
@@ -647,7 +684,58 @@ time has to be converted to GPS time - post-processing raw observations,
 or stamping GNSS epochs with their true time of validity instead of their
 arrival time.
 
-## inslib_ubx_imu_calib.py - IMU calibration (no fixture)
+## inslib_speed_scale.py - speed.scale from GNSS
+
+```sh
+python inslib_speed_scale.py datasets/mydrive/csv
+python inslib_speed_scale.py datasets/mydrive/csv --plot
+python inslib_speed_scale.py --speed speed.csv --gnss gnss.csv --plot scale.png
+```
+
+config.yaml's own comment on `speed: scale` says what this does:
+"Systematic and vehicle-specific, so calibrate it against GNSS". Reads a
+dataset's `speed.csv` and `gnss.csv`, shifts each to its own true event
+time using its `delay_ms` (odometry per-row, GNSS from `config.yaml`'s
+`gnss: delay_ms`), and fits `gnss_speed = scale * odometry_speed` through
+the origin - a weighted least squares plus a robust median-ratio
+cross-check that a handful of outliers cannot move:
+
+```
+13213 samples used of 16332 odometry rows (81%), spanning 1566 s, odometry speed 3.1 - 38.6 m/s
+gnss.delay_ms used: 200 ms (from config.yaml)
+
+weighted LS through origin : scale = 1.0295 +/- 3.8e-05
+robust median ratio        : scale = 1.0301 +/- 0.0048 (MAD-based)
+speed RMS vs GNSS: 0.768 m/s raw -> 0.112 m/s scaled
+
+config.yaml:
+  speed:
+    scale: 1.0295
+```
+
+Samples near a stop are dropped (`--min-speed-mps`, default 3): GNSS
+Doppler noise and any driveline backlash dominate there and the scale is
+not observable anyway. Samples where GNSS speed is changing fast are
+dropped too (`--max-accel-mps2`, default 1.5): a timing error costs
+nothing while speed is constant and grows with the rate of change, so
+those are exactly the samples a leftover error in either `delay_ms` would
+bias, not average out. `reverse=1` rows are dropped by default
+(`--include-reverse` keeps them) - whether the vehicle scales the same way
+running backwards is not something this script can tell.
+
+The two reported numbers are a check on each other, not a choice: the
+weighted fit is right if the noise model (odometry stddev plus propagated
+GNSS velocity variance) is right, the median ratio is right regardless but
+throws away information. Large disagreement between them means the fit is
+leaning on a few samples - the script says so and points at `--plot`.
+
+`--plot` (needs matplotlib) opens a window with a scatter of odometry vs.
+GNSS speed and the fitted line, plus the two time series overlaid, so a
+systematic bend (wrong model, not just a scale) or a stretch of bad
+interpolation is visible instead of hiding inside the two numbers above.
+`--plot FILE.png` also saves it.
+
+## inslib_imu_calib.py - IMU calibration (no fixture)
 
 Records one session in which the unit is set down in a number of
 **arbitrary** static poses with rotations in between, then writes the
@@ -655,9 +743,39 @@ REQ-NAV-037 keys into a `config.yaml` that `insrcv --config` and
 `python/replay.py` consume directly.
 
 ```sh
-python3 tools/inslib_ubx_imu_calib.py --port COM4
-python3 tools/inslib_ubx_imu_calib.py --udp 29801     # via the hub fan-out
+python3 tools/inslib_imu_calib.py --port COM4
+python3 tools/inslib_imu_calib.py --udp 29801        # via the hub fan-out
+python3 tools/inslib_imu_calib.py --csv mysession/   # offline, any IMU
 ```
+
+**No sensor board? Calibrate from CSV.** `--csv` runs the same solve and
+the same config writer on a session recorded with any IMU, as
+replay-format files (see `datasets/replay_format.py`):
+
+```text
+imu.csv   t_us, gyr_x, gyr_y, gyr_z [rad/s], acc_x, acc_y, acc_z [m/s^2][, temp_degC]
+mag.csv   t_us, mag_x, mag_y, mag_z [uT]          (optional)
+```
+
+Body frame FRD, timestamps in integer microseconds, both files on the
+same clock (the magnetometer is matched to the static poses by time, and
+may run at a different rate). Lines starting with `#` are skipped. Point
+`--csv` at a directory and its `imu.csv` and `mag.csv` are both used, or
+at an `imu.csv` directly and name the magnetometer file with `--mag-csv`.
+The recording has to follow the procedure below: the unit left alone for
+the first `--init-sec` seconds, then set down in 20 or more different
+attitudes, a few seconds each, with the rotations in between. `-y` writes
+the result without asking.
+
+```sh
+python3 tools/inslib_imu_calib.py --csv mysession/ -o config.yaml
+python3 tools/inslib_imu_calib.py --csv log/imu.csv --mag-csv log/mag.csv \
+    --gravity 9.8093 --mag-field-ut 48.6 -y
+```
+
+`python/tests/test_calib_csv.py` runs exactly this path against a
+synthetic session with known scale factors, misalignments and biases in
+all three sensors.
 
 **A board that corrects its own stream has to be switched off first**, or
 the recording measures what is left over of the calibration it already

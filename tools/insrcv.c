@@ -615,15 +615,13 @@ static void cov6_to_mat3(const float c6[6], float out[9])
    same origin as ins_get_position_local()/pos_ned, so PlotJuggler can
    overlay the raw fix on top of the estimated position. Same lat/lon/h
    delta + ins_dlatlonh_to_dned approach ins_fuse_gnss() uses internally
-   (ins.c) to turn a fix into a position relative to f->origin_ecef. */
+   (ins.c) to turn a fix into a position relative to f->origin_llh. */
 static bool gnss_llh_to_ins_ned(const ins_t* f, double lat_rad, double lon_rad, double alt_m,
                                 float pos_ned[3])
 {
     if (!f->is_initialized) return false;
-    double origin_llh[3];
-    ins_ecef_to_latlonh(f->origin_ecef, &origin_llh[0], &origin_llh[1], &origin_llh[2]);
-    const double dllh[3] = {lat_rad - origin_llh[0], lon_rad - origin_llh[1],
-                            alt_m - origin_llh[2]};
+    const double dllh[3] = {lat_rad - f->origin_llh[0], lon_rad - f->origin_llh[1],
+                            alt_m - f->origin_llh[2]};
     ins_dlatlonh_to_dned(dllh, lat_rad, alt_m, pos_ned);
     return true;
 }
@@ -1005,7 +1003,7 @@ static bool baro_stddev_of(const baro_alt_t* b, float o[3])
  * Mirrors INSLIB/telemetry.py's suite_status(): same codes, same texts,
  * same derivation from ins's own diagnostic counters. A fix that never
  * arrived, one rejected by the accuracy gate and one that arrived before
- * the ECEF anchor existed are three different failures with three
+ * the WGS84 anchor existed are three different failures with three
  * different remedies, so they get three different codes.
  * ===========================================================================
  */
@@ -1018,7 +1016,7 @@ typedef enum
     BLOCKED_NO_AIDING,       /* no absolute-position measurement ever arrived */
     BLOCKED_RECEIVER_NO_FIX, /* NAV-PVT arrives, carrying no solution */
     BLOCKED_AIDING_REJECTED, /* every fix failed the accuracy gate */
-    BLOCKED_NO_ANCHOR        /* fixes arrived with no ECEF anchor for them */
+    BLOCKED_NO_ANCHOR        /* fixes arrived with no WGS84 anchor for them */
 } blocked_t;
 
 static const char* blocked_text(blocked_t b)
@@ -1033,7 +1031,7 @@ static const char* blocked_text(blocked_t b)
             return "3D filter off: the receiver has no 3D fix (NAV-PVT arrives without one)";
         case BLOCKED_AIDING_REJECTED:
             return "3D filter off: all GNSS fixes rejected (accuracy gate)";
-        case BLOCKED_NO_ANCHOR: return "3D filter off: GNSS seen but no ECEF anchor";
+        case BLOCKED_NO_ANCHOR: return "3D filter off: GNSS seen but no WGS84 anchor";
         default: return "unknown";
     }
 }
@@ -1383,6 +1381,10 @@ typedef struct
     bool  automotive_mode;
     float automotive_min_speed_mps;
     float automotive_min_yaw_stddev_deg;
+    bool  automotive_lateral_constraint;
+    float automotive_lateral_stddev_mps;
+    float automotive_lateral_max_yaw_rate_deg;
+    float automotive_lateral_after_sec;
     float max_dr_sec;
     bool  allow_unlimited_dr;
     /* Free-inertial start (config section free_inertial_start), see
@@ -1520,7 +1522,13 @@ static bool config_key_is_replay_only(const char* sec, const char* key)
     return !strcmp(key, "name") || !strcmp(key, "aiding") || !strcmp(key, "init");
 }
 
-static void config_set(insrcv_t* r, const char* sec, const char* key, const char* val)
+/* Apply one "section.key: value" pair. Returns -2 when a key this tool
+   owns carries a value it cannot read, which config_load turns into a
+   hard error (REQ-VER-028), and 0 otherwise. An UNKNOWN key is not an
+   error here (see the forward-compatibility branch at the end), a
+   malformed value for a known key is: the destination would keep a
+   default the operator never wrote down. */
+static int config_set(insrcv_t* r, const char* sec, const char* key, const char* val)
 {
     char full[128];
     snprintf(full, sizeof(full), "%s%s%s", sec, sec[0] ? "." : "", key);
@@ -1532,10 +1540,10 @@ static void config_set(insrcv_t* r, const char* sec, const char* key, const char
     else if (!strcmp(full, "imu.acc_psd")) { if (d > 0.0) r->acc_psd = (float)d; }
     else if (!strcmp(full, "imu.gyr_bias_rw")) { if (d > 0.0) r->gyr_bias_rw = (float)d; }
     else if (!strcmp(full, "imu.acc_bias_rw")) { if (d > 0.0) r->acc_bias_rw = (float)d; }
-    else if (!strcmp(full, "imu.acc_misalignment")) { mini_yaml_list(val, r->acc_misalignment, 9); }
-    else if (!strcmp(full, "imu.gyr_misalignment")) { mini_yaml_list(val, r->gyr_misalignment, 9); }
-    else if (!strcmp(full, "imu.acc_fixed_bias")) { mini_yaml_list(val, r->acc_fixed_bias, 3); }
-    else if (!strcmp(full, "imu.gyr_fixed_bias")) { mini_yaml_list(val, r->gyr_fixed_bias, 3); }
+    else if (!strcmp(full, "imu.acc_misalignment")) { if (mini_yaml_list(val, r->acc_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "imu.gyr_misalignment")) { if (mini_yaml_list(val, r->gyr_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "imu.acc_fixed_bias")) { if (mini_yaml_list(val, r->acc_fixed_bias, 3) != 0) return -2; }
+    else if (!strcmp(full, "imu.gyr_fixed_bias")) { if (mini_yaml_list(val, r->gyr_fixed_bias, 3) != 0) return -2; }
     /* Extra process noise on top of what the IMU noise model already
        propagates through the strapdown (ins.h: these are densities per
        sqrt(s), not rates). Same keys as tools/replay.c. */
@@ -1640,11 +1648,12 @@ static void config_set(insrcv_t* r, const char* sec, const char* key, const char
     {
         if (d > 0.0) { r->baro_acc_bias_init_stddev_mps2 = (float)d; }
     }
-    else if (!strcmp(full, "gnss.leverarm_frd")) { mini_yaml_list(val, r->leverarm_frd, 3); }
+    else if (!strcmp(full, "gnss.leverarm_frd")) { if (mini_yaml_list(val, r->leverarm_frd, 3) != 0) return -2; }
     else if (!strcmp(full, "gnss.pos_stddev_fallback_m"))
     {
         float fb[2] = {0.0f, 0.0f};
-        if (mini_yaml_list(val, fb, 2) == 0 && fb[0] > 0.0f) { r->pos_fallback_m = fb[0]; }
+        if (mini_yaml_list(val, fb, 2) != 0) return -2;
+        if (fb[0] > 0.0f) { r->pos_fallback_m = fb[0]; }
     }
     else if (!strcmp(full, "gnss.vel_stddev_fallback_mps"))
     {
@@ -1741,8 +1750,8 @@ static void config_set(insrcv_t* r, const char* sec, const char* key, const char
        config. */
     else if (!strcmp(full, "mag.min_delay_ms")) { r->mag_min_delay_ms = (int)d; }
     else if (!strcmp(full, "mag.estimate_bias")) { r->mag_estimate_bias = ((int)d != 0); }
-    else if (!strcmp(full, "mag.misalignment")) { mini_yaml_list(val, r->mag_misalignment, 9); }
-    else if (!strcmp(full, "mag.fixed_bias")) { mini_yaml_list(val, r->mag_fixed_bias, 3); }
+    else if (!strcmp(full, "mag.misalignment")) { if (mini_yaml_list(val, r->mag_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "mag.fixed_bias")) { if (mini_yaml_list(val, r->mag_fixed_bias, 3) != 0) return -2; }
     else if (!strcmp(full, "free_inertial_start.enable"))
     {
         r->fi_enable = ((int)d != 0);
@@ -1767,6 +1776,22 @@ static void config_set(insrcv_t* r, const char* sec, const char* key, const char
     {
         if (d > 0.0) { r->automotive_min_speed_mps = (float)d; }
     }
+    else if (!strcmp(full, "automotive_lateral_constraint"))
+    {
+        r->automotive_lateral_constraint = ((int)d != 0);
+    }
+    else if (!strcmp(full, "automotive_lateral_stddev_mps"))
+    {
+        if (d > 0.0) { r->automotive_lateral_stddev_mps = (float)d; }
+    }
+    else if (!strcmp(full, "automotive_lateral_max_yaw_rate_deg"))
+    {
+        if (d > 0.0) { r->automotive_lateral_max_yaw_rate_deg = (float)d; }
+    }
+    else if (!strcmp(full, "automotive_lateral_after_sec"))
+    {
+        r->automotive_lateral_after_sec = (float)d;
+    }
     else if (!strcmp(full, "automotive_min_yaw_stddev_deg"))
     {
         if (d > 0.0) { r->automotive_min_yaw_stddev_deg = (float)d; }
@@ -1788,13 +1813,20 @@ static void config_set(insrcv_t* r, const char* sec, const char* key, const char
         fprintf(stderr, "[insrcv] config: \"%s\" not used by insrcv"
                         " (typo, or a replay-only key)\n", full);
     }
+    return 0;
 }
 
 /* mini_yaml_parse() callback: unknown keys are ignored (forward
- * compatibility, see config_set's own comment), so this never aborts. */
+ * compatibility, see config_set's own comment), a value config_set cannot
+ * read aborts the parse (REQ-VER-028). */
 static int config_set_cb(void* ctx, const char* sec, const char* key, const char* val)
 {
-    config_set((insrcv_t*)ctx, sec, key, val);
+    if (config_set((insrcv_t*)ctx, sec, key, val) != 0)
+    {
+        fprintf(stderr, "[insrcv] config: \"%s%s%s\" is not a list of numbers\n", sec,
+                sec[0] ? "." : "", key);
+        return -1;
+    }
     return 0;
 }
 
@@ -2147,11 +2179,14 @@ static void mav_send_suite(insrcv_t* r, blocked_t blocked)
     float  dummy[3];
     float  sd[15];
     float  baro_h = 0.0f, baro_v = 0.0f, h_m = 0.0f, h_ell = 0.0f;
-    double x_ecef[3];
+    double llh[3];
     int    i;
 
-    const bool have_pos  = ins_get_position_local(&s->ins, pos_ned);
-    const bool have_ecef = ins_get_position_ecef(&s->ins, x_ecef);
+    const bool have_pos = ins_get_position_local(&s->ins, pos_ned);
+    /* The filter's own anchor, not ins_get_position_ecef() converted back:
+       that one is BUILT from these three numbers, so the round trip would
+       cost two conversions for a value already in hand (REQ-NAV-078). */
+    const bool have_llh  = ins_get_latlonh(&s->ins, llh);
     const bool have_rpy  = nav_suite_get_rpy(s, &rpy[0], &rpy[1], &rpy[2]);
     const bool have_rate = ins_get_omega_b_nb(&s->ins, rate);
     const bool have_acc  = ins_get_acc_n(&s->ins, acc_n);
@@ -2184,12 +2219,11 @@ static void mav_send_suite(insrcv_t* r, blocked_t blocked)
         mav_emit(p, mini_mav_local_position_ned(&p->m, boot_ms, xyz, vel_ned));
     }
 
-    if (have_ecef && mav_due(p, MAV_RATE_GLOBAL_POS, now))
+    if (have_llh && mav_due(p, MAV_RATE_GLOBAL_POS, now))
     {
-        double lat_rad, lon_rad, alt_ell_m;
-        ins_ecef_to_latlonh(x_ecef, &lat_rad, &lon_rad, &alt_ell_m);
-        const double  lat_deg      = RAD2DEG(lat_rad);
-        const double  lon_deg      = RAD2DEG(lon_rad);
+        const double  alt_ell_m    = llh[2];
+        const double  lat_deg      = RAD2DEG(llh[0]);
+        const double  lon_deg      = RAD2DEG(llh[1]);
         const int16_t vel_cmps[3]  = {mav_cmps(vel_ned[0]), mav_cmps(vel_ned[1]),
                                       mav_cmps(vel_ned[2])};
         /* alt is declared as MSL. There is no geoid model in this
@@ -2432,14 +2466,13 @@ static void publish_suite(insrcv_t* r)
     if (ins_get_velocity_ned(&s->ins, v3)) { j_ned(j, "vel_ned", v3); }
 
     j_obj_begin(j, "global");
-    double x_ecef[3];
-    if (ins_get_position_ecef(&s->ins, x_ecef))
+    /* Straight from the filter's anchor (REQ-NAV-078), see above. */
+    double llh[3];
+    if (ins_get_latlonh(&s->ins, llh))
     {
-        double lat_rad, lon_rad, h_ell;
-        ins_ecef_to_latlonh(x_ecef, &lat_rad, &lon_rad, &h_ell);
-        j_num(j, "lat_deg", RAD2DEG(lat_rad));
-        j_num(j, "lon_deg", RAD2DEG(lon_rad));
-        j_num(j, "alt_m", h_ell);
+        j_num(j, "lat_deg", RAD2DEG(llh[0]));
+        j_num(j, "lon_deg", RAD2DEG(llh[1]));
+        j_num(j, "alt_m", llh[2]);
     }
     else
     {
@@ -2662,8 +2695,9 @@ static void suite_bootstrap(insrcv_t* r, int64_t t_us)
     memset(&init, 0, sizeof(init));
     init.time = t_us;
     /* auto_init: the first usable fix supplies the real position, so the
-       prescribed one only has to be finite. */
-    ins_latlonh_to_ecef(0.0, 0.0, 0.0, init.x_ecef);
+       prescribed one only has to be plausible. Geodetic, like everything
+       else this tool hands the filter (REQ-NAV-081), and lat/lon/h all zero
+       is a point on the equator rather than the centre of the Earth. */
     /* free_inertial_start: the origin IS the declared point, so the
        uncertainty of that statement is the initial position uncertainty by
        construction. Without this the bootstrap installs ins's own
@@ -2751,6 +2785,12 @@ static void suite_bootstrap(insrcv_t* r, int64_t t_us)
     opt.automotive_min_yaw_stddev          = (r->automotive_min_yaw_stddev_deg > 0.0f)
                                                  ? DEG2RAD(r->automotive_min_yaw_stddev_deg)
                                                  : 0.0f;
+    opt.automotive_lateral_constraint      = r->automotive_lateral_constraint;
+    opt.automotive_lateral_stddev_mps      = r->automotive_lateral_stddev_mps;
+    opt.automotive_lateral_max_yaw_rate    = (r->automotive_lateral_max_yaw_rate_deg > 0.0f)
+                                                 ? DEG2RAD(r->automotive_lateral_max_yaw_rate_deg)
+                                                 : 0.0f;
+    opt.automotive_lateral_after_sec       = r->automotive_lateral_after_sec;
     /* Stillness detection: one set for ins, both AHRS instances and
        baro_alt (REQ-SUITE-020). The velocity-blind ARS/AHRS fallback
        (REQ-AHRS-017) is what makes the live receiver work at all before
@@ -3004,8 +3044,9 @@ static void fi_offer_start_position(insrcv_t* r, int64_t t_us, ins_measurements_
        dwell is satisfied by margin rather than exactly on its boundary. */
     r->fi_next_t_us = t_us + US_PER_SEC / 2;
 
-    ins_latlonh_to_ecef(r->fi_lat_deg * (M_PI / 180.0), r->fi_lon_deg * (M_PI / 180.0),
-                        r->fi_height_m, m->gnss_pos.xyz_ecef);
+    m->gnss_pos.llh[0]       = r->fi_lat_deg * (M_PI / 180.0);
+    m->gnss_pos.llh[1]       = r->fi_lon_deg * (M_PI / 180.0);
+    m->gnss_pos.llh[2]       = r->fi_height_m;
     const float var          = r->fi_stddev_m * r->fi_stddev_m;
     m->gnss_pos.Qll_ned[0]   = var;
     m->gnss_pos.Qll_ned[4]   = var;
@@ -3067,9 +3108,13 @@ static void on_imu(insrcv_t* r, const imu_sample_t* s)
     {
         const gnss_sample_t* g = &r->pending_gnss;
         r->have_pending_gnss   = false;
-        ins_latlonh_to_ecef(g->lat_deg * (M_PI / 180.0), g->lon_deg * (M_PI / 180.0), g->alt_m,
-                            m.gnss_pos.xyz_ecef);
-        m.gnss_pos.is_valid = true;
+        /* As NAV-PVT reports it. The fusion builds its residual from the
+           geodetic difference, so nothing is converted on the way in
+           (REQ-NAV-079). */
+        m.gnss_pos.llh[0]       = g->lat_deg * (M_PI / 180.0);
+        m.gnss_pos.llh[1]       = g->lon_deg * (M_PI / 180.0);
+        m.gnss_pos.llh[2]       = g->alt_m;
+        m.gnss_pos.is_valid     = true;
         if (g->has_cov) { cov6_to_mat3(g->cov_pos, m.gnss_pos.Qll_ned); }
         else
         {

@@ -96,7 +96,7 @@ BLOCKED_COASTING = 1       # ins ready but dead-reckoning (aiding stale/gone)
 BLOCKED_WARMUP = 2         # aiding accepted, filter not converged yet
 BLOCKED_NO_AIDING = 3      # no absolute-position measurement has EVER arrived
 BLOCKED_AIDING_REJECTED = 4  # aiding arrived but every fix failed the noise gate
-BLOCKED_NO_ANCHOR = 5      # aiding arrived but there is no ECEF anchor for it
+BLOCKED_NO_ANCHOR = 5      # aiding arrived but there is no WGS84 anchor for it
 
 BLOCKED_TEXT = {
     BLOCKED_OK: "3D filter running (FULL)",
@@ -104,7 +104,7 @@ BLOCKED_TEXT = {
     BLOCKED_WARMUP: "3D filter converging: aiding accepted, not ready yet",
     BLOCKED_NO_AIDING: "3D filter off: no GNSS/position measurements at all",
     BLOCKED_AIDING_REJECTED: "3D filter off: all GNSS fixes rejected (accuracy gate)",
-    BLOCKED_NO_ANCHOR: "3D filter off: GNSS seen but no ECEF anchor",
+    BLOCKED_NO_ANCHOR: "3D filter off: GNSS seen but no WGS84 anchor",
 }
 
 
@@ -121,7 +121,7 @@ def suite_status(nav):
 
     The reason is derived from ins's own diagnostic counters (see
     Navigator.diag): a fix that never arrived, one rejected by the
-    accuracy gate and one that arrived before the ECEF anchor existed are
+    accuracy gate and one that arrived before the WGS84 anchor existed are
     three different failures with three different fixes, and guessing
     between them from the outside is exactly what this avoids.
     """

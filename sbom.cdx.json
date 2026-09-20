@@ -1,0 +1,25 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-09-13T00:00:00Z",
+    "component": {
+      "type": "library",
+      "name": "INSLIB",
+      "version": "1.1.0",
+      "licenses": [{ "license": { "id": "AGPL-3.0-only" } }],
+      "purl": "pkg:github/jnz/INSLIB@v1.1.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "KFCore",
+      "version": "8648bad199493676f5cd3e51478998b4db66586c",
+      "description": "Linear algebra and UDU/Bierman-Thornton Kalman filter core, vendored as a git submodule at KFCore/",
+      "licenses": [{ "license": { "id": "BSD-3-Clause" } }],
+      "purl": "pkg:github/jnz/KFCore@8648bad199493676f5cd3e51478998b4db66586c"
+    }
+  ]
+}

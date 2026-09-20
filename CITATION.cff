@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "INSLIB: A Portable C Library for 3D Navigation State Estimation"
+type: software
+authors:
+  - family-names: "Zwiener"
+    given-names: "Jan"
+repository-code: "https://github.com/jnz/INSLIB"
+url: "https://github.com/jnz/INSLIB"
+license: AGPL-3.0-only
+version: 1.1.0
+date-released: 2026-09-13
+keywords:
+  - "Kalman filter"
+  - "inertial navigation"
+  - "GNSS/INS fusion"
+  - "AHRS"
+  - "sensor fusion"
+  - "state estimation"

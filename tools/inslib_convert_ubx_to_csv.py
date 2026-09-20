@@ -16,6 +16,13 @@ Outputs (written to --outdir):
                   actually carried magnetometer frames, and `mag: enable`
                   in the generated config.yaml follows the same fact:
                   the replay harnesses fail on `enable` without a file.
+  - speed.csv     absolute ground speed from the host-produced odometry
+                  frames (0x40/0x80, e.g. tools/inslib_obd_speed.py via
+                  tools/inslib_hub.py). Only frames the hub already
+                  stamped with an MCU t_us are convertible: the replay
+                  format has one timebase and there is nothing here to
+                  map a bare host clock onto. Written, and `speed:
+                  enable` set, only when the capture carries such frames.
   - gnss.csv      from the passed-through receiver's NAV-PVT + NAV-COV
                   (0x01/0x07, 0x01/0x36) -- decoded with pyubx2 from
                   already checksum-verified frames. Only epochs with
@@ -35,7 +42,17 @@ Outputs (written to --outdir):
                   `mag: wmm_year` comes from the UTC date of the first
                   dated NAV-PVT: the replay harnesses build no reference
                   field without an epoch, and without one every
-                  magnetometer sample is rejected.
+                  magnetometer sample is rejected. `speed: scale` is
+                  fitted against gnss.csv's own velocity by
+                  tools/inslib_speed_scale.py (used here as a library)
+                  whenever that fit clears its own trust bar -- see
+                  calibrate_speed_scale() below -- and left at the
+                  library default (0.0 -> 1.0) with a comment explaining
+                  why otherwise, never a number this tool cannot vouch for.
+                  `automotive_mode` defaults to whatever this capture is:
+                  on when it carries odometry, off otherwise -- a wheel/OBD
+                  speed source is itself evidence of a road vehicle.
+                  --automotive-mode/--no-automotive-mode overrides this.
 
 Not produced yet (left as planned features -- see the comments at the
 call sites below for where to hook them in):
@@ -65,7 +82,11 @@ announcement; --pos fits a linear clock model to them (see ClockFit).
 
 Usage:
   inslib_convert_ubx_to_csv.py capture.ubx --outdir datasets/mydevice/trial1
-  inslib_convert_ubx_to_csv.py capture.ubx --outdir out --automotive-mode
+  inslib_convert_ubx_to_csv.py capture.ubx --outdir out   # automotive_mode
+                                                           # auto-detected from
+                                                           # whether odometry
+                                                           # is in the capture
+  inslib_convert_ubx_to_csv.py capture.ubx --outdir out --no-automotive-mode
 
 Requires pyubx2 (pip install pyubx2, listed in python/requirements.txt).
 
@@ -86,11 +107,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "datasets"))
 from replay_format import (BARO_HEADER, GNSS_HEADER, IMU_HEADER_TEMP,    # noqa: E402
-                           MAG_HEADER, REF_HEADER, gnss_row, write_config)
+                           MAG_HEADER, REF_HEADER, SPEED_HEADER, gnss_row,
+                           write_config)
 
 from inslib_ubx import (BARO_FMT, ID_BARO, ID_IMU, ID_MAG,             # noqa: E402
                         ID_ODOMETRY, ID_STATUS, ID_TIMESYNC, IMU_FMT,
-                        MAG_FMT, UbxFramer, decode_imu_status, parse_timesync)
+                        MAG_FMT, ODO_DIR_VALID, ODO_KIND_GROUND_SPEED,
+                        ODO_T_DEGRADED, UbxFramer, decode_imu_status,
+                        parse_odometry, parse_timesync)
 
 try:
     from pyubx2 import UBXReader
@@ -452,6 +476,14 @@ class UbxGnssDecoder:
 # Conversion driver
 # --------------------------------------------------------------------------
 
+def _median(values):
+    v = sorted(values)
+    if not v:
+        return 0.0
+    mid = len(v) // 2
+    return float(v[mid]) if len(v) % 2 else 0.5 * float(v[mid - 1] + v[mid])
+
+
 def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
     os.makedirs(outdir, exist_ok=True)
     gnss_decoder = UbxGnssDecoder()
@@ -461,6 +493,7 @@ def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
     first_imu_t_us = None
     last_imu_t_us = None
     status_last = None
+    speed_rows = []
 
     imu_f = open(os.path.join(outdir, "imu.csv"), "w", encoding="utf-8")
     baro_f = open(os.path.join(outdir, "baro.csv"), "w", encoding="utf-8")
@@ -567,12 +600,33 @@ def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
                 # table without breaking this converter).
                 status_last = payload
             elif mid == ID_ODOMETRY:
-                # Recorded so the capture stays self-describing, but not
-                # written to a CSV: the replay format (datasets/
-                # replay_format.py) has no odometry stream, and replay.c
-                # has no input for one. Counted here so a capture that
-                # carries odometry does not look as if it did not.
+                # Host-produced ground speed -> speed.csv (REQ-NAV-068).
+                # Buffered rather than streamed because it is the only
+                # stream whose frames can reach the capture out of order:
+                # they are injected by the hub on the host clock while
+                # everything else is written in MCU order.
+                o = parse_odometry(payload)
+                if o is None:
+                    n["odometry_bad_len"] += 1
+                    return
                 n["odometry"] += 1
+                if o["kind"] != ODO_KIND_GROUND_SPEED:
+                    # A different measurement MODEL (an airspeed would
+                    # need a wind assumption), not another source of |v|.
+                    n["odometry_other_kind"] += 1
+                    return
+                if not o["t_us_valid"]:
+                    # The producer's half of a frame the hub never
+                    # completed, typically recorded before any IMU sample
+                    # gave it a clock to map onto.
+                    n["odometry_no_t_us"] += 1
+                    return
+                if not (math.isfinite(o["speed_mps"]) and o["speed_mps"] >= 0.0):
+                    n["odometry_bad_value"] += 1
+                    return
+                if o["flags"] & ODO_T_DEGRADED:
+                    n["odometry_t_degraded"] += 1
+                speed_rows.append(o)
             return
 
         # Standard u-blox: hand pyubx2 ONE complete, already checksum-
@@ -725,12 +779,94 @@ def convert(ubx_path, outdir, min_fix_type=3, pos_rows=None, pos_max_q=2):
     if n["mag"] == 0:
         os.remove(mag_path)
 
+    # speed.csv last, and only when there is something to put in it: same
+    # reasoning as mag.csv above, an empty file reads as a stream that
+    # exists. Sorted because the hub injects these frames on the host
+    # clock, so capture order is not t_us order, and tools/replay.c reads
+    # the rows in file order (python/replay.py sorts, the C harness does
+    # not, and the two must not disagree about the same dataset).
+    if speed_rows:
+        speed_rows.sort(key=lambda o: o["t_us"])
+        with open(os.path.join(outdir, "speed.csv"), "w",
+                  encoding="utf-8") as speed_f:
+            speed_f.write(SPEED_HEADER)
+            speed_f.write("# from 0x40/0x80 odometry frames. Both replay"
+                          " harnesses read the first two columns only; the"
+                          " rest is the producer's own record: stddev_mps,"
+                          " delay_ms, reverse (1 = travelling backwards,"
+                          " blank = direction unknown)\n")
+            for o in speed_rows:
+                speed_f.write("%d,%.4f,%.4f,%d,%s\n" % (
+                    o["t_us"], o["speed_mps"], o["stddev_mps"],
+                    o["delay_ms"],
+                    "1" if o["reverse"] else
+                    ("0" if o["flags"] & ODO_DIR_VALID else "")))
+        n["speed"] = len(speed_rows)
+        # Constants for config.yaml: the format keeps uncertainty and delay
+        # there rather than per row, so the dataset is described in one
+        # place. Median rather than mean, so a handful of outliers (a
+        # stalled OBD round trip) cannot move what every sample is charged.
+        n["speed_stddev_mps"] = _median([o["stddev_mps"] for o in speed_rows])
+        n["speed_delay_ms"] = _median([o["delay_ms"] for o in speed_rows])
+        n["speed_reverse"] = sum(1 for o in speed_rows if o["reverse"])
+
     return n, status_last, gnss_decoder.identities
 
 
 # --------------------------------------------------------------------------
 # config.yaml
 # --------------------------------------------------------------------------
+
+SPEED_SCALE_FIXME = (
+    0.0, "0 -> 1.0. Systematic and vehicle-specific, so calibrate it against"
+        " GNSS: PID 0x0D is the ECU's own value, not the dashboard reading"
+        " that type approval keeps on the high side")
+
+
+def calibrate_speed_scale(outdir):
+    """(scale, comment) for config.yaml's `speed: scale`, fitted from the
+    gnss.csv/speed.csv just written to `outdir` -- reuses
+    tools/inslib_speed_scale.py as a library rather than a second copy of
+    its parsing/fit logic.
+
+    Falls back to SPEED_SCALE_FIXME (the library default, 0.0 -> 1.0) with
+    a comment saying why whenever the fit does not clear that script's own
+    trust bar (inslib_speed_scale.trust_reason): a plausible-looking number
+    baked into config.yaml unattended is worse than the FIXME it replaces,
+    since nothing about a config file says "this one was never checked"."""
+    import inslib_speed_scale as ss
+    gnss_rows = ss.load_gnss(os.path.join(outdir, "gnss.csv"))
+    speed_rows = ss.load_speed(os.path.join(outdir, "speed.csv"))
+    if len(gnss_rows) < 2:
+        return (0.0, SPEED_SCALE_FIXME[1] + " (this capture has no usable"
+                " GNSS velocity fix, vel_ok=1, to calibrate against yet)")
+
+    # gnss: delay_ms is written as 0.0 just below (see its own comment):
+    # calibrate against the same event-time convention this config will
+    # replay with, not against whatever a previous hand-tuned config used.
+    samples = ss.collect_samples(gnss_rows, speed_rows, gnss_delay_ms=0.0,
+                                 min_speed_mps=3.0, max_gap_s=0.5,
+                                 max_accel_mps2=1.5, include_reverse=False)
+    if len(samples) < ss.MIN_SAMPLES:
+        return (0.0, SPEED_SCALE_FIXME[1] +
+                " (only %d sample(s) against GNSS after filtering, need >="
+                " %d -- not enough speed variation in this capture yet)"
+                % (len(samples), ss.MIN_SAMPLES))
+
+    fit = ss.fit_scale(samples)
+    reason = ss.trust_reason(samples, fit)
+    if reason:
+        return (0.0, SPEED_SCALE_FIXME[1] +
+                " (tools/inslib_speed_scale.py measured %.4f from this"
+                " capture but flagged it -- %s; review with its --plot"
+                " before applying it by hand)" % (fit["scale"], reason))
+    return (round(fit["scale"], 4),
+           "measured against GNSS by tools/inslib_speed_scale.py: %.4f +/-"
+           " %s from %d samples, %.1f-%.1f m/s, RMS %.3f -> %.3f m/s."
+           " Re-run it after a mechanical change (tires, gearing)"
+           % (fit["scale"], ss.fmt_unc(fit["sigma_scale"]), fit["n"],
+              fit["odo_min"], fit["odo_max"], fit["rms_raw"], fit["rms_fit"]))
+
 
 # Tuning carried over from datasets/tunnel/config.yaml, which was tuned on
 # a recording from this same board and receiver, so it is a far better
@@ -760,7 +896,9 @@ AUTOMOTIVE_IMU = {
 
 
 def write_cfg(path_out, name, automotive_mode, leverarm_frd, from_pos=False,
-              has_mag=False, wmm_year=0.0):
+              has_mag=False, wmm_year=0.0, has_speed=False,
+              speed_stddev_mps=0.0, speed_delay_ms=0.0,
+              speed_scale=SPEED_SCALE_FIXME, automotive_mode_reason=None):
     """Replay configuration for the converted dataset. IMU noise defaults
     are the library's generic MEMS fallback (src/sensor_defaults.h,
     src/ins.c INS_DEFAULT_ACC_*) -- replace with this board's actual IMU
@@ -788,7 +926,9 @@ def write_cfg(path_out, name, automotive_mode, leverarm_frd, from_pos=False,
         ("aiding", ("gnss", "NAV-PVT/NAV-COV passthrough, see gnss.csv header")),
         ("init", "auto"),
         ("automotive_mode", (1 if automotive_mode else 0,
-                              "derive yaw from GNSS course over ground")),
+                              "derive yaw from GNSS course over ground"
+                              + (" (%s)" % automotive_mode_reason
+                                 if automotive_mode_reason else ""))),
         ("imu", dict(AUTOMOTIVE_IMU, **{
             "gyr_psd": (AUTOMOTIVE_IMU["gyr_psd"],
                         "from datasets/tunnel (same board), not a datasheet figure"),
@@ -805,16 +945,16 @@ def write_cfg(path_out, name, automotive_mode, leverarm_frd, from_pos=False,
             "pos_stddev_fallback_m": ([0.8, 1.5] if automotive_mode else [5.0, 10.0],
                                        "only used for a NAV-COV-less epoch"),
             "vel_stddev_fallback_mps": 0.2 if automotive_mode else 0.5,
-            # Deliberately NOT copied from datasets/tunnel (200 ms): that
-            # value compensates THAT recording path, not a property of the
-            # board. Each GNSS epoch here is stamped with the most recent
-            # IMU t_us, so the error is bounded by the IMU period - under a
-            # millisecond at 1 kHz. Measured on the first drive by shifting
-            # gnss.csv against a post-processed ref.csv: 10 ms.
-            # To re-measure on a new dataset, sweep the shift that minimises
-            # the horizontal RMS between the two.
-            "delay_ms": (0.0, "GNSS epochs carry the last IMU t_us; at kHz IMU"
-                              " rates that is already within a few ms"),
+            # 0 is only a placeholder, it is usually wrong. Stamping each
+            # GNSS epoch with the most recent IMU t_us removes the transport
+            # delay, but not the group delay of the receiver's own
+            # navigation filter, which depends on its dynamic model (about
+            # 200 ms for u-blox F9P/X20P in Airborne 4g, possibly different
+            # in Automotive). No default fits every receiver setup, so the
+            # value has to be tuned per recording, e.g. by cross-correlating
+            # GNSS vs baro_alt
+            "delay_ms": (0.0, "TUNE ME: receiver filter group delay, e.g. ~200"
+                              " for u-blox F9P/X20P in Airborne 4g"),
         }),
         ("mag", {
             # Only ever 1 when the capture really carried 0x40/0x06 frames:
@@ -847,28 +987,43 @@ def write_cfg(path_out, name, automotive_mode, leverarm_frd, from_pos=False,
         }),
         ("baro", {
             "enable": 1,
-            "stddev_m": (0.8 if automotive_mode else 0.5,
+            "stddev_m": (0.8 if automotive_mode else 0.0,
                           "from datasets/tunnel" if automotive_mode
-                          else "FIXME: generic MEMS baro guess"),
+                          else "0 -> default"),
             "acc_bias_init_mps2": 0.08,
         }),
     ] + extra + [
-        # Absolute speed aiding (REQ-NAV-068). Off by default: this tool
-        # does not produce speed.csv, it comes from the recording side
-        # (tools/inslib_obd_speed.py via inslib_udp_to_serial.py). Written
-        # out anyway so the knobs are visible rather than having to be
-        # looked up. Every 0 means "library default".
+        # Absolute speed aiding (REQ-NAV-068), from the capture's own
+        # 0x40/0x80 odometry frames. Enabled on the same fact as `mag`
+        # above: on when speed.csv was written, off (but visible, so the
+        # knobs do not have to be looked up) when the capture carried no
+        # convertible odometry. Every 0 means "library default".
+        #
+        # stddev_mps and delay_ms are the medians the producer reported
+        # per sample, promoted to constants because that is where this
+        # format keeps them. A dataset whose speed uncertainty really
+        # varies (heavy braking widens it, see inslib_protocol.md
+        # 0x40/0x80) is served worse by a median than by its own columns,
+        # which stay in speed.csv for exactly that day.
         ("speed", {
-            "enable": (0, "1 + a speed.csv next to this file to use it"),
-            "scale": (0.0, "0 -> 1.0. A car speedometer reads high by law,"
-                           " so expect ~0.95..0.98 once calibrated"),
-            "stddev_mps": (0.0, "per-sample 1-sigma; 0 -> default (0.080,"
-                                " the 1 km/h quantisation of OBD-II PID 0x0D)"),
+            "enable": (1 if has_speed else 0,
+                        "0x40/0x80 odometry frames in the capture"
+                        if has_speed
+                        else "1 + a speed.csv next to this file to use it"),
+            "scale": speed_scale,
+            "stddev_mps": (round(speed_stddev_mps, 4) if has_speed else 0.0,
+                            "median of the per-sample 1-sigma the producer"
+                            " reported" if has_speed
+                            else "per-sample 1-sigma; 0 -> default (0.080,"
+                                 " the 1 km/h quantisation of OBD-II PID 0x0D)"),
             "stddev_rel": (0.0, "speed-proportional 1-sigma; 0 -> default (3%),"
                                 " covering the scale error left after `scale`"),
             "min_speed_mps": (0.0, "below this FILTERED speed a sample is"
                                    " skipped; 0 -> default"),
-            "delay_ms": (0.0, "how old a sample is at its timestamp"),
+            "delay_ms": (round(speed_delay_ms) if has_speed else 0.0,
+                          "median reported age of a sample at its timestamp"
+                          if has_speed
+                          else "how old a sample is at its timestamp"),
         }),
         ("score", {
             # The SAME lever arm as gnss.leverarm_frd above, and not
@@ -912,9 +1067,14 @@ def main():
     ap.add_argument("--outdir", required=True, help="output directory")
     ap.add_argument("--name", default=None,
                     help="dataset name for config.yaml (default: outdir basename)")
-    ap.add_argument("--automotive-mode", action="store_true",
-                    help="enable automotive_mode (GNSS course-over-ground yaw)"
-                         " in the generated config.yaml")
+    ap.add_argument("--automotive-mode", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="automotive_mode (GNSS course-over-ground yaw) in the"
+                         " generated config.yaml. Default: on when the capture"
+                         " carries odometry (0x40/0x80) -- a wheel/OBD speed"
+                         " source is itself evidence of a road vehicle -- off"
+                         " otherwise. Pass --no-automotive-mode to force it off"
+                         " even with odometry present")
     ap.add_argument("--leverarm-frd", type=float, nargs=3, default=(0.0, 0.0, 0.0),
                     metavar=("X", "Y", "Z"),
                     help="GNSS antenna lever arm, body FRD [m] (default 0 0 0)")
@@ -949,11 +1109,33 @@ def main():
     # Never clobber an existing config: re-running the conversion on a new
     # capture is routine, throwing away a hand-tuned config.yaml is not.
     cfg_kept = os.path.exists(cfg_path)
+    speed_scale = None
+    automotive_mode = args.automotive_mode
+    automotive_mode_reason = None
     if not cfg_kept:
+        # Needs speed.csv/gnss.csv already on disk (just written by
+        # convert() above) and at least one usable GNSS velocity fix.
+        if n["speed"] > 0 and n["gnss"] > 0:
+            speed_scale = calibrate_speed_scale(args.outdir)
+        else:
+            speed_scale = SPEED_SCALE_FIXME
+        # A wheel/OBD speed source is itself evidence of a road vehicle, so
+        # --automotive-mode/--no-automotive-mode left unset defaults to
+        # whichever this capture is. Only when it is genuinely unset: an
+        # explicit choice, either way, is never second-guessed.
+        if automotive_mode is None:
+            automotive_mode = n["speed"] > 0
+            automotive_mode_reason = ("auto-enabled: odometry present"
+                                      if automotive_mode else
+                                      "auto-disabled: no odometry in this capture")
         write_cfg(cfg_path, name,
-                  args.automotive_mode, args.leverarm_frd,
+                  automotive_mode, args.leverarm_frd,
                   from_pos=pos_rows is not None, has_mag=n["mag"] > 0,
-                  wmm_year=n["wmm_year"])
+                  wmm_year=n["wmm_year"], has_speed=n["speed"] > 0,
+                  speed_stddev_mps=n["speed_stddev_mps"],
+                  speed_delay_ms=n["speed_delay_ms"],
+                  speed_scale=speed_scale,
+                  automotive_mode_reason=automotive_mode_reason)
 
     if pos_rows is None:
         print("imu.csv: %d samples, baro.csv: %d samples, gnss.csv/ref.csv: %d epochs"
@@ -1019,12 +1201,40 @@ def main():
     if n["skipped_bytes"]:
         print("framer: %d byte(s) skipped to resynchronise (damaged stream?)"
               % n["skipped_bytes"])
-    if n["odometry"]:
-        # Named rather than silently dropped: the odometry IS in the
-        # capture, it just has nowhere to go in this format yet.
-        print("note: %d odometry frame(s) (0x40/0x80) in the capture, not"
-              " converted -- the replay format has no odometry stream"
-              % n["odometry"])
+    if n["speed"]:
+        print("speed.csv: %d of %d odometry frame(s) (0x40/0x80), speed:"
+              " enable: 1, stddev_mps %.3f / delay_ms %d from the medians"
+              " the producer reported"
+              % (n["speed"], n["odometry"], n["speed_stddev_mps"],
+                 round(n["speed_delay_ms"])))
+        if speed_scale is not None:
+            if speed_scale[0]:
+                print("         scale %.4f, %s" % speed_scale)
+            else:
+                print("         scale left at 0 (1.0): %s" % speed_scale[1])
+        if automotive_mode_reason:
+            print("         automotive_mode %s (%s)"
+                  % ("on" if automotive_mode else "off", automotive_mode_reason))
+        if n["speed_reverse"]:
+            print("         %d sample(s) flagged reverse -- fused as |v|"
+                  " either way, but a filter in automotive_mode derives"
+                  " heading from course, which is 180 deg off there"
+                  % n["speed_reverse"])
+        if n["odometry_t_degraded"]:
+            print("         %d sample(s) carry T_DEGRADED: the host/MCU"
+                  " mapping behind their timestamp was stale or thin"
+                  % n["odometry_t_degraded"])
+    dropped_odo = [(n["odometry_no_t_us"], "never stamped with an MCU t_us by"
+                    " the hub (nothing to place them on)"),
+                   (n["odometry_other_kind"], "not a ground speed (kind != 0)"),
+                   (n["odometry_bad_value"], "speed not finite or negative"),
+                   (n["odometry_bad_len"], "wrong payload length")]
+    dropped_odo = [(c, why) for c, why in dropped_odo if c]
+    for c, why in dropped_odo:
+        print("note: %d odometry frame(s) dropped, %s" % (c, why))
+    if n["odometry"] and not n["speed"]:
+        print("note: %d odometry frame(s) (0x40/0x80) in the capture, none"
+              " convertible -- no speed.csv written" % n["odometry"])
     if status_last is not None:
         print("last 0x40/0x04 status payload (%d bytes): %s"
               % (len(status_last), status_last.hex()))

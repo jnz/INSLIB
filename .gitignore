@@ -98,6 +98,12 @@ python/.venv/
 /tmp/
 /datasets/tmp/
 
+# Vendored CI-matching toolchain (scripts/fetch_ci_clang_format.sh)
+/.tools/
+
+# wmm_error_analysis.py --plot output
+/magneticmodel/error_analysis_out/
+
 # STM32CubeIDE metadata. The firmware builds from its own Makefile now, so
 # anything the IDE writes is a personal workspace setting rather than part
 # of the build -- see "Debugging" in Core/Src/inslib_sensor/README_inslib.md.
@@ -115,3 +121,14 @@ python/.venv/
 /embedded/stm32f429/firmware.hex
 /embedded/stm32f429/firmware.list
 /embedded/stm32f429/firmware.map
+
+# local marker recording the public repo HEAD
+/.public_sync_head
+
+# KiCad Local Settings & Backups
+*.kicad_prl
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*-backups/
+_autosave-*
+*.lck

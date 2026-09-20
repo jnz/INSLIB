@@ -38,7 +38,9 @@ set "SRCS=src\ins.c src\geodetic_toolbox.c src\magnetic_model.c src\ahrs.c src\b
 
 if not exist build_cl mkdir build_cl
 echo [1/3] compiling...
-cl /nologo /std:c11 /O2 /c /D_USE_MATH_DEFINES /wd4068 %INCS% %SRCS% /Fo:build_cl\
+rem  KALMAN_MAX_*: KFCore scratchpad sizes, keep in sync with $(KFCORE_LIMITS)
+rem  in the Makefile (src\ins.c static-asserts them against the filter sizes).
+cl /nologo /std:c11 /O2 /c /D_USE_MATH_DEFINES /DKALMAN_MAX_STATE_SIZE=18 /DKALMAN_MAX_NOISE_SIZE=24 /wd4068 %INCS% %SRCS% /Fo:build_cl\
 if errorlevel 1 ( echo ERROR: compile failed & goto :fail )
 
 rem --- generate the exports .def (the ins_core_*/ins_suite_* capi + magnetic_*

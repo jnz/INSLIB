@@ -85,6 +85,10 @@ typedef struct
     int   automotive_mode;               /* 0/1: yaw from GNSS course over ground (REQ-NAV-034) */
     float automotive_min_speed_mps;      /* 0 -> default */
     float automotive_min_yaw_stddev_deg; /* 0 -> default */
+    int   automotive_lateral_constraint;   /* 0/1: NHC lateral (REQ-NAV-077) */
+    float automotive_lateral_stddev_mps;   /* 0 -> default */
+    float automotive_lateral_max_yaw_rate_deg; /* 0 -> default */
+    float automotive_lateral_after_sec;    /* 0 -> default, <0 -> no delay */
 
     float auto_init_window_sec; /* IMU leveling window for ins's auto-init
                                     bootstrap [s] (0 -> ins's built-in default,
@@ -259,6 +263,17 @@ typedef struct
     double wmm_year;          /* magnetic model epoch (0 -> no model) */
     int    mag_estimate_bias; /* 0/1: ins 18-state mode, online hard-iron
                                   bias estimate (REQ-NAV-029) */
+    /* The two knobs of that estimate, both 0 -> ins default. Exposed
+       because they are what decides whether the 18-state mode helps on a
+       given recording: the initial sigma says how much hard iron the
+       filter should be prepared to find, and the random walk how long the
+       estimate keeps listening once it has settled. Neither has a value
+       that is right everywhere -- a road recording whose magnetometer was
+       calibrated in place wants a different prior from a box just bolted
+       into an unknown vehicle -- so they belong in the dataset's own
+       config rather than in a compiled-in constant. */
+    float  mag_bias_init_ut;      /* [uT] initial hard-iron 1-sigma      */
+    float  mag_bias_rw_ut_sqrts;  /* [uT/sqrt(s)] hard-iron random walk  */
 
     /* speed: scalar ground speed (REQ-NAV-068), e.g. an OBD-II vehicle
        speed. Uncertainty and delay are constants from the config rather
@@ -338,13 +353,26 @@ typedef struct
     double lim_ars_att_bias_deg;
     double lim_ars_roll_std_deg, lim_ars_pitch_std_deg;
     double lim_ars_yaw_drift_deg_min;
+    /* Coasting re-acquisition (REQ-VER-029): every gap in the aiding file
+       longer than coast_gap_min_sec is scored by the position error at the
+       first reference epoch after it. 0 -> not measured / not gated. */
+    double coast_gap_min_sec;
+    double lim_coast_exit_err_m;
+    /* Time of validity of a reference row (REQ-VER-030): the row timestamped
+       T describes the state at T - ref_delay_ms. Set it when ref.csv comes
+       out of the same receiver output as the aiding and that output carries
+       a latency the filter is told about via gnss: delay_ms. */
+    double ref_delay_ms;
 } replay_cfg_t;
 
 /* Apply one "section.key: value" pair. Returns -1 if the key is not
    known, which load_config turns into a hard error (REQ-VER-025): a
    silently ignored key is indistinguishable from a key that had no
    effect, and a mistyped or renamed tuning parameter then looks like the
-   library ignoring the configuration. */
+   library ignoring the configuration. Returns -2 for a known key whose
+   value is not the list it has to be (REQ-VER-028), the same argument one
+   level down: a half-read lever arm or misalignment matrix would leave
+   the harness running on numbers nobody wrote. */
 static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char* val)
 {
     char full[128];
@@ -378,6 +406,22 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "inputs.speed")) { snprintf(c->in_speed, sizeof(c->in_speed), "%s", val); }
     else if (!strcmp(full, "automotive_mode")) { c->automotive_mode = (int)d; }
     else if (!strcmp(full, "automotive_min_speed_mps")) { c->automotive_min_speed_mps = (float)d; }
+    else if (!strcmp(full, "automotive_lateral_constraint"))
+    {
+        c->automotive_lateral_constraint = (int)d;
+    }
+    else if (!strcmp(full, "automotive_lateral_stddev_mps"))
+    {
+        c->automotive_lateral_stddev_mps = (float)d;
+    }
+    else if (!strcmp(full, "automotive_lateral_max_yaw_rate_deg"))
+    {
+        c->automotive_lateral_max_yaw_rate_deg = (float)d;
+    }
+    else if (!strcmp(full, "automotive_lateral_after_sec"))
+    {
+        c->automotive_lateral_after_sec = (float)d;
+    }
     else if (!strcmp(full, "automotive_min_yaw_stddev_deg"))
     {
         c->automotive_min_yaw_stddev_deg = (float)d;
@@ -396,10 +440,10 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "imu.acc_psd")) { c->acc_psd = (float)d; }
     else if (!strcmp(full, "imu.gyr_bias_rw")) { c->gyr_bias_rw = (float)d; }
     else if (!strcmp(full, "imu.acc_bias_rw")) { c->acc_bias_rw = (float)d; }
-    else if (!strcmp(full, "imu.acc_misalignment")) { mini_yaml_list(val, c->acc_misalignment, 9); }
-    else if (!strcmp(full, "imu.gyr_misalignment")) { mini_yaml_list(val, c->gyr_misalignment, 9); }
-    else if (!strcmp(full, "imu.acc_fixed_bias")) { mini_yaml_list(val, c->acc_fixed_bias, 3); }
-    else if (!strcmp(full, "imu.gyr_fixed_bias")) { mini_yaml_list(val, c->gyr_fixed_bias, 3); }
+    else if (!strcmp(full, "imu.acc_misalignment")) { if (mini_yaml_list(val, c->acc_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "imu.gyr_misalignment")) { if (mini_yaml_list(val, c->gyr_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "imu.acc_fixed_bias")) { if (mini_yaml_list(val, c->acc_fixed_bias, 3) != 0) return -2; }
+    else if (!strcmp(full, "imu.gyr_fixed_bias")) { if (mini_yaml_list(val, c->gyr_fixed_bias, 3) != 0) return -2; }
     else if (!strcmp(full, "imu.pos_pred_stddev_m_sqrts"))
     {
         c->pos_pred_stddev_m_sqrts = (float)d;
@@ -445,10 +489,10 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     {
         c->auto_zupt_velocity_blind_disable = (int)d;
     }
-    else if (!strcmp(full, "gnss.leverarm_frd")) { mini_yaml_list(val, c->gnss_leverarm_frd, 3); }
+    else if (!strcmp(full, "gnss.leverarm_frd")) { if (mini_yaml_list(val, c->gnss_leverarm_frd, 3) != 0) return -2; }
     else if (!strcmp(full, "gnss.pos_stddev_fallback_m"))
     {
-        mini_yaml_list(val, c->pos_stddev_fallback_m, 2);
+        if (mini_yaml_list(val, c->pos_stddev_fallback_m, 2) != 0) return -2;
     }
     else if (!strcmp(full, "gnss.vel_stddev_fallback_mps"))
     {
@@ -566,10 +610,12 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     /* Unclamped: ins reads 0 as "use my default" and negative as "no rate
        limit", and both have to survive the config. */
     else if (!strcmp(full, "mag.min_delay_ms")) { c->mag_min_delay_ms = (int)d; }
-    else if (!strcmp(full, "mag.misalignment")) { mini_yaml_list(val, c->mag_misalignment, 9); }
-    else if (!strcmp(full, "mag.fixed_bias")) { mini_yaml_list(val, c->mag_fixed_bias, 3); }
+    else if (!strcmp(full, "mag.misalignment")) { if (mini_yaml_list(val, c->mag_misalignment, 9) != 0) return -2; }
+    else if (!strcmp(full, "mag.fixed_bias")) { if (mini_yaml_list(val, c->mag_fixed_bias, 3) != 0) return -2; }
     else if (!strcmp(full, "mag.wmm_year")) { c->wmm_year = d; }
     else if (!strcmp(full, "mag.estimate_bias")) { c->mag_estimate_bias = (int)d; }
+    else if (!strcmp(full, "mag.bias_init_ut")) { c->mag_bias_init_ut = (float)d; }
+    else if (!strcmp(full, "mag.bias_rw_ut_sqrts")) { c->mag_bias_rw_ut_sqrts = (float)d; }
     else if (!strcmp(full, "speed.enable")) { c->speed_enable = (int)d; }
     else if (!strcmp(full, "speed.scale")) { c->speed_scale = (float)d; }
     else if (!strcmp(full, "speed.stddev_mps")) { c->speed_stddev_mps = (float)d; }
@@ -613,7 +659,7 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "init_hint.rpy_stddev_deg")) { c->init_hint_rpy_stddev_deg = (float)d; }
     else if (!strcmp(full, "init_hint.yaw_deg")) { c->init_hint_yaw_deg = (float)d; }
     else if (!strcmp(full, "init_hint.yaw_stddev_deg")) { c->init_hint_yaw_stddev_deg = (float)d; }
-    else if (!strcmp(full, "score.leverarm_frd")) { mini_yaml_list(val, c->score_leverarm_frd, 3); }
+    else if (!strcmp(full, "score.leverarm_frd")) { if (mini_yaml_list(val, c->score_leverarm_frd, 3) != 0) return -2; }
     else if (!strcmp(full, "score.ahrs")) { c->score_ahrs = (int)d; }
     else if (!strcmp(full, "score.attitude")) { c->score_attitude = (int)d; }
     else if (!strcmp(full, "score.warmup_sec")) { c->warmup_sec = d; }
@@ -633,6 +679,9 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "score.lim_ars_roll_std_deg")) { c->lim_ars_roll_std_deg = d; }
     else if (!strcmp(full, "score.lim_ars_pitch_std_deg")) { c->lim_ars_pitch_std_deg = d; }
     else if (!strcmp(full, "score.lim_ars_yaw_drift_deg_min")) { c->lim_ars_yaw_drift_deg_min = d; }
+    else if (!strcmp(full, "score.coast_gap_min_sec")) { c->coast_gap_min_sec = d; }
+    else if (!strcmp(full, "score.ref_delay_ms")) { c->ref_delay_ms = d; }
+    else if (!strcmp(full, "score.lim_coast_exit_err_m")) { c->lim_coast_exit_err_m = d; }
     /* Known to the schema, owned by a DIFFERENT consumer of the SAME
        config.yaml. One dataset directory is read by more than one tool, and
        REQ-VER-025 makes the schema shared, not the interpretation - so these
@@ -675,7 +724,14 @@ typedef struct
 static int cfg_set_cb(void* ctx_, const char* sec, const char* key, const char* val)
 {
     cfg_parse_ctx_t* ctx = (cfg_parse_ctx_t*)ctx_;
-    if (cfg_set(ctx->c, sec, key, val) != 0)
+    const int        rc  = cfg_set(ctx->c, sec, key, val);
+    if (rc == -2)
+    {
+        fprintf(stderr, "%s: config key '%s%s%s' is not a list of numbers: %s\n", ctx->path, sec,
+                sec[0] ? "." : "", key, val);
+        return -1;
+    }
+    if (rc != 0)
     {
         fprintf(stderr, "%s: unknown config key '%s%s%s'\n", ctx->path, sec, sec[0] ? "." : "", key);
         return -1;
@@ -719,6 +775,14 @@ static int load_config(const char* path, replay_cfg_t* c)
     if (!(c->warmup_sec > 0.0) || c->min_epochs <= 0)
     {
         fprintf(stderr, "%s: missing score: warmup_sec or score: min_epochs\n", path);
+        return -1;
+    }
+    if ((c->ref_delay_ms > 0.0 || c->ref_delay_ms < 0.0) && !strcmp(c->aiding, "ref"))
+    {
+        /* There the reference IS the aiding, so a latency belongs in
+           gnss: delay_ms and shifting the reference would move the
+           measurements with it (REQ-VER-030). */
+        fprintf(stderr, "%s: score: ref_delay_ms cannot be used with aiding: ref\n", path);
         return -1;
     }
     if (c->fi_enable && !(c->fi_have_lat && c->fi_have_lon))
@@ -1016,12 +1080,141 @@ static int load_speed(const char* path, speed_epoch_t** out)
     return n;
 }
 
+/* ---------------------------------------------------------------------------
+ * Coasting re-acquisition metric (REQ-VER-029)
+ *
+ * A dataset with a real outage cannot be scored inside it: the reference
+ * comes from the same receiver as the aiding, so no fixes means no truth.
+ * The one question the data does answer is how far out the filter is when
+ * aiding returns, and that is what this measures.
+ *
+ * The gaps are taken from the aiding FILE, not from what the filter fused,
+ * so the number stays comparable across configurations that gate fixes
+ * differently.
+ * ------------------------------------------------------------------------- */
+
+#define REPLAY_MAX_COAST_GAPS 16
+/* Furthest a reference row may lie from the sampled IMU epoch and still score
+   a gap, and never more than half the gap itself (REQ-VER-029). */
+#define REPLAY_COAST_REF_MAX_DT_US 500000
+
+typedef struct
+{
+    int64_t t_beg_us;  /* timestamp of the last fix before the gap */
+    int64_t t_end_us;  /* timestamp of the first fix after the gap */
+    double  gap_sec;   /* length of the gap */
+    double  chord_m;   /* straight-line distance across it */
+    double  err_m;     /* position error at the first reference epoch after it */
+    int     have_err;  /* 0 -> the filter had no solution there, which fails */
+    int     resolved;  /* 0 -> still waiting for that reference epoch */
+} coast_gap_t;
+
+/* Collect every gap longer than min_sec that ends after t_warmup_end. */
+static int coast_gaps_scan(const gnss_epoch_t* fix, int n_fix, double min_sec,
+                           int64_t t_warmup_end, coast_gap_t* out, int max_out)
+{
+    int n = 0;
+    int i;
+    if (min_sec <= 0.0 || n_fix < 2) return 0;
+    for (i = 1; i < n_fix && n < max_out; ++i)
+    {
+        const double gap = (double)(fix[i].t_us - fix[i - 1].t_us) * 1e-6;
+        double       dllh[3];
+        float        dned_f[3];
+        if (gap < min_sec) continue;
+        if (fix[i].t_us < t_warmup_end) continue;
+        dllh[0] = fix[i].lat_rad - fix[i - 1].lat_rad;
+        dllh[1] = fix[i].lon_rad - fix[i - 1].lon_rad;
+        dllh[2] = fix[i].h_m - fix[i - 1].h_m;
+        ins_dlatlonh_to_dned(dllh, fix[i - 1].lat_rad, fix[i - 1].h_m, dned_f);
+        out[n].t_beg_us = fix[i - 1].t_us;
+        out[n].t_end_us = fix[i].t_us;
+        out[n].gap_sec  = gap;
+        out[n].chord_m =
+            sqrt((double)dned_f[0] * dned_f[0] + (double)dned_f[1] * dned_f[1]);
+        out[n].err_m    = 0.0;
+        out[n].have_err = 0;
+        out[n].resolved = 0;
+        n++;
+        if (n == max_out && i + 1 < n_fix)
+        {
+            /* Say so rather than dropping the rest quietly: a dataset with
+               more outages than this would otherwise be gated on a subset
+               nobody chose. */
+            fprintf(stderr, "replay: more than %d aiding gaps over %g s, only the first %d "
+                            "are scored\n",
+                    max_out, min_sec, max_out);
+        }
+    }
+    return n;
+}
+
 static nav_suite_t    g_suite; /* too large for the stack */
 static ref_epoch_t*   g_ref;   /* per-stream buffers, grown on demand at load */
 static gnss_epoch_t*  g_gnss;
 static mag_epoch_t*   g_mag;
 static baro_epoch_t*  g_baro;
 static speed_epoch_t* g_speed;
+
+/* 3D position error of the ins solution against one reference epoch, with the
+ * scoring lever arm mapping the filter position onto the truth point. Returns
+ * 0 when the filter has no position to offer, which is an answer of its own
+ * for the coasting metric (REQ-VER-029). */
+static int nav_pos_error_m(const ref_epoch_t* ref, const float leverarm_frd[3], double* err_m)
+{
+    double llh[3];
+    double dllh[3];
+    float  R[9];
+    float  la_n[3] = {0.0f, 0.0f, 0.0f};
+    float  dned_f[3];
+    double dn, de, dd;
+    if (!ins_is_ready(&g_suite.ins)) return 0;
+    /* The anchor as the filter holds it (REQ-NAV-078): going out through
+       ins_get_position_ecef() and back would run two conversions to land on
+       the same three numbers. */
+    if (!ins_get_latlonh(&g_suite.ins, llh)) return 0;
+    if (ins_get_rotmat_b_to_n(&g_suite.ins, R))
+    {
+        la_n[0] = R[0] * leverarm_frd[0] + R[3] * leverarm_frd[1] + R[6] * leverarm_frd[2];
+        la_n[1] = R[1] * leverarm_frd[0] + R[4] * leverarm_frd[1] + R[7] * leverarm_frd[2];
+        la_n[2] = R[2] * leverarm_frd[0] + R[5] * leverarm_frd[1] + R[8] * leverarm_frd[2];
+    }
+    dllh[0] = llh[0] - ref->lat_rad;
+    dllh[1] = llh[1] - ref->lon_rad;
+    dllh[2] = llh[2] - ref->h_m;
+    ins_dlatlonh_to_dned(dllh, ref->lat_rad, ref->h_m, dned_f);
+    dn     = dned_f[0] + la_n[0];
+    de     = dned_f[1] + la_n[1];
+    dd     = dned_f[2] + la_n[2];
+    *err_m = sqrt(dn * dn + de * de + dd * dd);
+    return 1;
+}
+
+/* Reference epoch nearest to IMU epoch t for the coasting metric
+ * (REQ-VER-029). iref is the index of the first row after t, so the only
+ * candidates are the rows either side of it. Returns NULL when neither lies
+ * within max_dt_us: a reference that does not cover the end of the gap cannot
+ * score it. */
+static const ref_epoch_t* coast_ref_near(int64_t t, int iref, int n_ref, int64_t max_dt_us)
+{
+    const ref_epoch_t* best    = (const ref_epoch_t*)0;
+    int64_t            best_dt = 0;
+    int                k;
+    for (k = iref - 1; k <= iref; ++k)
+    {
+        int64_t dt;
+        if (k < 0 || k >= n_ref) continue;
+        dt = g_ref[k].t_us - t;
+        if (dt < 0) dt = -dt;
+        if (best == (const ref_epoch_t*)0 || dt < best_dt)
+        {
+            best    = &g_ref[k];
+            best_dt = dt;
+        }
+    }
+    if (best_dt > max_dt_us) { best = (const ref_epoch_t*)0; }
+    return best;
+}
 
 /* Mean gyro over the first seconds of the (stationary) trial = initial
  * gyro bias; same idea as pyahrs.py initialGyroBiasHeuristics().
@@ -1163,6 +1356,21 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    /* Move every reference row onto its own time of validity (REQ-VER-030).
+       Done here rather than at each comparison so that everything downstream
+       -- scoring, the error dump, the warmup window -- reads one consistent
+       timeline, and so a row's timestamp means what it says from this point
+       on. */
+    if (cfg.ref_delay_ms > 0.0 || cfg.ref_delay_ms < 0.0)
+    {
+        const int64_t shift = (int64_t)(cfg.ref_delay_ms * 1000.0);
+        int           i;
+        for (i = 0; i < n_ref; ++i) { g_ref[i].t_us -= shift; }
+        printf("reference time of validity: %.0f ms earlier than its timestamps "
+               "(score: ref_delay_ms)\n",
+               cfg.ref_delay_ms);
+    }
+
     int n_gnss = 0;
     if (aiding_gnss)
     {
@@ -1231,8 +1439,9 @@ int main(int argc, char** argv)
         /* Known initial state from the reference: position, attitude AND
            velocity. The start need not be stationary (e.g. an aircraft
            cruising at 200 m/s), so the reference NED velocity is carried
-           over, converted to ECEF (the unit ins_init expects). Everything
-           after t0 is aided by GNSS only.
+           over as-is: ins_init takes the velocity in the n-frame and the
+           position geodetically (REQ-NAV-081), which is how the reference
+           states both. Everything after t0 is aided by GNSS only.
 
            Use the reference epoch aligned with the FIRST IMU sample, not
            g_ref[0]: ins defers a prescribed init to its actual start
@@ -1246,19 +1455,17 @@ int main(int argc, char** argv)
         while (i0 + 1 < n_ref && g_ref[i0].t_us < t_imu0) { i0++; }
         const ref_epoch_t* r0 = &g_ref[i0];
         init.time             = r0->t_us;
-        ins_latlonh_to_ecef(r0->lat_rad, r0->lon_rad, r0->h_m, init.x_ecef);
-        init.rpy_init_rad[0] = r0->roll_rad;
-        init.rpy_init_rad[1] = r0->pitch_rad;
-        init.rpy_init_rad[2] = r0->yaw_rad;
-        float R_n_to_e[9];
-        ins_rotmat_n_to_e(r0->lat_rad, r0->lon_rad, R_n_to_e);
-        int k;
-        for (k = 0; k < 3; ++k) /* v_ecef = R_n_to_e * v_ned (R column-major) */
-        {
-            init.xdot_ecef[k] = (double)R_n_to_e[k] * r0->vel_ned[0] +
-                                (double)R_n_to_e[k + 3] * r0->vel_ned[1] +
-                                (double)R_n_to_e[k + 6] * r0->vel_ned[2];
-        }
+        /* Position and velocity as the reference holds them, which is also
+           what the filter works in (REQ-NAV-081). */
+        init.llh[0] = r0->lat_rad;
+        init.llh[1]           = r0->lon_rad;
+        init.llh[2]           = r0->h_m;
+        init.rpy_init_rad[0]  = r0->roll_rad;
+        init.rpy_init_rad[1]  = r0->pitch_rad;
+        init.rpy_init_rad[2]  = r0->yaw_rad;
+        init.vel_ned[0]       = r0->vel_ned[0];
+        init.vel_ned[1]       = r0->vel_ned[1];
+        init.vel_ned[2]       = r0->vel_ned[2];
         if (have_bias0)
         {
             /* Remove the modeled non-bias content from the initial-window
@@ -1285,6 +1492,7 @@ int main(int argc, char** argv)
             ins_calc_omega_n_in(r0->lat_rad, r0->h_m, r0->vel_ned, w_in_n, (float*)0, (float*)0);
             ins_quat_from_rpy(r0->roll_rad, r0->pitch_rad, r0->yaw_rad, q);
             ins_quat_to_rotmat(q, R0);
+            int k;
             for (k = 0; k < 3; ++k) /* w_b = R0' * w_n (R column-major) */
             {
                 gyr_bias0[k] -= R0[3 * k + 0] * w_in_n[0] + R0[3 * k + 1] * w_in_n[1] +
@@ -1325,22 +1533,25 @@ int main(int argc, char** argv)
     else if (aiding_gnss)
     {
         init.time = g_gnss[0].t_us;
-        ins_latlonh_to_ecef(g_gnss[0].lat_rad, g_gnss[0].lon_rad, g_gnss[0].h_m,
-                            init.x_ecef); /* replaced by auto-init */
+        init.llh[0] = g_gnss[0].lat_rad; /* replaced by auto-init */
+        init.llh[1]           = g_gnss[0].lon_rad;
+        init.llh[2]           = g_gnss[0].h_m;
     }
     else if (cfg.fi_enable)
     {
         /* The declared position IS the origin here, rather than something
            the first fix will replace. */
         init.time = first_imu_time_us(fimu);
-        ins_latlonh_to_ecef(DEG2RAD(cfg.fi_lat_deg), DEG2RAD(cfg.fi_lon_deg), cfg.fi_height_m,
-                            init.x_ecef);
+        init.llh[0] = DEG2RAD(cfg.fi_lat_deg);
+        init.llh[1]           = DEG2RAD(cfg.fi_lon_deg);
+        init.llh[2]           = cfg.fi_height_m;
     }
     else
     {
         init.time = g_ref[0].t_us;
-        ins_latlonh_to_ecef(g_ref[0].lat_rad, g_ref[0].lon_rad, g_ref[0].h_m,
-                            init.x_ecef); /* replaced by auto-init */
+        init.llh[0] = g_ref[0].lat_rad; /* replaced by auto-init */
+        init.llh[1]           = g_ref[0].lon_rad;
+        init.llh[2]           = g_ref[0].h_m;
     }
     if (have_bias0)
     {
@@ -1433,6 +1644,13 @@ int main(int argc, char** argv)
     opt.automotive_min_yaw_stddev                = (cfg.automotive_min_yaw_stddev_deg > 0.0f)
                                                        ? DEG2RAD(cfg.automotive_min_yaw_stddev_deg)
                                                        : 0.0f;
+    opt.automotive_lateral_constraint            = cfg.automotive_lateral_constraint != 0;
+    opt.automotive_lateral_stddev_mps            = cfg.automotive_lateral_stddev_mps;
+    opt.automotive_lateral_max_yaw_rate =
+        (cfg.automotive_lateral_max_yaw_rate_deg > 0.0f)
+            ? DEG2RAD(cfg.automotive_lateral_max_yaw_rate_deg)
+            : 0.0f;
+    opt.automotive_lateral_after_sec             = cfg.automotive_lateral_after_sec;
     /* Stillness detection (REQ-VER-024): set once here, nav_suite_init()
        hands it to the ARS/AHRS and baro_alt (REQ-SUITE-020). */
     opt.auto_zupt_static_gyr_rps =
@@ -1467,6 +1685,12 @@ int main(int argc, char** argv)
     opt.speed_min_mps                    = cfg.speed_min_mps;
     opt.estimate_mag_bias                = cfg.mag_estimate_bias != 0;
     opt.magnetometer_min_delay_ms        = cfg.mag_min_delay_ms;
+    /* Both are 0 unless the config names them, which is the library's own
+       "use the default" sentinel -- so a dataset that says nothing about
+       the hard-iron states replays exactly as it did before these keys
+       existed. */
+    init.mag_bias_init_stddev_ut         = cfg.mag_bias_init_ut;
+    init.mag_bias_pred_stddev_ut_sqrts   = cfg.mag_bias_rw_ut_sqrts;
 
     /* IMU calibration (REQ-NAV-037) and GNSS covariance conditioning
        (REQ-NAV-038): copied through verbatim (all-0 / 0 sentinels are the
@@ -1592,6 +1816,17 @@ int main(int argc, char** argv)
         ahrs_set_position(&g_suite.ahrs, (float)g_ref[0].lat_rad, (float)g_ref[0].lon_rad,
                           (float)cfg.wmm_year);
     }
+    else if (cfg.mag_enable)
+    {
+        /* Unlike insrcv this harness has no date source of its own, so a
+           missing epoch means no reference field and every magnetometer
+           sample gets rejected inside ins. Say so once up front instead of
+           leaving it to a per-sample warning from the filter. */
+        fprintf(stderr,
+                "replay: WARNING mag.enable is set but mag.wmm_year is missing, no magnetic "
+                "reference field is built and the magnetometer will not be fused "
+                "(tools/inslib_convert_ubx_to_csv.py derives it from NAV-PVT)\n");
+    }
 
     char delay_suffix[32];
     delay_suffix[0] = '\0';
@@ -1665,6 +1900,17 @@ int main(int argc, char** argv)
 
     const int64_t t_first_fix  = aiding_gnss ? g_gnss[0].t_us : g_ref[0].t_us;
     const int64_t t_warmup_end = t_first_fix + (int64_t)(cfg.warmup_sec * US_PER_SEC);
+
+    /* Coasting re-acquisition (REQ-VER-029), aiding: gnss only -- the other
+       aiding modes synthesize their fixes from the reference and have no
+       outage of their own to measure. */
+    coast_gap_t coast_gap[REPLAY_MAX_COAST_GAPS];
+    const int   n_coast_gap =
+        aiding_gnss ? coast_gaps_scan(g_gnss, n_gnss, cfg.coast_gap_min_sec, t_warmup_end,
+                                        coast_gap, REPLAY_MAX_COAST_GAPS)
+                      : 0;
+    int i_coast_gap = 0; /* next gap still waiting for its reference epoch */
+
     int64_t       t_prev       = 0;
     int           iref = 0, ignss = 0, imag = 0, ibaro = 0, ispeed = 0;
     int64_t       fi_next_t_us = 0; /* next free_inertial_start offer */
@@ -1732,6 +1978,31 @@ int main(int argc, char** argv)
             iref++;
         }
 
+        /* Coasting re-acquisition (REQ-VER-029). Sampled HERE, before this
+           epoch's measurements are fused: the whole point is the state the
+           coasting left behind, and the first fix back would have snapped it
+           onto the truth before the scoring block further down ever sees it.
+           Taken at the first IMU epoch at or after the end of the gap, which
+           is the epoch that fix is fed in, against the reference row nearest
+           to it. Not gated on a reference row arriving in this epoch: shifted
+           by ref_delay_ms (REQ-VER-030) the row for the gap end can land just
+           before it, and waiting for the next row would sample after the
+           returning fix has been fused. */
+        if (i_coast_gap < n_coast_gap && t >= coast_gap[i_coast_gap].t_end_us)
+        {
+            coast_gap_t*       cg     = &coast_gap[i_coast_gap];
+            int64_t            max_dt = (int64_t)(0.5 * cg->gap_sec * US_PER_SEC);
+            const ref_epoch_t* ref_gap_end;
+            if (max_dt > REPLAY_COAST_REF_MAX_DT_US) { max_dt = REPLAY_COAST_REF_MAX_DT_US; }
+            ref_gap_end = coast_ref_near(t, iref, n_ref, max_dt);
+            if (ref_gap_end != (const ref_epoch_t*)0)
+            {
+                cg->have_err = nav_pos_error_m(ref_gap_end, cfg.score_leverarm_frd, &cg->err_m);
+                cg->resolved = 1;
+            }
+            i_coast_gap++;
+        }
+
         if (aiding_gnss && cfg.gnss_enable)
         {
             /* Real GNSS epochs with the receiver's full covariance. */
@@ -1745,7 +2016,12 @@ int main(int argc, char** argv)
                 cov_apply_fallback(gm->Qpos_ned, var_pos_fallback_hor, var_pos_fallback_ver))
             {
                 m.gnss_pos.is_valid = true;
-                ins_latlonh_to_ecef(gm->lat_rad, gm->lon_rad, gm->h_m, m.gnss_pos.xyz_ecef);
+                /* Handed over as the dataset holds it: the filter fuses the
+                   geodetic difference, so this form needs no conversion on
+                   either side (REQ-NAV-079). */
+                m.gnss_pos.llh[0]       = gm->lat_rad;
+                m.gnss_pos.llh[1]       = gm->lon_rad;
+                m.gnss_pos.llh[2]       = gm->h_m;
                 memcpy(m.gnss_pos.Qll_ned, gm->Qpos_ned, sizeof(m.gnss_pos.Qll_ned));
                 if (gm->vel_ok &&
                     cov_apply_fallback(gm->Qvel_ned, var_vel_fallback, var_vel_fallback))
@@ -1773,7 +2049,9 @@ int main(int argc, char** argv)
                back to): this synthesized fix never has a reported
                covariance of its own either, so it is exactly that case. */
             m.gnss_pos.is_valid = true;
-            ins_latlonh_to_ecef(ref->lat_rad, ref->lon_rad, ref->h_m, m.gnss_pos.xyz_ecef);
+            m.gnss_pos.llh[0]       = ref->lat_rad;
+            m.gnss_pos.llh[1]       = ref->lon_rad;
+            m.gnss_pos.llh[2]       = ref->h_m;
             m.gnss_pos.Qll_ned[0] = var_pos_fallback_hor;
             m.gnss_pos.Qll_ned[4] = var_pos_fallback_hor;
             m.gnss_pos.Qll_ned[8] = var_pos_fallback_ver;
@@ -1796,8 +2074,9 @@ int main(int argc, char** argv)
             t >= fi_next_t_us)
         {
             fi_next_t_us = t + US_PER_SEC / 2; /* 2 Hz: the entry dwell wants >= 1 */
-            ins_latlonh_to_ecef(DEG2RAD(cfg.fi_lat_deg), DEG2RAD(cfg.fi_lon_deg), cfg.fi_height_m,
-                                m.gnss_pos.xyz_ecef);
+            m.gnss_pos.llh[0]       = DEG2RAD(cfg.fi_lat_deg);
+            m.gnss_pos.llh[1]       = DEG2RAD(cfg.fi_lon_deg);
+            m.gnss_pos.llh[2]       = cfg.fi_height_m;
             const float fi_var    = cfg.fi_stddev_m * cfg.fi_stddev_m;
             m.gnss_pos.Qll_ned[0] = fi_var;
             m.gnss_pos.Qll_ned[4] = fi_var;
@@ -1880,34 +2159,11 @@ int main(int argc, char** argv)
             e_nav[0] = RAD2DEG(wrap_pi_d(roll - ref->roll_rad));
             e_nav[1] = RAD2DEG(wrap_pi_d(pitch - ref->pitch_rad));
             e_nav[2] = RAD2DEG(wrap_pi_d(yaw - ref->yaw_rad));
-
-            double pos_ecef[3];
-            if (ins_get_position_ecef(&g_suite.ins, pos_ecef))
-            {
-                /* The scoring lever arm maps the filter position onto
-                   the ground-truth point (zero when the truth refers to
-                   the IMU center). */
-                float R[9];
-                float la_n[3] = {0.0f, 0.0f, 0.0f};
-                if (ins_get_rotmat_b_to_n(&g_suite.ins, R))
-                {
-                    const float* la_b = cfg.score_leverarm_frd;
-                    la_n[0]           = R[0] * la_b[0] + R[3] * la_b[1] + R[6] * la_b[2];
-                    la_n[1]           = R[1] * la_b[0] + R[4] * la_b[1] + R[7] * la_b[2];
-                    la_n[2]           = R[2] * la_b[0] + R[5] * la_b[1] + R[8] * la_b[2];
-                }
-                double dllh[3] = {0};
-                ins_ecef_to_latlonh(pos_ecef, &dllh[0], &dllh[1], &dllh[2]);
-                dllh[0] -= ref->lat_rad;
-                dllh[1] -= ref->lon_rad;
-                dllh[2] -= ref->h_m;
-                float dned_f[3];
-                ins_dlatlonh_to_dned(dllh, ref->lat_rad, ref->h_m, dned_f);
-                const double dn = dned_f[0] + la_n[0];
-                const double de = dned_f[1] + la_n[1];
-                const double dd = dned_f[2] + la_n[2];
-                e_nav[3]        = sqrt(dn * dn + de * de + dd * dd);
-            }
+            /* The scoring lever arm maps the filter position onto the
+               ground-truth point (zero when the truth refers to the IMU
+               center). Same helper the coasting metric uses, so the two can
+               never drift apart. */
+            (void)nav_pos_error_m(ref, cfg.score_leverarm_frd, &e_nav[3]);
             have_nav = 1;
             if (scored)
             {
@@ -2033,6 +2289,27 @@ int main(int argc, char** argv)
         stat_print("ellipsoid height error", &ell_h, "m  ");
     }
 
+    if (n_coast_gap > 0)
+    {
+        int k;
+        printf("\ncoasting re-acquisition (aiding gaps > %.0f s, error when each one "
+               "ends):\n",
+               cfg.coast_gap_min_sec);
+        for (k = 0; k < n_coast_gap; ++k)
+        {
+            const coast_gap_t* cg = &coast_gap[k];
+            printf("  gap %d: %6.1f s, %7.0f m travelled ->  ", k + 1, cg->gap_sec, cg->chord_m);
+            if (!cg->resolved) { printf("no reference epoch near its end\n"); }
+            else if (!cg->have_err) { printf("NO SOLUTION (filter gave the coast up)\n"); }
+            else
+            {
+                printf("%8.1f m", cg->err_m);
+                if (cg->chord_m > 1.0) { printf("  (%.1f %% of the distance)", 100.0 * cg->err_m / cg->chord_m); }
+                printf("\n");
+            }
+        }
+    }
+
     double ars_drift_deg_min = 0.0;
     if (cfg.score_ahrs)
     {
@@ -2072,7 +2349,39 @@ int main(int argc, char** argv)
     {
         printf("  skip  %-44s: no attitude reference in this dataset\n", "ins attitude gates");
     }
-    CHECK_LIMIT(stat_rms(&nav_pos), cfg.lim_pos_rms_m, "ins pos rms [m]");
+    /* 0 -> not gated, the convention the manual states for every lim_* key
+       and the one datasets/check_simulated.py already implements. This one
+       used to be checked unconditionally, so a 0 meant "must be below zero"
+       and failed every run: the way to leave it ungated was an arbitrary
+       large number (datasets/fog/config_pyahrs.yaml still carries a 999). */
+    if (cfg.lim_pos_rms_m > 0.0)
+    {
+        CHECK_LIMIT(stat_rms(&nav_pos), cfg.lim_pos_rms_m, "ins pos rms [m]");
+    }
+    if (cfg.lim_coast_exit_err_m > 0.0)
+    {
+        int k;
+        for (k = 0; k < n_coast_gap; ++k)
+        {
+            const coast_gap_t* cg = &coast_gap[k];
+            char               msg[64];
+            snprintf(msg, sizeof(msg), "coast %.0f s: re-acquisition error [m]", cg->gap_sec);
+            /* No solution at that epoch is a failure of its own, not a
+               number above the limit (REQ-VER-029). */
+            if (!cg->resolved || !cg->have_err)
+            {
+                printf("  FAIL  %-44s: no solution when aiding returned\n", msg);
+                fails++;
+            }
+            else { CHECK_LIMIT(cg->err_m, cfg.lim_coast_exit_err_m, msg); }
+        }
+        if (n_coast_gap == 0)
+        {
+            printf("  FAIL  %-44s: no aiding gap longer than %g s\n",
+                   "coast re-acquisition gate", cfg.coast_gap_min_sec);
+            fails++;
+        }
+    }
     if (cfg.baro_enable && cfg.lim_baro_rms_m > 0.0)
     {
         CHECK_LIMIT(stat_rms(&baro_h), cfg.lim_baro_rms_m, "baro rel-height rms [m]");

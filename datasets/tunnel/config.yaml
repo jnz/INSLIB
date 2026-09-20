@@ -63,6 +63,7 @@ baro:
   acc_bias_init_mps2: 0.08
 score:
   warmup_sec: 30.0
+  ref_delay_ms: 200.0 # ref.csv has a 200 ms delay
   min_epochs: 2000
   ahrs: 0
   attitude: 0
@@ -70,7 +71,17 @@ score:
   # fixes come back. It is a SELF-CONSISTENCY number (ref.csv IS the aiding),
   # dominated by the re-acquisition transient at the tunnel exit rather than
   # by steady-state tracking, which is exactly what makes it useful here.
-  # ~2x a known-good run, retune after an intentional change.
-  lim_pos_rms_m: 9              # observed 4.239
-  lim_ellipsoid_rms_m: 5        # observed 2.072
+  # Regression tripwire, 0.25 m above the observed value (an RMS over the
+  # whole run moves far less than the exit transient it contains).
+  # Reproducible to the millimetre across compilers and optimisation levels
+  # (REQ-VER-031), retighten after an intentional improvement.
+  lim_pos_rms_m: 4.05           # observed 3.797
+  lim_ellipsoid_rms_m: 4.0      # observed 3.744
+  # Report the coasting re-acquisition error (REQ-VER-029) but do not gate
+  # it here. This dataset exists to drive the branch where the coasting
+  # window expires and the 3D solution is given up, so the filter has no
+  # solution left when fixes return and the metric says so. That is the
+  # documented behaviour of this recording, not a regression. The dataset
+  # that gates the number is the one that coasts through.
+  coast_gap_min_sec: 30.0
 automotive_min_yaw_stddev_deg: 15.0

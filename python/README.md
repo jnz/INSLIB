@@ -210,8 +210,8 @@ nav.set_magnetic_model(lat_rad, lon_rad, 2026.5)
 
 # per epoch — add only the sensors you actually have:
 nav.imu(t_us, dt, acc, gyr)              # begins an epoch (acc/gyr var optional)
-nav.gnss_pos(ecef_xyz, var_ned)          # ECEF fix + diagonal NED covariance
-nav.gnss_pos(ecef_xyz, var_ned, delay_ms=80)  # …or a late fix (history-anchored)
+nav.gnss_pos_llh(llh, var_ned)           # lat/lon/height fix + diagonal NED covariance
+nav.gnss_pos_llh(llh, var_ned, delay_ms=80)   # or a late fix (history-anchored)
 nav.gnss_vel(vel_ned, var_ned)
 nav.gnss_leverarm((0, 0, -0.14))
 nav.mag(mag_uT, mag_var)                 # magnetometer (or set Config.magnetic_n)
@@ -228,7 +228,7 @@ tele.publish(nav.state())                # stream to PlotJuggler / MAVLink
 ```
 
 The vertical channel degrades as gracefully as the rest: under fresh
-GNSS aiding heights come from INSLIB; in an outage the baro filter keeps
+GNSS aiding heights come from INSLIB, in an outage the baro filter keeps
 measuring (same datum, continuous), and `height_ell_m` stays absolute
 via the estimated baro-to-ellipsoid offset. Estimated sensor biases are
 available as `nav.bias_acc()` / `bias_gyr()` / `bias_mag()` (the latter
@@ -239,11 +239,11 @@ with `Config(estimate_mag_bias=True)`, the 18-state mode).
 ```python
 from INSLIB import Ins, Config
 nav = Ins(Config(auto_init=True))      # no AHRS fallback, leaner
-nav.imu(t_us, dt, acc, gyr); nav.gnss_pos(ecef, var_ned); nav.update()
+nav.imu(t_us, dt, acc, gyr); nav.gnss_pos_llh(llh, var_ned); nav.update()
 print(nav.rpy(), nav.is_ready())
 ```
 
-Conventions match ins: body frame FRD, nav frame NED, Hamilton
+Conventions match INS: body frame FRD, nav frame NED, Hamilton
 quaternion `q=[w,x,y,z]`, time in int64 microseconds, angles in radians.
 
 ## Live replay + telemetry

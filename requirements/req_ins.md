@@ -71,9 +71,12 @@ tighter, against a tolerance two orders of magnitude smaller.
 - **Parent:** REQ-SYS-001
 - **Verification:** Test: tests/test_ins_core.c:scenario_gnss_position
 
-The filter shall fuse GNSS position measurements given in ECEF with a
-full 3x3 NED covariance, compensating the antenna lever arm with the
-attitude at the measurement's time of validity.
+The filter shall fuse GNSS position measurements given as geodetic
+coordinates (REQ-NAV-079) with a full 3x3 NED covariance, compensating
+the antenna lever arm with the attitude at the measurement's time of
+validity. The residual shall be formed as the geodetic difference
+between the fix and the filter's own absolute anchor (REQ-NAV-080),
+mapped to metres with the curvature radii.
 
 ## REQ-NAV-006 — GNSS velocity fusion
 
@@ -361,11 +364,12 @@ recompiling. The filter shall never act on these counters.
 
 - **Status:** implemented
 - **Parent:** REQ-SYS-004
-- **Verification:** Inspection: doubles only in ECEF/lat-lon anchor code paths (init, per GNSS epoch, accessors)
+- **Verification:** Inspection: doubles only in the geodetic anchor code paths (init, the GNSS residual, accessors)
 
 The per-epoch hot path (strapdown, prediction, fusion) shall use
 single precision; double precision shall be limited to the
-absolute-position anchor (ECEF origin, lat/lon/height book-keeping).
+absolute-position anchor (the geodetic origin, the lat/lon/height
+book-keeping and the geodetic differences formed against them).
 
 ## REQ-NAV-021 — Unlimited dead reckoning option
 
@@ -533,6 +537,16 @@ then relative to true north. The interface may be called at any time
 (e.g. once a first position becomes available) and shall ignore a
 non-finite argument.
 
+When the supplied position lies inside a magnetic dip pole exclusion
+zone (REQ-SYS-018), ins shall suspend magnetometer fusion and retain
+its previous reference field rather than store one built from a
+meaningless declination. The auto-init yaw bootstrap shall likewise
+skip its magnetometer stage inside such a zone and fall through to the
+unknown-heading case (REQ-NAV-048), so a filter started there still
+runs with valid roll and pitch and an honest yaw covariance instead of
+a heading seeded from an ill-conditioned declination. Fusion and the
+reference field resume on the first position outside the zone.
+
 ## REQ-NAV-028 — Magnetometer field-strength disturbance rejection
 
 - **Status:** verified
@@ -573,19 +587,17 @@ can reclaim the extra covariance/history storage by overriding it to
 
 ## REQ-NAV-030 — GNSS latency from GPS time of validity
 
-- **Status:** draft
+- **Status:** deleted
 - **Parent:** REQ-NAV-008
-- **Verification:** Open
+- **Verification:** Inspection: obsolete, GNSS latency is an integration parameter (gnss_delay_ms, REQ-NAV-008).
 
-When a GNSS measurement carries a GPS time of validity (gps_week and
-gps_itow_ms both > 0), the filter shall maintain a local-time to
-GPS-time mapping and derive the measurement latency from it,
-anchoring the residual in the history exactly like the explicit
-gnss_delay_ms path. Rationale: the fields are already declared in
-ins_measurements_t but are currently ignored (TODO in
-ins_fuse_gnss); gnss_delay_ms is the implemented alternative. This
-requirement tracks the interface gap so the header contract and the
-implementation converge instead of silently diverging.
+Not pursued. The GNSS measurement latency is stated explicitly by the
+integration via gnss_delay_ms and can be estimated offline with the
+post-processing tools. The filter does not derive it from the GPS time
+of validity: that would compensate the processing and transport delay
+(receiver output, UART), but not the group delay of the receiver's
+internal filtering and smoothing, which still places the effective
+measurement epoch further in the past than its time tag.
 
 ## REQ-NAV-031 — Numerical robustness with degenerate process noise
 
@@ -1683,7 +1695,7 @@ data behind it.
 
 The re-arm of REQ-NAV-052, and only that re-arm, shall carry the n-frame
 origin into the next bootstrap: that bootstrap shall keep the inherited
-origin_ecef instead of adopting its own fix as the origin, and derive the
+origin instead of adopting its own fix as the origin, and derive the
 initial pos_local from the fix, using the same geodetic mapping as the
 re-acquisition of REQ-NAV-023 (a latitude/longitude/height difference, not a
 flat-earth ECEF delta, which at the distances reachable during an outage
@@ -1719,7 +1731,7 @@ The carry shall be refused, and the bootstrap fix shall define a fresh
 origin as before, when
 
 - no origin has been established yet (any bootstrap after ins_init),
-- the inherited origin is not a finite, plausible ECEF position, or
+- the inherited origin is not a finite, plausible geodetic position, or
 - the bootstrap fix cannot be the same platform continuing: it lies further
   from the position the exiting instance last held than
   INS_ORIGIN_CARRY_MAX_SPEED_MPS could have covered in the time since that
@@ -2091,10 +2103,14 @@ Rationale for the two-part noise model: for this class of sensor the
 per-sample noise and the systematic scale error are different orders of
 magnitude and scale differently. An OBD-II PID 0x0D reading is quantized
 to 1 km/h, i.e. a 0.080 m/s uniform-quantization 1-sigma that does not
-grow with speed; the vehicle's speedometer calibration, which by EU type
-approval may never read low and in practice reads 2..5% high, plus tyre
-wear, is a multiplicative error that reaches 0.83 m/s at 100 km/h. Fusing
-the raw value against the per-sample noise alone would present a
+grow with speed; the scale error of the vehicle's own speed signal
+(rolling radius, tyre wear, the scaling the ECU applies) is a
+multiplicative error of a few percent, reaching 0.83 m/s at 100 km/h at
+the 3% default. Its sign is not predictable: the type-approval margin
+that keeps an indicated speed from ever falling below the true one
+constrains the dashboard, while an OBD-II PID 0x0D reading is the ECU's
+own value. Fusing the raw value against the per-sample noise alone
+would present a
 systematic bias as if it were an independent measurement and pull the
 velocity states permanently off. The scale factor removes the calibrated
 part, the relative variance carries what is left.
@@ -2495,3 +2511,127 @@ inflating the velocity noise in proportion to the rotation weakens the
 aiding that rotation provides. At the default scales the trade is mild (a
 0.3 m arm at 90 deg/s costs 0.07 m/s), and it is not sized more generously
 than that for this reason.
+
+## REQ-NAV-077 — Non-holonomic lateral velocity constraint
+
+- **Status:** verified
+- **Parent:** REQ-NAV-034
+- **Verification:** Test: tests/test_ins_core.c:scenario_nhc_lateral
+
+Under `opt.automotive_lateral_constraint` the filter shall fuse a synthetic
+measurement stating that the LATERAL component of the body-frame velocity is
+zero, as the residual `(R_b_to_n^T * v_ned)_y` against a truth of zero, with
+the measurement noise `opt.automotive_lateral_stddev_mps`. The option shall
+default to off and shall require `opt.automotive_mode`.
+
+The measurement matrix carries an attitude block, and that block is the point
+of the constraint rather than a side effect: with the psi-angle convention of
+this filter the residual perturbs as
+
+    dv_b = R^T dv + R^T [v_n x] psi
+
+so the row seen by the error state is `(R^T)_y` on the velocity states and
+`(R^T [v_n x])_y` on the attitude states, whose gain is the ground speed. At
+20 m/s one degree of roll error shows up as 0.35 m/s of lateral body
+velocity. During a GNSS outage the lateral channel is otherwise unobserved
+and a roll error leaks gravity sideways.
+
+Only the lateral row is fused.
+
+Fusions shall be rate limited to INS_NHC_MIN_INTERVAL_SEC. The residual is
+dominated by a slowly varying offset with a measured correlation time of
+88 s (0.91 at 1 s, 0.79 at 8 s), so a coast of a hundred seconds contains on
+the order of one independent sample and a faster rate would add confidence
+without adding information.
+
+The constraint shall be gated on ground speed (`opt.automotive_min_speed_mps`,
+shared with REQ-NAV-034) and on yaw rate
+(`opt.automotive_lateral_max_yaw_rate`). Unlike the course-over-ground yaw
+aiding of REQ-NAV-034 the constraint stays valid in reverse, where the course
+flips by 180 degrees and the lateral velocity does not.
+
+`opt.automotive_lateral_after_sec` shall hold the constraint off until the
+filter has been without GNSS fusion for that long (negative -> no delay).
+Next to a receiver delivering velocity at 5 Hz and 0.05 m/s the constraint
+carries no information, so restricting it to the coast gives nothing up and
+keeps a mounting error from reaching the state during normal operation. The
+delay shall be short: waiting lets the lateral velocity error grow
+unconstrained (0.055 m/s^2 measured), and the constraint then arrives as a
+large correction at the moment the attitude covariance is at its widest,
+which is the worst time to decide how to distribute it.
+
+## REQ-NAV-078 — Direct geodetic position accessor
+
+- **Status:** verified
+- **Parent:** REQ-NAV-005
+- **Verification:** Test: tests/test_ins_core.c:scenario_get_latlonh_accessor
+
+The filter shall publish the absolute geodetic position it maintains
+(latitude, longitude, height above the WGS84 ellipsoid).
+The value shall be the same anchor the filter itself carries, so that
+converting it forward with ins_latlonh_to_ecef() reproduces
+ins_get_position_ecef() exactly, and it shall report the same readiness
+condition as the other position accessors.
+
+Rationale: the absolute anchor is held as latitude, longitude and height
+(REQ-NAV-080), and ins_get_position_ecef() converts THAT into ECEF on
+every call.
+
+## REQ-NAV-079 — GNSS position in geodetic form
+
+- **Status:** verified
+- **Parent:** REQ-NAV-005
+- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_pos_llh_input
+
+A GNSS position measurement shall be handed over as geodetic coordinates
+(latitude, longitude, height above the WGS84 ellipsoid) and shall be
+consumed in that form, without a conversion on the epoch path. A
+non-finite component shall drop the fix and count as invalid input
+(REQ-SYS-007).
+
+Rationale: the fusion works on the geodetic difference between the fix
+and the filter's own anchor (REQ-NAV-005), so a fix that arrives as
+latitude, longitude and height is already in the form the residual
+needs.
+
+A source that is natively ECEF, an RTK solution or UBX-NAV-HPPOSECEF,
+converts once with ins_ecef_to_latlonh() before offering the fix.
+
+## REQ-NAV-080 — Geodetic origin, ECEF only on request
+
+- **Status:** verified
+- **Parent:** REQ-NAV-005
+- **Verification:** Test: tests/test_ins_core.c:scenario_geodetic_origin; Inspection: src/ins.c contains no ins_ecef_to_latlonh() at all, and its only ins_latlonh_to_ecef() is the one ins_get_position_ecef() runs on request, and no ECEF quantity is held in ins_t
+
+The filter shall hold the origin of its local n-frame, and the absolute
+position it book-keeps against that origin, as geodetic coordinates.
+ECEF shall exist only at the API boundary, where a caller hands one in
+or asks for one, and shall be derived there on request rather than kept
+as the internal representation or cached in the filter state. No ECEF
+conversion shall remain on the per-epoch path, and no ECEF quantity
+shall be refreshed by it.
+
+A pure vertical shift of the origin (REQ-NAV-025) shall change its
+height alone and leave latitude and longitude bit-for-bit unchanged.
+
+Rationale: the filter mechanizes in a local NED frame anchored on an
+absolute geodetic position, and the residuals are geodetic differences
+(REQ-NAV-005).
+
+## REQ-NAV-081 — Initial position and velocity in the caller's own frame
+
+- **Status:** verified
+- **Parent:** REQ-NAV-080
+- **Verification:** Test: tests/test_ins_core.c:scenario_init_llh_vel_ned
+
+The initial position shall be supplied as geodetic coordinates
+(ins_init_t.llh) and the initial velocity in the local NED frame
+(ins_init_t.vel_ned), the frames the filter itself works in. A latitude
+or longitude outside its range, or a non-finite one, shall make
+ins_init() fail. An all-zero block shall NOT fail: it denotes the point
+where the equator meets the prime meridian at ellipsoid height 0, which
+is a position like any other.
+
+Rationale: the filter anchors geodetically (REQ-NAV-080) and mechanizes
+in NED, and that is also what callers hold.
+

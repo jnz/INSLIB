@@ -54,6 +54,13 @@
 #define INS_WGS84_A (6378137.0)
 /** WGS84 eccentricity squared (e^2 = f*(2-f)) */
 #define INS_WGS84_E2 (0.00669437999014)
+/** WGS84 semi-minor axis [m], b = a*sqrt(1 - e^2) from #INS_WGS84_A and
+ *  #INS_WGS84_E2. Stored rather than derived so the closed-form
+ *  ECEF to geodetic conversion costs no square root to set up. */
+#define INS_WGS84_B (6356752.314245184)
+/** WGS84 second eccentricity squared, e'^2 = e^2 / (1 - e^2). Same
+ *  reason as #INS_WGS84_B. */
+#define INS_WGS84_EP2 (0.0067394967422751)
 /** Earth rotation rate [rad/s] */
 #define INS_WGS84_OMEGA (7.2921151467E-5)
 /** Nominal gravity [m/s^2] (used as a fallback) */
@@ -61,7 +68,7 @@
 /** Floor on |cos(lat)| used to bound tan(lat) in the azimuth transport
  *  rate near the poles (~0.006 deg from +/-90 deg). Keeps the NED
  *  mechanization's polar singularity finite instead of divergent. */
-#define INS_POLE_COS_FLOOR (1.0e-4)
+#define INS_POLE_COS_FLOOR (1.0e-4f)
 
 /** Somigliana normal gravity at the equator [m/s^2]. */
 #define INS_GAMMA_E (9.7803253359f)
@@ -296,6 +303,15 @@ extern "C"
      * Given a small local displacement dxyz_n (meters in NED) at current
      * lat/lon/height, compute the corresponding changes in lat/lon/height.
      *
+     * The geodetic side is double because the caller forms it against an
+     * absolute coordinate, where single precision would quantize a latitude
+     * to steps of 0.38 m. The curvature radii themselves are evaluated in
+     * single precision, which costs a few units in the last place of the
+     * result, and more on the longitude component toward the poles, where
+     * the division by cos(lat) amplifies the rounded latitude by tan(lat).
+     * |cos(lat)| is bounded by #INS_POLE_COS_FLOOR so the longitude stays
+     * finite and signed at the pole itself.
+     *
      * @param[in] dxyz_n Delta position in NED [m] (3x1 float).
      * @param[in] lat_rad Current latitude [rad].
      * @param[in] height_m Current height above ellipsoid [m].
@@ -305,7 +321,9 @@ extern "C"
 
     /** @brief Convert a small lat/lon/height delta to a position delta in NED.
      *
-     * Exact inverse of ins_dned_to_dlatlonh (same curvature radii).
+     * Inverse of ins_dned_to_dlatlonh, from the same curvature radii and the
+     * same cosine bound, so the two invert each other to single-precision
+     * tolerance wherever either is defined.
      * Intended for meter-scale differences (e.g. measurement residuals).
      *
      * @param[in] dlatlonh Delta (dlat_rad, dlon_rad, dheight_m).

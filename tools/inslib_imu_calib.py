@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IMU calibration for the STM32 sensor board, without a fixture.
+"""IMU calibration without a fixture, live from the sensor board or from CSV.
 
 Records one continuous session in which the unit is put down in a number
 of arbitrary static poses with rotations in between, then solves for the
@@ -70,9 +70,15 @@ noise model) is preserved. Merging needs PyYAML; hand-written comments
 in the old file are regenerated, not kept.
 
 Usage:
-    python3 tools/inslib_ubx_imu_calib.py --port COM4
-    python3 tools/inslib_ubx_imu_calib.py --udp 29801        # hub fan-out
-    python3 tools/inslib_ubx_imu_calib.py --port COM4 --duration 240
+    python3 tools/inslib_imu_calib.py --port COM4
+    python3 tools/inslib_imu_calib.py --udp 29801        # hub fan-out
+    python3 tools/inslib_imu_calib.py --port COM4 --duration 240
+    python3 tools/inslib_imu_calib.py --csv mysession/   # offline
+
+--csv solves a session that was recorded some other way, from any IMU,
+as replay-format CSV files (imu.csv, optionally mag.csv, see
+load_csv_recording). It follows the same procedure: rest period first,
+then poses with rotations in between.
 
 --udp reads the stream from tools/inslib_hub.py's fan-out instead of
 opening the serial port, so a running session keeps recording and feeding
@@ -223,17 +229,11 @@ def psd_from_still(acc, gyr, rate_hz):
             float(np.var(acc, axis=0, ddof=1).mean()) * dt)
 
 
-def stillness_complaints(gyr_std_dps, acc_std, max_gyr_std_dps=0.5,
-                         max_acc_std_mps2=0.3):
-    """Human-readable reasons why a window was NOT still (empty = ok)."""
-    out = []
-    if gyr_std_dps > max_gyr_std_dps:
-        out.append("gyro noise %.2f deg/s (limit %.2f) -- unit moved or "
-                   "vibrating surface" % (gyr_std_dps, max_gyr_std_dps))
-    if acc_std > max_acc_std_mps2:
-        out.append("accel noise %.2f m/s^2 (limit %.2f) -- unit moved or "
-                   "vibrating surface" % (acc_std, max_acc_std_mps2))
-    return out
+# Worst-axis standard deviation over a short live window above which the
+# unit counts as moving. Display and capture gating only, the solve finds
+# its static poses by its own threshold sweep.
+STILL_MAX_GYR_STD_DPS = 0.5
+STILL_MAX_ACC_STD_MPS2 = 0.3
 
 
 # --- UBX class-0x40 IMU decode ---------------------------------------------
@@ -572,8 +572,9 @@ class Recording:
         self.gyr.append(s.gyr_rps)
         if s.cal_applied:
             self.n_cal_applied += 1
-        self.temp_min = min(self.temp_min, s.temp_c)
-        self.temp_max = max(self.temp_max, s.temp_c)
+        if math.isfinite(s.temp_c):     # a CSV may not carry one
+            self.temp_min = min(self.temp_min, s.temp_c)
+            self.temp_max = max(self.temp_max, s.temp_c)
 
     def add_mag(self, s):
         self.mag_t_us.append(s.t_us)
@@ -610,48 +611,144 @@ class Recording:
         span = (self.t_us[-1] - self.t_us[0]) / US_PER_SEC
         return (len(self) - 1) / span if span > 0 else 0.0
 
-    def pose_count(self, init_sec, pose_sec):
-        """How many static poses the detector currently finds.
+    def static_poses(self, init_sec, pose_sec):
+        """(intervals, acc) of the static poses the detector finds so far.
 
-        The live counter during recording. Uses the middle threshold of
-        the sweep the solve will run, so it is indicative rather than
-        final -- the solve may find one or two more or fewer."""
+        For the live counter during recording (console and GUI). Uses the
+        middle threshold of the sweep the solve will run, so it is
+        indicative rather than final -- the solve may find one or two more
+        or fewer. `intervals` are (start, end) sample indices into `acc`,
+        the session's accelerometer array, or empty while there is not
+        enough of a session to tell."""
+        none = [], np.zeros((0, 3))
         if len(self) < 500:
-            return 0
+            return none
         t, acc, _ = self.arrays()
         rate = self.rate_hz()
         if rate <= 0:
-            return 0
+            return none
         end = int(min(np.searchsorted(t, init_sec), len(t) - 1))
         if end < 100:
-            return 0
+            return none
         var = acc[:end + 1].var(axis=0, ddof=1)
         norm_th = float(np.sqrt((var * var).sum()))
         if not (norm_th > 0):
-            return 0
+            return none
         n_samp = max(int(pose_sec * rate * 0.5), 20)
-        ivals = imu_tk.static_intervals(acc, 6.0 * norm_th)
-        return sum(1 for (s, e) in ivals if e - s + 1 >= n_samp)
+        ivals = [(s, e) for (s, e) in imu_tk.static_intervals(acc, 6.0 * norm_th)
+                 if e - s + 1 >= n_samp]
+        return ivals, acc
+
+    def pose_count(self, init_sec, pose_sec):
+        """How many static poses the detector currently finds."""
+        return len(self.static_poses(init_sec, pose_sec)[0])
+
+
+# --- offline input: replay-format CSV --------------------------------------
+
+def _csv_rows(path, n_min):
+    """Numeric rows of a replay-format CSV with at least n_min fields.
+
+    Comment lines, short lines and anything that does not parse to finite
+    numbers are skipped rather than fatal, like the replay harnesses do."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            p = line.strip().split(",")
+            if len(p) < n_min:
+                continue
+            try:
+                t_us = int(float(p[0]))
+                vals = [float(v) for v in p[1:]]
+            except ValueError:
+                continue
+            if not all(math.isfinite(v) for v in vals[:n_min - 1]):
+                continue
+            rows.append((t_us, vals))
+    return rows
+
+
+def resolve_csv_paths(path, mag_path=None):
+    """(imu.csv, mag.csv or None) for --csv / --mag-csv.
+
+    A dataset directory stands for its imu.csv, and its mag.csv is picked
+    up when present. A file given directly takes the magnetometer only
+    from an explicit --mag-csv, so nothing is fused in by accident."""
+    if os.path.isdir(path):
+        imu_path = os.path.join(path, "imu.csv")
+        if mag_path is None and os.path.isfile(os.path.join(path, "mag.csv")):
+            mag_path = os.path.join(path, "mag.csv")
+    else:
+        imu_path = path
+    if not os.path.isfile(imu_path):
+        raise ValueError("no IMU file at %s" % imu_path)
+    if mag_path is not None and not os.path.isfile(mag_path):
+        raise ValueError("no magnetometer file at %s" % mag_path)
+    return imu_path, mag_path
+
+
+def load_csv_recording(imu_path, mag_path=None):
+    """A Recording from replay-format CSV files instead of the board.
+
+    imu.csv: t_us, gyr_frd_xyz [rad/s], acc_frd_xyz [m/s^2] and optionally
+    imu_temp_c [degC] (datasets/replay_format.py). mag.csv: t_us,
+    mag_frd_xyz [uT], on the same clock as imu.csv, because the static
+    poses are matched to the magnetometer by time. The session has to be
+    recorded the same way as a live one: the initial rest period first,
+    then poses with rotations in between. Raises ValueError when the
+    files do not hold a usable time series."""
+    rec = Recording()
+    rows = _csv_rows(imu_path, 7)
+    if not rows:
+        raise ValueError("%s: no IMU samples (t_us, gyr xyz, acc xyz)"
+                         % imu_path)
+    last = None
+    for t_us, v in rows:
+        if last is not None and t_us <= last:
+            raise ValueError("%s: timestamps not strictly increasing at "
+                             "t_us=%d" % (imu_path, t_us))
+        last = t_us
+        temp = v[6] if len(v) > 6 and math.isfinite(v[6]) else float("nan")
+        rec.add(ImuSample(t_us=t_us, acc_mps2=(v[3], v[4], v[5]),
+                          gyr_rps=(v[0], v[1], v[2]), temp_c=temp, seq=0))
+    if mag_path is not None:
+        for t_us, v in _csv_rows(mag_path, 4):
+            rec.add_mag(MagSample(t_us=t_us, mag_ut=(v[0], v[1], v[2]),
+                                  temp_c=float("nan")))
+    return rec
 
 
 # --- config output ---------------------------------------------------------
 
-def load_existing(path):
-    """Existing config.yaml as a dict (to merge into), or None. Needs
-    PyYAML only in the merge case -- fail before measuring, not after."""
+def read_config(path):
+    """Existing config.yaml as a dict (to merge into), or None when there
+    is no such file. Needs PyYAML only in the merge case. Raises
+    ValueError with a message for the user when the file exists but
+    cannot be merged into, OSError when it cannot be read."""
     if not os.path.exists(path):
         return None
     try:
         import yaml
     except ImportError:
-        sys.exit(f"{path} exists; merging the calibration into it needs "
-                 f"PyYAML (pip install pyyaml). Or write to a fresh file "
-                 f"with -o <path>.")
+        raise ValueError(f"{path} exists; merging the calibration into it "
+                         f"needs PyYAML (pip install pyyaml). Or write to a "
+                         f"fresh file.") from None
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     if not isinstance(cfg, dict):
-        sys.exit(f"{path}: not a mapping at the top level, refusing to merge")
+        raise ValueError(f"{path}: not a mapping at the top level, refusing "
+                         f"to merge")
     return cfg
+
+
+def load_existing(path):
+    """read_config for the console tool: fail before measuring, not after."""
+    try:
+        return read_config(path)
+    except (OSError, ValueError) as e:
+        sys.exit(str(e))
 
 
 def build_sections(existing, updates):
@@ -823,7 +920,7 @@ class Calibration:
             % ", ".join("%+.3f" % (b / DEG2RAD) for b in self.gyr_bias),
             "gyro  scale [%s] %%"
             % ", ".join("%+.2f" % s for s in gyr_scale),
-            "IMU temperature %.1f .. %.1f degC" % (self.temp_lo, self.temp_hi),
+            "IMU temperature %s" % temp_range_text(self.temp_lo, self.temp_hi),
         ]
         if not self.misalignment_estimated:
             lines.append("misalignment NOT estimated (diagonal model)")
@@ -858,6 +955,13 @@ class Calibration:
             out.append("  %-16s %8.4f   %+8.4f   %9.4f   %s"
                        % (label, a["rms"], a["mean"], a["max"], gtxt))
         return out
+
+
+def temp_range_text(lo, hi):
+    """'lo .. hi degC', or a note that the input carried no temperature."""
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return "not recorded"
+    return "%.1f .. %.1f degC" % (lo, hi)
 
 
 def quality_warnings(res):
@@ -994,19 +1098,19 @@ def build_header(cal, merged, magcal=None, housing=None):
     date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     if cal is not None:
         header = (
-            "IMU calibration by tools/inslib_ubx_imu_calib.py\n"
+            "IMU calibration by tools/inslib_imu_calib.py\n"
             "method: multi-position, no fixture (imu_tk, Tedaldi et al. "
             "ICRA 2014)\n"
             "date: %s\n"
             "%d static poses over %.0f s, |g| residual %.4f m/s^2 rms\n"
-            "IMU temperature during calibration: %.1f .. %.1f degC\n"
+            "IMU temperature during calibration: %s\n"
             "  (biases drift with temperature; recalibrate outside this "
             "range)\n"
             "gravity assumed: %g m/s^2\n"
             "%s"
             "model: corrected = M * (raw - fixed_bias)   (REQ-NAV-037)"
             % (date, cal.n_positions, cal.duration_sec, cal.residual_rms,
-               cal.temp_lo, cal.temp_hi, cal.gravity,
+               temp_range_text(cal.temp_lo, cal.temp_hi), cal.gravity,
                "" if cal.misalignment_estimated
                else "misalignment NOT estimated: scale and bias only\n"))
     else:
@@ -1161,6 +1265,28 @@ def solve_mag(rec, cal, field_ut=0.0, field_source="", log=None):
                            field_source=field_source, log=log)
 
 
+def solve_session(rec, gravity=G_MPS2, init_sec=DEFAULT_INIT_SEC,
+                  estimate_misalignment=True, with_mag=True, field_ut=0.0,
+                  field_source="", log=None):
+    """Recording -> (Calibration, MagCalibration or None).
+
+    The one sequence both front ends run. Raises ValueError when the IMU
+    part fails. A magnetometer that cannot be fitted must not cost the IMU
+    calibration that already succeeded, so that failure is only logged
+    and the magnetometer result is None."""
+    cal = solve(rec, gravity, init_sec,
+                estimate_misalignment=estimate_misalignment, log=log)
+    magcal = None
+    if with_mag and rec.has_mag():
+        try:
+            magcal = solve_mag(rec, cal, field_ut=field_ut,
+                               field_source=field_source, log=log)
+        except Exception as e:   # noqa: BLE001  (a singular fit included)
+            if log is not None:
+                log("magnetometer not calibrated: %s" % e)
+    return cal, magcal
+
+
 # --- main ------------------------------------------------------------------
 
 def record_session(stream, duration, init_sec, pose_sec, show=True):
@@ -1169,8 +1295,6 @@ def record_session(stream, duration, init_sec, pose_sec, show=True):
     stream.flush()
     t0 = time.monotonic()
     next_line = t0
-    live = AxisStats()
-    live_t0 = t0
     poses = 0
     while True:
         now = time.monotonic()
@@ -1178,13 +1302,8 @@ def record_session(stream, duration, init_sec, pose_sec, show=True):
             break
         for s in stream.read_samples():
             rec.add(s)
-            live.add(s.gyr_rps)
         for m in stream.read_mag():
             rec.add_mag(m)
-        if now - live_t0 > 0.5:
-            live_t0, live_std = now, max(live.std()) / DEG2RAD if live.n > 5 else 0.0
-            still = live_std < 0.5
-            live = AxisStats()
         if show and now >= next_line:
             next_line = now + 1.0
             if int(now - t0) % 5 == 0:
@@ -1223,6 +1342,17 @@ def main():
                           "opening the port, so a running inslib_hub.py "
                           "session keeps recording and feeding insrcv "
                           "(hub: --fanout 127.0.0.1:29800,127.0.0.1:29801)")
+    src.add_argument("--csv", metavar="IMU_CSV|DIR",
+                     help="calibrate offline from a recorded session in the "
+                          "replay format instead of a live board: imu.csv "
+                          "(t_us, gyr xyz [rad/s], acc xyz [m/s^2], optional "
+                          "temperature [degC]) or a directory holding one. "
+                          "A mag.csv next to it in a directory is used too")
+    ap.add_argument("--mag-csv", metavar="MAG_CSV",
+                    help="with --csv: magnetometer file (t_us, mag xyz "
+                         "[uT]) on the same clock as the IMU file")
+    ap.add_argument("-y", "--yes", action="store_true",
+                    help="write the result without asking")
     ap.add_argument("--baud", type=int, default=921600,
                     help="baud rate (irrelevant for USB-CDC; default 921600)")
     ap.add_argument("-o", "--out", default="config.yaml",
@@ -1260,8 +1390,27 @@ def main():
                          "way, but the filter gates the magnetometer on the "
                          "field strength matching its own WMM lookup")
     args = ap.parse_args()
+    if args.mag_csv and not args.csv:
+        ap.error("--mag-csv needs --csv")
 
     existing = load_existing(args.out)  # fail early if merge is impossible
+    if args.csv:
+        try:
+            imu_path, mag_path = resolve_csv_paths(args.csv, args.mag_csv)
+            rec = load_csv_recording(imu_path, mag_path)
+        except (OSError, ValueError) as e:
+            sys.exit("[calib] %s" % e)
+        print("[calib] %s: %d samples at %.0f Hz%s"
+              % (imu_path, len(rec), rec.rate_hz(),
+                 ", %d magnetometer samples from %s"
+                 % (len(rec.mag), mag_path) if mag_path else ""))
+    else:
+        rec = record_live(args)
+    finish(args, rec, existing)
+
+
+def record_live(args):
+    """The interactive part: open the board, instruct, record."""
     source = open_source(args.port, args.baud, args.udp)
     stream = ImuStream(source)
     where = f"udp:{args.udp}" if args.udp else args.port
@@ -1292,24 +1441,24 @@ def main():
 
     input("Press Enter to start the recording ... ")
     rec = record_session(stream, args.duration, args.init_sec, args.pose_sec)
-    print("[calib] recorded %d samples at %.0f Hz, temperature %.1f .. %.1f degC"
-          % (len(rec), rec.rate_hz(), rec.temp_min, rec.temp_max))
+    print("[calib] recorded %d samples at %.0f Hz, temperature %s"
+          % (len(rec), rec.rate_hz(),
+             temp_range_text(rec.temp_min, rec.temp_max)))
+    return rec
 
+
+def finish(args, rec, existing):
+    """Solve a recording (live or from CSV), report and write it."""
     try:
-        cal = solve(rec, args.gravity, args.init_sec,
-                    estimate_misalignment=not args.no_misalignment,
-                    log=lambda m: print("   " + m))
+        cal, magcal = solve_session(
+            rec, args.gravity, args.init_sec,
+            estimate_misalignment=not args.no_misalignment,
+            with_mag=not args.no_mag, field_ut=args.mag_field_ut,
+            log=lambda m: print("   " + m))
     except ValueError as e:
         sys.exit("[calib] %s" % e)
 
-    magcal = None
-    if rec.has_mag() and not args.no_mag:
-        try:
-            magcal = solve_mag(rec, cal, field_ut=args.mag_field_ut,
-                               log=lambda m: print("   " + m))
-        except ValueError as e:
-            print("[calib] magnetometer not calibrated: %s" % e)
-    elif not rec.has_mag():
+    if not rec.has_mag():
         print("[calib] no magnetometer frames in the session (0x40/0x06), "
               "IMU only")
 
@@ -1325,9 +1474,10 @@ def main():
     if cal.n_positions < MIN_POSITIONS:
         sys.exit("[calib] only %d poses, need at least %d -- nothing written"
                  % (cal.n_positions, MIN_POSITIONS))
-    ans = input(f"Write calibration to {args.out}? [Y/n] ").strip().lower()
-    if ans and ans not in ("y", "yes", "j", "ja"):
-        sys.exit("[calib] aborted, nothing written")
+    if not args.yes:
+        ans = input(f"Write calibration to {args.out}? [Y/n] ").strip().lower()
+        if ans and ans not in ("y", "yes", "j", "ja"):
+            sys.exit("[calib] aborted, nothing written")
 
     if write_calibration(args.out, cal, existing, magcal=magcal):
         print("[calib] keeping the existing noise model (measured here: "

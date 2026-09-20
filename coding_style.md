@@ -34,6 +34,14 @@
     ```
  * **Alignment:** Struct members and their trailing inline comments (`/**< ... */`) should be vertically aligned to improve readability.
  * **Array Parameters:** When the size of an array parameter is fixed, it should be explicitly specified in the function declaration for better documentation (e.g., `const float acc_mps2[3]`).
+ * **Enforcement:** `make format`/`make format-check` run `.clang-format`.
+   Its verdict is version-sensitive (e.g. `(MACRO_PARAM)*x` vs.
+   `(MACRO_PARAM) * x` differs between clang-format releases), so CI pins
+   clang-format via `ubuntu-22.04` (see `.github/workflows/ci.yml`). On a
+   machine whose system clang-format is newer (Debian, Ubuntu 24.04, ...),
+   run `scripts/fetch_ci_clang_format.sh` once to vendor a copy matching
+   CI's exact version into `.tools/` - `make format`/`format-check` pick it
+   up automatically when present.
 
 ## 4. Documentation (Doxygen)
 

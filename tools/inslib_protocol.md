@@ -776,10 +776,13 @@ ignores such frames; an offline consumer can still map them.
 
 `stddev_mps` is the per-sample uncertainty **only** — for OBD-II PID 0x0D
 the 1 km/h quantisation, i.e. 1/sqrt(12) km/h = 0.080 m/s. The systematic
-speedometer scale error (EU type approval forbids reading low, so
-production speedometers read 2..5% high; tyre wear adds to it) is a
-property of the vehicle rather than of the sample and is deliberately not
-folded in here. It belongs in the filter's `speed_scale` /
+scale error of the vehicle's speed signal (rolling radius, tyre wear, and
+whatever scaling the ECU applies) is a property of the vehicle rather than
+of the sample and is deliberately not folded in here. Its sign is not
+predictable either: the type-approval margin that keeps an indicated speed
+from ever falling below the true one constrains the **dashboard**, whereas
+this PID carries the ECU's own value, and which of the two is larger
+differs from vehicle to vehicle. It belongs in the filter's `speed_scale` /
 `speed_stddev_rel`, which is where a constant bias can be removed instead
 of being disguised as noise.
 

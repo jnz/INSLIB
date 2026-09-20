@@ -5,6 +5,9 @@ pyyaml
 pymavlink
 matplotlib
 simplekml
+pyproj    # optional: --kml real-altitude geoid correction (ins_kml.py),
+          # falls back to clampToGround if missing or offline
+Pillow    # --map-frames OpenStreetMap tile stitching (ins_map_frames.py)
 
 # UBX/serial port related
 pyserial

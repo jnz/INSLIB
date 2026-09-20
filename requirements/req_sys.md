@@ -260,3 +260,163 @@ Passing NULL for phi_out and calling only update() (never predict_step/
 correct_step directly) shall reproduce every filter's existing
 behavior unchanged -- this is a pure API addition, not a semantic
 change to any existing entry point.
+
+## REQ-SYS-018 — Magnetic dip pole exclusion zone
+
+- **Status:** verified
+- **Parent:** REQ-SYS-013
+- **Verification:** Test: tests/test_ins_math.c:test_wmm_dip_pole_zone
+
+The magnetic model shall report the great-circle distance from a given
+position to the nearest magnetic dip pole, and shall expose a predicate
+that is false within a fixed radius of any dip pole. Neither the number
+of dip poles nor their positions shall be fixed in the source code:
+they are measured properties of the field at that epoch, not
+invariants, and are tabulated by the generator. The present field has
+two, both drifting, the northern one by roughly 33 km per year.
+
+The positions shall be tabulated once at mid-epoch and shall not be
+interpolated in time, so the query takes no year. Over a five-year
+epoch the poles move about 1.5 deg, putting a fixed mid-epoch position
+at most ~0.8 deg from the truth at either end, which is far smaller
+than the margin the exclusion radius carries and smaller than the
+uncertainty in choosing that radius at all. The generator shall measure
+this drift when it regenerates the tables and shall fail rather than
+emit positions whose drift exceeds the budgeted margin.
+
+The distance shall be a great-circle distance and not a separation in
+latitude and longitude, because a degree of longitude near a dip pole
+covers a small fraction of the ground a degree of latitude does (at the
+northern pole, 5 deg of longitude is about 46 km against 555 km for
+5 deg of latitude).
+
+Rationale: at a dip pole the horizontal field vanishes, so the
+declination is ill-conditioned. The grid cannot resolve it (measured
+errors reach ~179 deg within a degree of the pole, and the worst case
+outside a 7 deg radius is still ~10 deg, at a cost of 0.75 percent of
+the Earth's surface) and a magnetometer carries almost no
+heading information there either, because the horizontal component it
+measures falls below a few percent of the total field. Callers that
+aid heading magnetically (REQ-AHRS-014, REQ-NAV-027) need to tell that
+region apart from a merely inaccurate one, which a declination value
+alone cannot express. Inclination and total field strength stay valid
+inside the zone and are not affected by this predicate.
+
+## REQ-SYS-019 — Bounded stack usage
+
+- **Status:** verified
+- **Parent:** REQ-SYS-003
+- **Verification:** Analysis: make stack (REQ-VER-033) computes the worst case of every public API function and gates it against the budgets in scripts/stack_usage.cfg
+
+The stack usage of every public API function shall have a static upper
+bound: no recursion, no variable length arrays or alloca, and every call
+through a function pointer shall have a known set of targets. The worst
+case of each entry point on the reference target (Cortex-M4F) shall be
+known and shall not grow past its budget unnoticed.
+
+Rationale: all filter state lives in caller-provided structs (REQ-SYS-003),
+but the Kalman updates keep their scratch matrices on the stack, so the
+stack is where the memory the library needs beyond its structs goes. An
+integrator sizing the stack of the task that runs the filter needs that
+figure, and a stack overflow on a bare-metal target corrupts memory silently
+instead of failing.
+
+## REQ-SYS-020 — Closed-form ECEF to geodetic conversion
+
+- **Status:** verified
+- **Parent:** REQ-SYS-014
+- **Verification:** Test: tests/test_ins_math.c:test_ecef_to_latlonh_closed_form; Test: tests/test_ins_math.c:test_ecef_roundtrip; Test: tests/test_ins_math.c:test_wgs84_constants_consistent
+
+The ECEF -> geodetic conversion of the toolbox (REQ-SYS-014) shall run
+as a fixed, non-iterative instruction sequence whose execution time
+does not depend on the coordinates handed to it. For ellipsoidal
+heights from -1 km to +30 km it shall reproduce the converged geodetic
+latitude and height to within 1 mm, and it shall return finite values
+for every finite input, including the geographic poles, points on the
+polar axis and points inside the ellipsoid.
+
+Rationale: the conversion is an API-boundary operation (REQ-NAV-080):
+ins itself no longer runs it per epoch, but a caller whose source is
+natively ECEF does run it once per fix before offering it (REQ-NAV-079),
+inside its own worst case. A loop whose iteration count depends on the
+coordinates is exactly what REQ-SYS-004 rules out for such a caller, and
+on a target without a double-precision FPU it was the single most
+expensive operation of a GNSS epoch while it still sat there: every
+iteration of the previous fixed-count Bowring loop costs a double sin,
+cos, sqrt and atan2, about 72 us on the Cortex-M4F reference target at
+180 MHz, and the loop ran six of them whether or not they changed the
+result. The closed form (Bowring's parametric-latitude formula) trades
+an accuracy that degrades with height for that determinism: below a
+micrometre up to aircraft altitudes, about 1 mm at 400 km and a few
+decimetres at geostationary altitude. That envelope is the one the
+filters navigate in, nothing in the library targets orbit.
+
+## REQ-SYS-021 — Local tangent-plane mapping in single precision
+
+- **Status:** verified
+- **Parent:** REQ-SYS-014
+- **Verification:** Test: tests/test_ins_math.c:test_dned_dlatlonh_precision
+
+The mapping between a local NED displacement and the corresponding
+latitude, longitude and height difference shall take and return the
+geodetic side in double precision and evaluate the curvature radii in
+single precision. Over displacements up to 100 km and latitudes up to
+85 degrees it shall stay within 1e-5 relative of the same mapping
+evaluated entirely in double precision, and the two directions shall
+remain inverses of each other within 1e-6 relative. Toward the poles
+|cos(lat)| shall be bounded by INS_POLE_COS_FLOOR, so the longitude
+component stays finite and keeps its sign instead of dividing by a
+cosine that single precision can round to zero or past it.
+
+The bound on the north component is a few units in the last place of
+single precision. The east component is looser because it divides by
+cos(lat), whose error comes from rounding the latitude itself and is
+therefore amplified by tan(lat): about 6e-8 relative at 45 degrees,
+7e-7 at 85 and 3e-5 at 89. Measured worst case over the envelope above:
+8e-7 relative, and 8e-8 on the round trip. The mutual-inverse bound is
+the tighter of the two because both directions take their radii from
+the same evaluation, so whatever the cosine costs cancels between
+them.
+
+Rationale: the geodetic side has to be double because the caller forms
+it by subtracting two absolute coordinates, where a latitude of about
+0.85 rad leaves a single-precision step of 0.38 m and the difference is
+metre-scale. That cancellation happens before this mapping is reached.
+What is left here is a multiplication by a curvature radius of about
+6.4e6 m, where single precision carries 8e-8 relative, i.e. under a
+micrometre on a metre-scale residual and under a millimetre over 10 km.
+The model error of a tangent-plane mapping at such a distance is orders
+of magnitude larger (REQ-NAV-023).
+
+## REQ-SYS-022 — n-frame rate in single precision
+
+- **Status:** verified
+- **Parent:** REQ-SYS-004
+- **Verification:** Test: tests/test_ins_math.c:test_omega_n_in_precision; Test: tests/test_ins_math.c:test_transport_rate_pole
+
+The n-frame angular rate (Earth rotation plus transport rate) shall take
+the latitude and height in double precision, because that is how the
+caller holds them, and evaluate entirely in single precision from there.
+Over heights to 30 km, speeds to 600 m/s and latitudes to 80 degrees it
+shall stay within 1e-9 rad/s of the same formula evaluated entirely in
+double. Every finite latitude, including the poles and values handed in
+out of range, shall yield a finite and bounded rate (the
+INS_POLE_COS_FLOOR of REQ-SYS-021 bounds the azimuth term).
+
+Accuracy is NOT required near the poles. The bound above holds to 80
+degrees, is about 3e-8 rad/s at 89 degrees and degrades quickly beyond
+it, because the rounding falls on cos(lat) as an absolute error while
+cos(lat) itself is going to zero, and tan(lat) amplifies it. This is
+accepted: the quantity it corrupts is the azimuth transport rate, which
+a north-slaved NED frame makes singular at the pole whatever the
+arithmetic. Working there is a question of choosing a different frame,
+not of widening a float.
+
+Rationale: both terms are small and well conditioned away from the
+poles. The Earth rate is 7.29e-5 rad/s and the transport rate is a
+velocity divided by an Earth radius, so single precision carries them to
+~1e-10 rad/s, which is 2e-5 deg/h of attitude drift, orders below the
+bias stability of any gyroscope these filters run on. The double sine,
+cosine and square root this replaced sat in the strapdown step
+(REQ-NAV-020), i.e. once per IMU sample, and on a target without a
+double-precision FPU they were the most expensive operation there.

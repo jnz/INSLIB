@@ -35,20 +35,13 @@ typedef struct
 static void cfg_to_init_opt(const ins_cfg_t* cfg, ins_init_t* init, ins_options_t* opt)
 {
     memset(init, 0, sizeof(*init));
-    init->time = cfg->time_us;
-    ins_latlonh_to_ecef(cfg->lat_rad, cfg->lon_rad, cfg->h_m, init->x_ecef);
-    /* Initial velocity (NED -> ECEF) for a non-stationary manual start. */
-    {
-        float R_n_to_e[9];
-        int   k;
-        ins_rotmat_n_to_e(cfg->lat_rad, cfg->lon_rad, R_n_to_e);
-        for (k = 0; k < 3; ++k)
-        {
-            init->xdot_ecef[k] = (double)R_n_to_e[k] * (double)cfg->init_vel_ned[0] +
-                                 (double)R_n_to_e[k + 3] * (double)cfg->init_vel_ned[1] +
-                                 (double)R_n_to_e[k + 6] * (double)cfg->init_vel_ned[2];
-        }
-    }
+    init->time                            = cfg->time_us;
+    init->llh[0]                          = cfg->lat_rad;
+    init->llh[1]                          = cfg->lon_rad;
+    init->llh[2]                          = cfg->h_m;
+    init->vel_ned[0]                      = cfg->init_vel_ned[0];
+    init->vel_ned[1]                      = cfg->init_vel_ned[1];
+    init->vel_ned[2]                      = cfg->init_vel_ned[2];
     init->pos_init_stddev_m               = cfg->pos_init_stddev_m;
     init->vel_init_stddev_mps             = cfg->vel_init_stddev_mps;
     init->rpy_init_stddev_rad[0]          = cfg->rpy_init_stddev_rad[0];
@@ -153,6 +146,10 @@ static void cfg_to_init_opt(const ins_cfg_t* cfg, ins_init_t* init, ins_options_
     opt->gnss_stop_disable                        = (cfg->gnss_stop_disable != 0);
     opt->gnss_pos_decimation                      = (int)cfg->gnss_pos_decimation;
     opt->gnss_min_delay_ms                        = (int)cfg->gnss_min_delay_ms;
+    opt->automotive_lateral_constraint            = (cfg->automotive_lateral_constraint != 0);
+    opt->automotive_lateral_stddev_mps            = cfg->automotive_lateral_stddev_mps;
+    opt->automotive_lateral_max_yaw_rate          = cfg->automotive_lateral_max_yaw_rate;
+    opt->automotive_lateral_after_sec             = cfg->automotive_lateral_after_sec;
 }
 
 static void meas_baro(ins_measurements_t* m, float pressure_pa, float stddev_m)
@@ -191,15 +188,17 @@ static void meas_imu(ins_measurements_t* m, int64_t t_us, float dt, const float 
     }
 }
 
-static void meas_gnss_pos(ins_measurements_t* m, const double ecef[3], const float var_ned[3])
+/* The fix as the receiver reports it, which is the form the fusion builds its
+   residual from (REQ-NAV-079). */
+static void meas_gnss_pos_llh(ins_measurements_t* m, const double llh[3], const float var_ned[3])
 {
-    m->gnss_pos.is_valid    = true;
-    m->gnss_pos.xyz_ecef[0] = ecef[0];
-    m->gnss_pos.xyz_ecef[1] = ecef[1];
-    m->gnss_pos.xyz_ecef[2] = ecef[2];
-    m->gnss_pos.Qll_ned[0]  = var_ned[0];
-    m->gnss_pos.Qll_ned[4]  = var_ned[1];
-    m->gnss_pos.Qll_ned[8]  = var_ned[2];
+    m->gnss_pos.is_valid   = true;
+    m->gnss_pos.llh[0]     = llh[0];
+    m->gnss_pos.llh[1]     = llh[1];
+    m->gnss_pos.llh[2]     = llh[2];
+    m->gnss_pos.Qll_ned[0] = var_ned[0];
+    m->gnss_pos.Qll_ned[4] = var_ned[1];
+    m->gnss_pos.Qll_ned[8] = var_ned[2];
 }
 
 static void meas_gnss_vel(ins_measurements_t* m, const float vel_ned[3], const float var_ned[3])
@@ -213,12 +212,13 @@ static void meas_gnss_vel(ins_measurements_t* m, const float vel_ned[3], const f
     }
 }
 
-static void meas_gnss_pos_cov(ins_measurements_t* m, const double ecef[3], const float Qll_ned[9])
+static void meas_gnss_pos_llh_cov(ins_measurements_t* m, const double llh[3],
+                                  const float Qll_ned[9])
 {
-    m->gnss_pos.is_valid    = true;
-    m->gnss_pos.xyz_ecef[0] = ecef[0];
-    m->gnss_pos.xyz_ecef[1] = ecef[1];
-    m->gnss_pos.xyz_ecef[2] = ecef[2];
+    m->gnss_pos.is_valid = true;
+    m->gnss_pos.llh[0]   = llh[0];
+    m->gnss_pos.llh[1]   = llh[1];
+    m->gnss_pos.llh[2]   = llh[2];
     memcpy(m->gnss_pos.Qll_ned, Qll_ned, sizeof(float) * 9);
 }
 
@@ -263,10 +263,10 @@ static void meas_local_pos(ins_measurements_t* m, const float pos_ned[3], const 
 /* The local NED frame origin (ECEF), valid once the filter is initialized. */
 static int origin_of(const ins_t* f, double o[3])
 {
+    /* The filter holds the origin geodetically (REQ-NAV-080). ECEF is what
+       this accessor needs. */
     if (!f->is_initialized) return 0;
-    o[0] = f->origin_ecef[0];
-    o[1] = f->origin_ecef[1];
-    o[2] = f->origin_ecef[2];
+    ins_latlonh_to_ecef(f->origin_llh[0], f->origin_llh[1], f->origin_llh[2], o);
     return 1;
 }
 
@@ -332,20 +332,20 @@ void ins_core_set_imu(void* h, int64_t t_us, float dt_sec, const float acc[3], c
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
     if (c) meas_imu(&c->meas, t_us, dt_sec, acc, gyr, acc_var, gyr_var);
 }
-void ins_core_set_gnss_pos_ecef(void* h, const double ecef[3], const float var_ned[3])
+void ins_core_set_gnss_pos_llh(void* h, const double llh[3], const float var_ned[3])
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
-    if (c) meas_gnss_pos(&c->meas, ecef, var_ned);
+    if (c) meas_gnss_pos_llh(&c->meas, llh, var_ned);
 }
 void ins_core_set_gnss_vel_ned(void* h, const float vel_ned[3], const float var_ned[3])
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
     if (c) meas_gnss_vel(&c->meas, vel_ned, var_ned);
 }
-void ins_core_set_gnss_pos_ecef_cov(void* h, const double ecef[3], const float Qll_ned[9])
+void ins_core_set_gnss_pos_llh_cov(void* h, const double llh[3], const float Qll_ned[9])
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
-    if (c) meas_gnss_pos_cov(&c->meas, ecef, Qll_ned);
+    if (c) meas_gnss_pos_llh_cov(&c->meas, llh, Qll_ned);
 }
 void ins_core_set_gnss_vel_ned_cov(void* h, const float vel_ned[3], const float Qll_ned[9])
 {
@@ -481,6 +481,11 @@ int ins_core_get_position_ecef(void* h, double o[3])
 {
     ins_core_ctx_t* c = (ins_core_ctx_t*)h;
     return c && ins_get_position_ecef(&c->filter, o);
+}
+int ins_core_get_latlonh(void* h, double o[3])
+{
+    ins_core_ctx_t* c = (ins_core_ctx_t*)h;
+    return c && ins_get_latlonh(&c->filter, o);
 }
 int ins_core_get_position_local(void* h, float o[3])
 {
@@ -620,20 +625,20 @@ void ins_suite_set_imu(void* h, int64_t t_us, float dt_sec, const float acc[3], 
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (c) meas_imu(&c->meas, t_us, dt_sec, acc, gyr, acc_var, gyr_var);
 }
-void ins_suite_set_gnss_pos_ecef(void* h, const double ecef[3], const float var_ned[3])
+void ins_suite_set_gnss_pos_llh(void* h, const double llh[3], const float var_ned[3])
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
-    if (c) meas_gnss_pos(&c->meas, ecef, var_ned);
+    if (c) meas_gnss_pos_llh(&c->meas, llh, var_ned);
 }
 void ins_suite_set_gnss_vel_ned(void* h, const float vel_ned[3], const float var_ned[3])
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     if (c) meas_gnss_vel(&c->meas, vel_ned, var_ned);
 }
-void ins_suite_set_gnss_pos_ecef_cov(void* h, const double ecef[3], const float Qll_ned[9])
+void ins_suite_set_gnss_pos_llh_cov(void* h, const double llh[3], const float Qll_ned[9])
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
-    if (c) meas_gnss_pos_cov(&c->meas, ecef, Qll_ned);
+    if (c) meas_gnss_pos_llh_cov(&c->meas, llh, Qll_ned);
 }
 void ins_suite_set_gnss_vel_ned_cov(void* h, const float vel_ned[3], const float Qll_ned[9])
 {
@@ -1011,6 +1016,11 @@ int ins_suite_get_position_ecef(void* h, double o[3])
 {
     ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
     return c && ins_get_position_ecef(&c->suite.ins, o);
+}
+int ins_suite_get_latlonh(void* h, double o[3])
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    return c && ins_get_latlonh(&c->suite.ins, o);
 }
 int ins_suite_get_position_local(void* h, float o[3])
 {

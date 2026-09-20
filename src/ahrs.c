@@ -118,6 +118,11 @@
 #define AHRS_DEFAULT_RESTART_STDDEV_Z   DEG2RAD(90.0f)
 #define AHRS_DEFAULT_RESTART_WARMUP_SEC (10.0f)
 
+/* Yaw 1-sigma for "heading unknown" (REQ-AHRS-014), and the fraction of the
+   yaw restart threshold it is capped at while that watchdog is armed. */
+#define AHRS_YAW_UNKNOWN_STDDEV         (3.14159265f)
+#define AHRS_YAW_UNKNOWN_RESTART_MARGIN (0.95f)
+
 /* ============================================================================
  * Small helpers
  * ============================================================================
@@ -297,6 +302,8 @@ int ahrs_init(ahrs_t* a, const ahrs_config_t* cfg, ahrs_time_us_t t)
     memset(a, 0, sizeof(*a));
     ahrs_resolve_config(cfg, &a->cfg);
     a->n = (a->cfg.mode == AHRS_MODE_AHRS) ? 6 : 5;
+    /* No position known yet, so nothing says the magnetometer is unusable. */
+    a->mag_heading_usable = true;
 
     ins_quat_from_rpy(cfg->rpy_init_rad[0], cfg->rpy_init_rad[1], cfg->rpy_init_rad[2], a->q);
     a->gyr_bias_rps[0] = cfg->gyr_bias_init_rps[0];
@@ -544,6 +551,10 @@ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
 {
     const int n = a->n;
 
+    /* Dip pole exclusion zone: the declination that would turn a magnetic
+       heading into a true one is meaningless here (REQ-SYS-018). */
+    if (!a->mag_heading_usable) { return; }
+
     /* cppcheck-suppress nullPointer
      * False positive: cppcheck's value-flow conflates the two branches in
      * ahrs_update() where mag_b may become NULL with the caller's
@@ -608,7 +619,12 @@ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
     memset(Ht, 0, sizeof(Ht[0]) * (size_t)n);
     Ht[2] = -1.0f;
 
-    (void)ahrs_fuse(a, &z, &R, Ht, 1, a->cfg.mag_chi2_threshold);
+    if (ahrs_fuse(a, &z, &R, Ht, 1, a->cfg.mag_chi2_threshold) == 0 && !a->declination_applied)
+    {
+        /* Referenced to magnetic north until a declination is applied, see
+           ahrs_set_position (REQ-AHRS-014). */
+        a->yaw_on_magnetic_north = true;
+    }
 }
 
 /* Zero-rotation update: with omega_b_nb == 0 the gyro should read just the gyro
@@ -1257,6 +1273,36 @@ float ahrs_mag_heading(const float mag_b[3], float roll_rad, float pitch_rad)
     return atan2f(-hy, hx);
 }
 
+/* Widen the yaw variance to "heading unknown", never narrowing it
+ * (REQ-AHRS-014). Capped just below the yaw restart threshold while the
+ * attitude-precision watchdog is armed (REQ-AHRS-023): tripping it would
+ * re-initialize the filter, which drops the zone state together with the
+ * position and fuses the magnetometer against magnetic north again. Like
+ * ins_reacquire_reset_yaw this rebuilds P as a diagonal and gives up the
+ * cross-covariances. */
+static void ahrs_widen_yaw_unknown(ahrs_t* a)
+{
+    if (a->cfg.mode != AHRS_MODE_AHRS) { return; } /* ARS: no yaw state */
+
+    float       sd  = AHRS_YAW_UNKNOWN_STDDEV;
+    const float thr = a->cfg.restart_att_stddev_rad[2];
+    if (!a->cfg.precision_restart_disable && thr > 0.0f &&
+        sd > AHRS_YAW_UNKNOWN_RESTART_MARGIN * thr)
+    {
+        sd = AHRS_YAW_UNKNOWN_RESTART_MARGIN * thr;
+    }
+
+    float var[AHRS_UNKNOWNS_MAX] = {0.0f};
+    int   i;
+    for (i = 0; i < a->n; ++i) { var[i] = ahrs_att_var(a, i); }
+    if (var[2] >= sd * sd) { return; }
+    var[2] = sd * sd;
+    mateye(a->U, a->n);
+    for (i = 0; i < a->n; ++i) { a->d[i] = var[i]; }
+    LOG_INFO("ahrs: yaw only ever referenced to magnetic north, yaw stddev widened to %.0f deg",
+             (double)RAD2DEG(sd));
+}
+
 /* @satisfies REQ-AHRS-014 */
 void ahrs_set_position(ahrs_t* a, float lat_rad, float lon_rad, float year)
 {
@@ -1268,6 +1314,29 @@ void ahrs_set_position(ahrs_t* a, float lat_rad, float lon_rad, float year)
     const float lat_deg = RAD2DEG(lat_rad);
     const float lon_deg = RAD2DEG(lon_rad);
 
+    /* Inside a dip pole exclusion zone the declination is meaningless, so the
+       magnetometer yaw is dropped until the position leaves it again
+       (REQ-SYS-018). Roll and pitch are unaffected, this only costs the
+       magnetic heading reference. */
+    const bool was_usable = a->mag_heading_usable;
+    a->mag_heading_usable = magnetic_heading_reference_valid(lat_deg, lon_deg);
+    if (!a->mag_heading_usable)
+    {
+        if (was_usable)
+        {
+            LOG_INFO("ahrs: magnetic dip pole zone entered, yaw coasts on the gyro");
+        }
+        /* No previous declination to keep: a yaw fused before any position is
+           a magnetic heading, and no re-framing will make it a true one. Its
+           covariance must not go on claiming otherwise. */
+        if (a->yaw_on_magnetic_north)
+        {
+            ahrs_widen_yaw_unknown(a);
+            a->yaw_on_magnetic_north = false;
+        }
+        return; /* keep the last reference rather than adopting a bogus one */
+    }
+
     const float new_decl = DEG2RAD(magnetic_declination_deg(lat_deg, lon_deg, year));
 
     /* Deterministic yaw re-framing: rotate the nominal attitude by the CHANGE
@@ -1275,15 +1344,27 @@ void ahrs_set_position(ahrs_t* a, float lat_rad, float lon_rad, float year)
        true north instead of slewing there via the mag fusion. true = magnetic +
        declination, so d_decl is added to the nominal yaw by left-multiplying q
        by q_z(d_decl). Covariance / gyro bias are unchanged (a known rotation
-       carries no new uncertainty). */
-    const float d_decl = new_decl - a->declination_rad;
-    const float h      = 0.5f * d_decl;
-    const float qz[4]  = {cosf(h), 0.0f, 0.0f, sinf(h)};
-    float       q_new[4];
-    ins_quat_multiply(qz, a->q, q_new);
-    ins_quat_normalize(q_new);
-    memcpy(a->q, q_new, sizeof(a->q));
+       carries no new uncertainty).
+
+       This is only valid while the yaw is magnetically anchored. After a pass
+       through an exclusion zone it is anchored to the gyro instead, and the
+       declination on the far side of a dip pole differs by ~80 deg, so
+       re-framing would rotate a sound estimate by that amount. Adopt the new
+       declination alone there and let the fusion pull the yaw in normally. */
+    if (was_usable)
+    {
+        const float d_decl = new_decl - a->declination_rad;
+        const float h      = 0.5f * d_decl;
+        const float qz[4]  = {cosf(h), 0.0f, 0.0f, sinf(h)};
+        float       q_new[4];
+        ins_quat_multiply(qz, a->q, q_new);
+        ins_quat_normalize(q_new);
+        memcpy(a->q, q_new, sizeof(a->q));
+    }
+    else { LOG_INFO("ahrs: magnetic dip pole zone left, magnetometer yaw re-enabled"); }
 
     a->declination_rad       = new_decl;
     a->mag_field_expected_uT = magnetic_field_strength_uT(lat_deg, lon_deg);
+    a->declination_applied   = true;
+    a->yaw_on_magnetic_north = false;
 }

@@ -13,7 +13,7 @@ MAVLink.
     from INSLIB import Navigator, Config, Telemetry
     nav = Navigator(Config(auto_init=True))
     tele = Telemetry(plotjuggler=True)
-    nav.imu(t_us, dt, acc, gyr); nav.gnss_pos(ecef, var_ned)
+    nav.imu(t_us, dt, acc, gyr); nav.gnss_pos_llh(llh, var_ned)
     nav.baro(pressure_pa); nav.mag(mag_uT, mag_var)
     nav.update()                         # run the epoch, then read it back
     sol = nav.solution(); tele.publish(nav.state())

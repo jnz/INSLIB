@@ -144,9 +144,9 @@ typedef struct
        a re-bootstrap anchors a new origin, and stays put when the origin is
        carried across a re-arm (REQ-NAV-062). */
     bool   vertical_datum_aligned; /**< true once INSLIB/baro_alt share one datum */
-    double datum_origin_ecef[3];   /**< the ins origin that agreement belongs to,
-                                        ECEF [m]; only meaningful while
-                                        vertical_datum_aligned is true */
+    double datum_origin_llh[3];    /**< the ins origin that agreement belongs to,
+                                        lat,lon [rad], h [m]; only meaningful
+                                        while vertical_datum_aligned is true */
 
     /* Where the offset filter stood when the datum above was fixed, i.e. the
        ellipsoid height ins's vertical datum was anchored to. Under the

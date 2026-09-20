@@ -179,7 +179,7 @@ def test_ins_gnss_position_pulls_in():
             t += 10000
             nav.imu(t, 0.01, (0.0, 0.0, -_G), (0.0, 0.0, 0.0))
             if i % 20 == 0:
-                nav.gnss_pos(fix, (1.0, 1.0, 4.0))
+                nav.gnss_pos_llh(ecef_to_llh(*fix), (1.0, 1.0, 4.0))
             nav.update()
         assert nav.diag()["n_gnss_used"] > 0
         ecef = nav.position_ecef()
@@ -344,7 +344,7 @@ def test_gnss_full_covariance():
             t += 10000
             nav.imu(t, 0.01, (0.0, 0.0, -_G), (0.0, 0.0, 0.0))
             if i % 20 == 0:
-                nav.gnss_pos(base, cov_pos)
+                nav.gnss_pos_llh(ecef_to_llh(*base), cov_pos)
                 nav.gnss_vel((0.0, 0.0, 0.0), cov_vel)
                 nav.gnss_pos_vel_cov(cross)
             nav.update()
@@ -373,7 +373,7 @@ def test_gnss_pos_cov_scale_height():
                 t += 10000
                 nav.imu(t, 0.01, (0.0, 0.0, -_G), (0.0, 0.0, 0.0))
                 if i % 20 == 0:
-                    nav.gnss_pos(base, (1.0, 1.0, 1.0))  # diagonal, unit stddev
+                    nav.gnss_pos_llh(ecef_to_llh(*base), (1.0, 1.0, 1.0))  # diagonal, unit stddev
                 nav.update()
             assert nav.diag()["n_gnss_used"] > 0
             p = nav.covariance()
@@ -389,7 +389,7 @@ def test_gnss_pos_cov_scale_height():
 
 
 def test_gnss_delay_kwarg():
-    """gnss_pos(..., delay_ms=) must still fuse (history-anchored)."""
+    """gnss_pos_llh(..., delay_ms=) must still fuse (history-anchored)."""
     cfg = _level_imu_config(pos_init_stddev_m=5.0)
     with Ins(cfg) as nav:
         from INSLIB._core import _WGS84_A, _WGS84_E2
@@ -402,7 +402,7 @@ def test_gnss_delay_kwarg():
             t += 10000
             nav.imu(t, 0.01, (0.0, 0.0, -_G), (0.0, 0.0, 0.0))
             if i > 50 and i % 20 == 0:
-                nav.gnss_pos(base, (1.0, 1.0, 4.0), delay_ms=100)
+                nav.gnss_pos_llh(ecef_to_llh(*base), (1.0, 1.0, 4.0), delay_ms=100)
             nav.update()
         assert nav.diag()["n_gnss_used"] > 0
 

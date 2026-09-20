@@ -163,6 +163,33 @@ steps by the declination change instead of slewing there through the
 magnetometer fusion -- while leaving the covariance and gyro-bias
 states unchanged. A non-finite argument shall be ignored.
 
+When the supplied position lies inside a magnetic dip pole exclusion
+zone (REQ-SYS-018), the AHRS shall instead suspend magnetometer yaw
+fusion and retain its previous declination, leaving roll and pitch
+aiding untouched. On the position that leaves the zone the AHRS shall
+adopt the new declination WITHOUT re-framing the attitude, because the
+re-framing above is only sound while the yaw is magnetically anchored,
+and after a pass through a zone it is anchored to the gyro. The
+declination on the far side of a dip pole differs by tens of degrees,
+so re-framing there would rotate a sound estimate by that amount
+instead of correcting it. The residual gyro drift is then removed by
+the resuming magnetometer fusion through the normal covariance
+weighting.
+
+If the first position the AHRS ever receives already lies inside an
+exclusion zone while its yaw has been fused against magnetic north,
+there is no previous declination to retain: the yaw is a magnetic
+heading that no re-framing will ever turn into a true one, yet its
+covariance still claims the accuracy of that fusion. The AHRS shall
+then widen the yaw variance to "heading unknown" (never narrowing it),
+capped just below the yaw threshold of the attitude-precision restart
+watchdog while that is armed (REQ-AHRS-023), since a restart would
+discard the zone state together with the position and fuse the
+magnetometer against magnetic north again, so that the yaw it reports, and any consumer of its standard deviation
+such as the nav_suite attitude hint (REQ-SUITE-016), does not present a
+magnetic heading as a converged true one. A yaw that was never fused
+against the magnetometer keeps its variance.
+
 ## REQ-AHRS-015 — Magnetometer field-strength disturbance rejection
 
 - **Status:** verified

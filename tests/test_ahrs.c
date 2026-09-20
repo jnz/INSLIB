@@ -73,6 +73,17 @@ static float frand01(void)
     return (float)(g_rng >> 8) * (1.0f / 16777216.0f);
 }
 
+/* The init block is geodetic (REQ-NAV-081). A GNSS fix measurement in ECEF
+   form is not, and several scenarios build one at the start point, so this
+   hands out the same position in that form. The static is fine here: every
+   use is immediate and the tests are single-threaded. */
+static const double* init_ecef(const ins_init_t* init)
+{
+    static double xyz[3];
+    ins_latlonh_to_ecef(init->llh[0], init->llh[1], init->llh[2], xyz);
+    return xyz;
+}
+
 static float gauss(float stddev)
 {
     float u1 = frand01();
@@ -347,6 +358,89 @@ static void scenario_wmm_position_aiding(void)
     CHECK_NEAR(RAD2DEG(yaw_after), 30.0, 1.0, "post: stepped to true north");
     CHECK_NEAR(RAD2DEG(yaw_after - yaw_before), decl, 0.05, "step equals declination (no slew)");
 
+    /* (e) Magnetic dip pole exclusion zone (REQ-SYS-018). Converge at New
+       York, then move into the northern zone. The declination there is
+       meaningless, so the AHRS must keep the old one and stop fusing the
+       magnetometer. Leaving the zone must NOT re-frame the attitude: after a
+       pass through the zone the yaw is anchored to the gyro, not to the
+       field, so the step that is right for a normal declination change would
+       rotate a sound estimate by the ~80 deg the declination differs by
+       across a dip pole. */
+    ahrs_t         z;
+    ahrs_time_us_t tz = 0;
+    CHECK_TRUE(ahrs_init(&z, &cfg, tz) == 0, "init z");
+    ahrs_set_position(&z, (float)(lat * M_PI / 180.0), (float)(lon * M_PI / 180.0), year);
+    run_ahrs(&z, &tz, 2500, mag_n);
+    CHECK_TRUE(z.mag_heading_usable, "zone: usable outside");
+    const float decl_before_zone = z.declination_rad;
+    float       yaw_at_entry;
+    ahrs_get_rpy(&z, &roll, &pitch, &yaw_at_entry);
+
+    /* Into the zone: the 2025 northern dip pole itself. */
+    ahrs_set_position(&z, (float)(85.762 * M_PI / 180.0), (float)(139.294 * M_PI / 180.0), year);
+    CHECK_TRUE(!z.mag_heading_usable, "zone: entering marks unusable");
+    CHECK_NEAR(z.declination_rad, decl_before_zone, 1e-6, "zone: declination retained");
+
+    /* A rotated field must no longer drag the yaw, the fusion is off. */
+    float rotated_n[3];
+    field_disturb(mag_n, DEG2RAD(60.0f), 1.0f, rotated_n);
+    run_ahrs(&z, &tz, 2500, rotated_n);
+    float yaw_in_zone;
+    ahrs_get_rpy(&z, &roll, &pitch, &yaw_in_zone);
+    CHECK_NEAR(RAD2DEG(yaw_in_zone), RAD2DEG(yaw_at_entry), 1.0, "zone: yaw not pulled by mag");
+
+    /* Out again, and deliberately NOT where we went in: leaving on the far
+       side is the realistic case and the only one that can tell a suppressed
+       re-frame from an applied one. Exiting at the entry position would make
+       the declination change zero, so the re-framing rotation would be the
+       identity and the check below could not fail. This exit point sits
+       7.5 deg from the pole with a declination ~62 deg away from New York's,
+       so a re-frame would visibly rotate the yaw. */
+    const double exit_lat = 83.0, exit_lon = 60.0;
+    const float  exit_decl = magnetic_declination_deg((float)exit_lat, (float)exit_lon, year);
+    CHECK_TRUE(fabsf(exit_decl - decl) > 30.0f, "zone: exit declination differs enough to bite");
+
+    float yaw_pre_exit;
+    ahrs_get_rpy(&z, &roll, &pitch, &yaw_pre_exit);
+    ahrs_set_position(&z, (float)(exit_lat * M_PI / 180.0), (float)(exit_lon * M_PI / 180.0), year);
+    float yaw_post_exit;
+    ahrs_get_rpy(&z, &roll, &pitch, &yaw_post_exit); /* no ahrs_update in between */
+    CHECK_TRUE(z.mag_heading_usable, "zone: leaving marks usable");
+    CHECK_NEAR(RAD2DEG(z.declination_rad), exit_decl, 0.01, "zone: declination adopted on exit");
+    CHECK_NEAR(RAD2DEG(yaw_post_exit), RAD2DEG(yaw_pre_exit), 1e-3, "zone: no re-frame on exit");
+
+    /* (f) First position already inside a zone, after the yaw converged on
+       MAGNETIC north. There is no declination to keep, so the yaw must stop
+       claiming the accuracy of that fusion (it would otherwise reach ins as a
+       converged true heading through the nav_suite hint), without tripping
+       the precision restart watchdog, which would forget the zone again. */
+    ahrs_t         p;
+    ahrs_time_us_t tp = 0;
+    float          rsd, psd, ysd;
+    CHECK_TRUE(ahrs_init(&p, &cfg, tp) == 0, "init p");
+    run_ahrs(&p, &tp, 2500, mag_n);
+    CHECK_TRUE(p.yaw_on_magnetic_north, "zone first: yaw fused on magnetic north");
+    ahrs_get_rpy_stddev(&p, &rsd, &psd, &ysd);
+    CHECK_TRUE(RAD2DEG(ysd) < 5.0f, "zone first: yaw converged before the position");
+    const float rsd_before = rsd;
+    ahrs_set_position(&p, (float)(85.762 * M_PI / 180.0), (float)(139.294 * M_PI / 180.0), year);
+    CHECK_TRUE(!p.mag_heading_usable, "zone first: unusable");
+    ahrs_get_rpy_stddev(&p, &rsd, &psd, &ysd);
+    CHECK_TRUE(RAD2DEG(ysd) > 45.0f, "zone first: yaw stddev widened");
+    CHECK_NEAR(RAD2DEG(rsd), RAD2DEG(rsd_before), 1e-3, "zone first: roll stddev untouched");
+    run_ahrs(&p, &tp, 1500, mag_n); /* past the restart watchdog warm-up */
+    CHECK_TRUE(p.is_initialized, "zone first: no precision watchdog restart");
+
+    /* Control: a yaw never fused against the magnetometer keeps its own
+       variance, a known initial heading is not discarded. */
+    ahrs_config_t cfg_known          = cfg;
+    cfg_known.rpy_init_stddev_rad[2] = DEG2RAD(3.0f);
+    ahrs_t q;
+    CHECK_TRUE(ahrs_init(&q, &cfg_known, 0) == 0, "init q");
+    ahrs_set_position(&q, (float)(85.762 * M_PI / 180.0), (float)(139.294 * M_PI / 180.0), year);
+    ahrs_get_rpy_stddev(&q, &rsd, &psd, &ysd);
+    CHECK_NEAR(RAD2DEG(ysd), 3.0, 1e-3, "zone first: unfused yaw keeps its variance");
+
     /* (d) Field-strength gate (opt-in): after clean convergence, feed a
        disturbance that is both rotated (+60 deg) and magnitude-anomalous
        (x3). The gated filter must resist it far better than the default
@@ -443,9 +537,11 @@ static void scenario_nav_suite(void)
     /* ins manual init (static, Stuttgart-ish). */
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.rpy_init_rad[2]           = yaw_true;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
@@ -538,8 +634,10 @@ static void scenario_nav_suite(void)
     {
         ins_init_t init2;
         memset(&init2, 0, sizeof(init2));
-        init2.time = t;
-        ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init2.x_ecef);
+        init2.time                      = t;
+        init2.llh[0]                    = 48.783 * M_PI / 180.0;
+        init2.llh[1]                    = 9.181 * M_PI / 180.0;
+        init2.llh[2]                    = 300.0;
         init2.pos_init_stddev_m         = 1.0f;
         init2.vel_init_stddev_mps       = 0.1f;
         init2.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
@@ -607,9 +705,11 @@ static void scenario_suite_att_hint(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t                     = 1000000;
+    init.time                            = t;
+    init.llh[0]                          = 48.783 * M_PI / 180.0;
+    init.llh[1]                          = 9.181 * M_PI / 180.0;
+    init.llh[2]                          = 300.0;
     init.pos_init_stddev_m               = 10.0f;
     init.vel_init_stddev_mps             = 1.0f;
     init.rpy_init_stddev_rad[0]          = DEG2RAD(5.0f);
@@ -682,9 +782,9 @@ static void scenario_suite_att_hint(void)
     memcpy(m.acc.data, acc_body, sizeof(acc_body));
     memcpy(m.gyr.data, gbias_true, sizeof(gbias_true));
     m.zero_rotation_update = true;
-    m.gnss_pos.xyz_ecef[0] = init.x_ecef[0];
-    m.gnss_pos.xyz_ecef[1] = init.x_ecef[1];
-    m.gnss_pos.xyz_ecef[2] = init.x_ecef[2];
+    m.gnss_pos.llh[0]      = init.llh[0];
+    m.gnss_pos.llh[1]      = init.llh[1];
+    m.gnss_pos.llh[2]      = init.llh[2];
     m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 1.0f;
     m.gnss_pos.Qll_ned[8]                         = 1.0f;
     m.gnss_pos.is_valid                           = true;
@@ -719,9 +819,11 @@ static void scenario_suite_quality_exit_rebootstrap(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t                     = 1000000;
+    init.time                            = t;
+    init.llh[0]                          = 48.783 * M_PI / 180.0;
+    init.llh[1]                          = 9.181 * M_PI / 180.0;
+    init.llh[2]                          = 300.0;
     init.pos_init_stddev_m               = 10.0f;
     init.vel_init_stddev_mps             = 1.0f;
     init.rpy_init_stddev_rad[0]          = DEG2RAD(5.0f);
@@ -773,9 +875,9 @@ static void scenario_suite_quality_exit_rebootstrap(void)
         memcpy(m.gyr.data, gyr_body, sizeof(gyr_body));                            \
         if ((long)((t) % 200000) < (long)(US_PER_SEC / 100))                       \
         {                                                                          \
-            m.gnss_pos.xyz_ecef[0] = init.x_ecef[0];                               \
-            m.gnss_pos.xyz_ecef[1] = init.x_ecef[1];                               \
-            m.gnss_pos.xyz_ecef[2] = init.x_ecef[2];                               \
+            m.gnss_pos.llh[0]     = init.llh[0];                                   \
+            m.gnss_pos.llh[1]     = init.llh[1];                                   \
+            m.gnss_pos.llh[2]     = init.llh[2];                                   \
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 1.0f;                  \
             m.gnss_pos.Qll_ned[8]                         = 1.0f;                  \
             m.gnss_pos.is_valid                           = true;                  \
@@ -830,9 +932,11 @@ static void scenario_suite_init_att_hint(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t                     = 1000000;
+    init.time                            = t;
+    init.llh[0]                          = 48.783 * M_PI / 180.0;
+    init.llh[1]                          = 9.181 * M_PI / 180.0;
+    init.llh[2]                          = 300.0;
     init.pos_init_stddev_m               = 10.0f;
     init.vel_init_stddev_mps             = 1.0f;
     init.rpy_init_stddev_rad[0]          = DEG2RAD(5.0f);
@@ -915,9 +1019,9 @@ static void scenario_suite_init_att_hint(void)
     m.acc.is_valid     = true;
     m.gyr.is_valid     = true;
     memcpy(m.acc.data, acc_body, sizeof(acc_body));
-    m.gnss_pos.xyz_ecef[0] = init.x_ecef[0];
-    m.gnss_pos.xyz_ecef[1] = init.x_ecef[1];
-    m.gnss_pos.xyz_ecef[2] = init.x_ecef[2];
+    m.gnss_pos.llh[0]     = init.llh[0];
+    m.gnss_pos.llh[1]     = init.llh[1];
+    m.gnss_pos.llh[2]     = init.llh[2];
     m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 1.0f;
     m.gnss_pos.Qll_ned[8]                         = 1.0f;
     m.gnss_pos.is_valid                           = true;
@@ -950,9 +1054,9 @@ static void scenario_suite_init_att_hint(void)
     m.acc.is_valid     = true;
     m.gyr.is_valid     = true;
     memcpy(m.acc.data, acc_body, sizeof(acc_body));
-    m.gnss_pos.xyz_ecef[0] = init.x_ecef[0];
-    m.gnss_pos.xyz_ecef[1] = init.x_ecef[1];
-    m.gnss_pos.xyz_ecef[2] = init.x_ecef[2];
+    m.gnss_pos.llh[0]     = init.llh[0];
+    m.gnss_pos.llh[1]     = init.llh[1];
+    m.gnss_pos.llh[2]     = init.llh[2];
     m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 1.0f;
     m.gnss_pos.Qll_ned[8]                         = 1.0f;
     m.gnss_pos.is_valid                           = true;
@@ -977,9 +1081,11 @@ static void scenario_suite_init_att_hint_roll_pitch(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t                     = 1000000;
+    init.time                            = t;
+    init.llh[0]                          = 48.783 * M_PI / 180.0;
+    init.llh[1]                          = 9.181 * M_PI / 180.0;
+    init.llh[2]                          = 300.0;
     init.pos_init_stddev_m               = 10.0f;
     init.vel_init_stddev_mps             = 1.0f;
     init.rpy_init_stddev_rad[0]          = DEG2RAD(20.0f);
@@ -1096,9 +1202,7 @@ static void yaw_carry_epoch(nav_suite_t* s, ahrs_time_us_t t, float yaw_rate_rps
 
     if (with_fix)
     {
-        m.gnss_pos.xyz_ecef[0] = x_ecef[0];
-        m.gnss_pos.xyz_ecef[1] = x_ecef[1];
-        m.gnss_pos.xyz_ecef[2] = x_ecef[2];
+        ins_ecef_to_latlonh(x_ecef, &m.gnss_pos.llh[0], &m.gnss_pos.llh[1], &m.gnss_pos.llh[2]);
         m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 1.0f;
         m.gnss_pos.Qll_ned[8]                         = 1.0f;
         m.gnss_pos.is_valid                           = true;
@@ -1119,9 +1223,11 @@ static void scenario_suite_yaw_carry(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t                     = 1000000;
+    init.time                            = t;
+    init.llh[0]                          = 48.783 * M_PI / 180.0;
+    init.llh[1]                          = 9.181 * M_PI / 180.0;
+    init.llh[2]                          = 300.0;
     init.pos_init_stddev_m               = 10.0f;
     init.vel_init_stddev_mps             = 1.0f;
     init.rpy_init_stddev_rad[0]          = DEG2RAD(5.0f);
@@ -1159,7 +1265,7 @@ static void scenario_suite_yaw_carry(void)
     for (i = 0; i < 500; ++i) /* 5 s */
     {
         t += US_PER_SEC / 100;
-        yaw_carry_epoch(&s, t, 0.0f, init.x_ecef, true, &yaw_true);
+        yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), true, &yaw_true);
     }
 
     CHECK_TRUE(ins_is_ready(&s.ins), "ins ready and aided before the shutdown");
@@ -1186,7 +1292,7 @@ static void scenario_suite_yaw_carry(void)
     for (i = 0; i < 300; ++i) /* 3 s * 10 deg/s = 30 deg */
     {
         t += US_PER_SEC / 100;
-        yaw_carry_epoch(&s, t, yaw_rate_rps, init.x_ecef, false, (const float*)0);
+        yaw_carry_epoch(&s, t, yaw_rate_rps, init_ecef(&init), false, (const float*)0);
     }
 
     float ars_roll, ars_pitch, ars_yaw;
@@ -1214,7 +1320,7 @@ static void scenario_suite_yaw_carry(void)
        offered with it, so without the carry-over this would be the
        "initial heading unknown" case. */
     t += US_PER_SEC / 100;
-    yaw_carry_epoch(&s, t, yaw_rate_rps, init.x_ecef, true, (const float*)0);
+    yaw_carry_epoch(&s, t, yaw_rate_rps, init_ecef(&init), true, (const float*)0);
 
     CHECK_TRUE(s.ins.is_initialized, "ins re-initialized on the returning fix");
 
@@ -1230,7 +1336,7 @@ static void scenario_suite_yaw_carry(void)
        reference the carry-over subtracts against is gone. */
     s.ars.is_initialized = false;
     t += US_PER_SEC / 100;
-    yaw_carry_epoch(&s, t, 0.0f, init.x_ecef, true, (const float*)0);
+    yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), true, (const float*)0);
     CHECK_TRUE(!s.yaw_carry.valid, "carry-over dropped when the ars re-bootstraps");
 }
 
@@ -1262,9 +1368,11 @@ static void scenario_suite_heading_switch_no_jump(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.rpy_init_rad[2]           = yaw_true;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
@@ -1319,7 +1427,7 @@ static void scenario_suite_heading_switch_no_jump(void)
         if (WITH_GNSS)                                                      \
         {                                                                   \
             m.gnss_pos.is_valid = true;                                     \
-            memcpy(m.gnss_pos.xyz_ecef, init.x_ecef, sizeof(init.x_ecef));  \
+            memcpy(m.gnss_pos.llh, init.llh, sizeof(double) * 3);           \
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;          \
             m.gnss_pos.Qll_ned[8]                         = 1.0f;           \
         }                                                                   \
@@ -1393,9 +1501,11 @@ static void scenario_suite_heading_cross_check(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
     init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
@@ -1452,7 +1562,7 @@ static void scenario_suite_heading_cross_check(void)
         if ((i % 100) == 0)                                                        \
         {                                                                          \
             m.gnss_pos.is_valid = true;                                            \
-            memcpy(m.gnss_pos.xyz_ecef, init.x_ecef, sizeof(init.x_ecef));         \
+            memcpy(m.gnss_pos.llh, init.llh, sizeof(double) * 3);                  \
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;                 \
             m.gnss_pos.Qll_ned[8]                         = 1.0f;                  \
         }                                                                          \
@@ -1561,9 +1671,11 @@ static void scenario_tunnel(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.rpy_init_rad[2]           = yaw_true;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
@@ -1599,29 +1711,29 @@ static void scenario_tunnel(void)
     float              roll, pitch, yaw;
     int                i;
 
-#define RUN_EPOCHS(N, WITH_GNSS)                                               \
-    do {                                                                       \
-        for (i = 0; i < (N); ++i)                                              \
-        {                                                                      \
-            t += US_PER_SEC / 100;                                             \
-            memset(&m, 0, sizeof(m));                                          \
-            m.timestamp        = t;                                            \
-            m.strapdown_dt_sec = 0.01f;                                        \
-            m.acc.is_valid     = true;                                         \
-            m.gyr.is_valid     = true;                                         \
-            memcpy(m.acc.data, f_b, sizeof(f_b));                              \
-            m.mag.is_valid = true;                                             \
-            memcpy(m.mag.data, mag_b, sizeof(mag_b));                          \
-            m.mag.Qll_diag[0] = m.mag.Qll_diag[1] = m.mag.Qll_diag[2] = 1.0f;  \
-            if ((WITH_GNSS) && (i % 100 == 0)) /* 1 Hz */                      \
-            {                                                                  \
-                m.gnss_pos.is_valid = true;                                    \
-                memcpy(m.gnss_pos.xyz_ecef, init.x_ecef, sizeof(init.x_ecef)); \
-                m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;         \
-                m.gnss_pos.Qll_ned[8]                         = 1.0f;          \
-            }                                                                  \
-            nav_suite_update(&s, &m);                                          \
-        }                                                                      \
+#define RUN_EPOCHS(N, WITH_GNSS)                                              \
+    do {                                                                      \
+        for (i = 0; i < (N); ++i)                                             \
+        {                                                                     \
+            t += US_PER_SEC / 100;                                            \
+            memset(&m, 0, sizeof(m));                                         \
+            m.timestamp        = t;                                           \
+            m.strapdown_dt_sec = 0.01f;                                       \
+            m.acc.is_valid     = true;                                        \
+            m.gyr.is_valid     = true;                                        \
+            memcpy(m.acc.data, f_b, sizeof(f_b));                             \
+            m.mag.is_valid = true;                                            \
+            memcpy(m.mag.data, mag_b, sizeof(mag_b));                         \
+            m.mag.Qll_diag[0] = m.mag.Qll_diag[1] = m.mag.Qll_diag[2] = 1.0f; \
+            if ((WITH_GNSS) && (i % 100 == 0)) /* 1 Hz */                     \
+            {                                                                 \
+                m.gnss_pos.is_valid = true;                                   \
+                memcpy(m.gnss_pos.llh, init.llh, sizeof(double) * 3);         \
+                m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;        \
+                m.gnss_pos.Qll_ned[8]                         = 1.0f;         \
+            }                                                                 \
+            nav_suite_update(&s, &m);                                         \
+        }                                                                     \
     } while (0)
 
     /* Aided phase. */
@@ -2317,9 +2429,11 @@ static void scenario_suite_selfhealing(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.rpy_init_rad[2]           = yaw_true;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
@@ -2444,9 +2558,11 @@ static void scenario_suite_fallbacks(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.rpy_init_rad[0]           = rpy_true[0];
     init.rpy_init_rad[1]           = rpy_true[1];
     init.pos_init_stddev_m         = 1.0f;
@@ -2500,9 +2616,10 @@ static void scenario_suite_fallbacks(void)
         memcpy(m.acc.data, f_b, sizeof(f_b));
         if (i == 0)
         {
-            m.gnss_pos.is_valid = true;
-            ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0,
-                                m.gnss_pos.xyz_ecef);
+            m.gnss_pos.is_valid   = true;
+            m.gnss_pos.llh[0]     = 48.783 * M_PI / 180.0;
+            m.gnss_pos.llh[1]     = 9.181 * M_PI / 180.0;
+            m.gnss_pos.llh[2]     = 300.0;
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
             m.gnss_pos.Qll_ned[8]                         = 1.0f;
         }
@@ -2562,7 +2679,9 @@ static void scenario_suite_fallbacks(void)
     m.baro.is_valid     = true;
     m.baro.pressure_pa  = 101325.0f;
     m.gnss_pos.is_valid = true;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, m.gnss_pos.xyz_ecef);
+    m.gnss_pos.llh[0]   = 48.783 * M_PI / 180.0;
+    m.gnss_pos.llh[1]   = 9.181 * M_PI / 180.0;
+    m.gnss_pos.llh[2]   = 300.0;
     /* vertical variance left at 0 -> pair skipped */
     nav_suite_update(&s, &m);
     CHECK_TRUE(!s.local_gnss.is_initialized, "offset pair without vertical variance skipped");
@@ -2597,9 +2716,11 @@ static void scenario_suite_height_cross_check(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
     init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
@@ -2658,9 +2779,10 @@ static void scenario_suite_height_cross_check(void)
         m.baro.pressure_pa = 101325.0f;
         if ((i % 100) == 0)
         {
-            m.gnss_pos.is_valid = true;
-            ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0,
-                                m.gnss_pos.xyz_ecef);
+            m.gnss_pos.is_valid   = true;
+            m.gnss_pos.llh[0]     = 48.783 * M_PI / 180.0;
+            m.gnss_pos.llh[1]     = 9.181 * M_PI / 180.0;
+            m.gnss_pos.llh[2]     = 300.0;
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
             m.gnss_pos.Qll_ned[8]                         = 1.0f;
             m.gnss_vel.is_valid                           = true;
@@ -2688,9 +2810,10 @@ static void scenario_suite_height_cross_check(void)
         m.baro.pressure_pa = pressure_at_altitude(0.2f * (float)(i + 1) * 0.01f);
         if ((i % 100) == 0)
         {
-            m.gnss_pos.is_valid = true;
-            ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0,
-                                m.gnss_pos.xyz_ecef);
+            m.gnss_pos.is_valid   = true;
+            m.gnss_pos.llh[0]     = 48.783 * M_PI / 180.0;
+            m.gnss_pos.llh[1]     = 9.181 * M_PI / 180.0;
+            m.gnss_pos.llh[2]     = 300.0;
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
             m.gnss_pos.Qll_ned[8]                         = 1.0f;
             m.gnss_vel.is_valid                           = true;
@@ -2729,9 +2852,10 @@ static void scenario_suite_height_cross_check(void)
         m.baro.pressure_pa = pressure_at_altitude(h_at_switch + 5.0f * (float)(i + 1) * 0.01f);
         if ((i % 100) == 0)
         {
-            m.gnss_pos.is_valid = true;
-            ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0,
-                                m.gnss_pos.xyz_ecef);
+            m.gnss_pos.is_valid   = true;
+            m.gnss_pos.llh[0]     = 48.783 * M_PI / 180.0;
+            m.gnss_pos.llh[1]     = 9.181 * M_PI / 180.0;
+            m.gnss_pos.llh[2]     = 300.0;
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
             m.gnss_pos.Qll_ned[8]                         = 1.0f;
             m.gnss_vel.is_valid                           = true;
@@ -2772,9 +2896,11 @@ static void scenario_suite_zaru(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
     init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
@@ -2818,7 +2944,7 @@ static void scenario_suite_zaru(void)
         if (i == 0)
         {
             m.gnss_pos.is_valid = true;
-            memcpy(m.gnss_pos.xyz_ecef, init.x_ecef, sizeof(init.x_ecef));
+            memcpy(m.gnss_pos.llh, init.llh, sizeof(double) * 3);
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
             m.gnss_pos.Qll_ned[8]                         = 1.0f;
         }
@@ -2880,8 +3006,10 @@ static void scenario_suite_stillness_propagation(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    init.time = 1000000;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    init.time                = 1000000;
+    init.llh[0]              = 48.783 * M_PI / 180.0;
+    init.llh[1]              = 9.181 * M_PI / 180.0;
+    init.llh[2]              = 300.0;
     init.pos_init_stddev_m   = 1.0f;
     init.vel_init_stddev_mps = 0.1f;
     init.zero_vel_stddev_mps = 0.02f;
@@ -2972,9 +3100,11 @@ static void scenario_suite_auto_zupt_zaru_disable(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
     init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
@@ -3015,7 +3145,7 @@ static void scenario_suite_auto_zupt_zaru_disable(void)
         if (i == 0)
         {
             m.gnss_pos.is_valid = true;
-            memcpy(m.gnss_pos.xyz_ecef, init.x_ecef, sizeof(init.x_ecef));
+            memcpy(m.gnss_pos.llh, init.llh, sizeof(double) * 3);
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
             m.gnss_pos.Qll_ned[8]                         = 1.0f;
         }
@@ -3255,8 +3385,10 @@ static void scenario_ahrs_chi2_disable(void)
        config templates, the caller only has to set it once. */
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    init.time = 0;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    init.time                      = 0;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
     init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
@@ -3293,9 +3425,11 @@ static float run_suite_ars_yaw(float gyr_fixed_bias_z)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = US_PER_SEC;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = US_PER_SEC;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.rpy_init_rad[2]           = 0.0f;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
@@ -3985,9 +4119,11 @@ static void scenario_suite_predict_correct_equivalence(void)
 
     ins_init_t init;
     memset(&init, 0, sizeof(init));
-    ahrs_time_us_t t = 1000000;
-    init.time        = t;
-    ins_latlonh_to_ecef(48.783 * M_PI / 180.0, 9.181 * M_PI / 180.0, 300.0, init.x_ecef);
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
     init.rpy_init_rad[2]           = yaw_true;
     init.pos_init_stddev_m         = 1.0f;
     init.vel_init_stddev_mps       = 0.1f;
@@ -4022,7 +4158,7 @@ static void scenario_suite_predict_correct_equivalence(void)
     CHECK_TRUE(nav_suite_init(&s2, &init, &opt) == 0, "s2 init");
 
     double truth_ecef[3];
-    memcpy(truth_ecef, init.x_ecef, sizeof(truth_ecef));
+    memcpy(truth_ecef, init_ecef(&init), sizeof(truth_ecef));
 
     bool  phi_checked = false;
     float phi_check[INS_UNKNOWNS_MAX * INS_UNKNOWNS_MAX];
@@ -4046,9 +4182,8 @@ static void scenario_suite_predict_correct_equivalence(void)
 
         if (i % 20 == 0)
         {
-            m.gnss_pos.xyz_ecef[0] = truth_ecef[0];
-            m.gnss_pos.xyz_ecef[1] = truth_ecef[1];
-            m.gnss_pos.xyz_ecef[2] = truth_ecef[2];
+            ins_ecef_to_latlonh(truth_ecef, &m.gnss_pos.llh[0], &m.gnss_pos.llh[1],
+                                &m.gnss_pos.llh[2]);
             m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = m.gnss_pos.Qll_ned[8] = 1.0f;
             m.gnss_pos.is_valid                                                   = true;
         }

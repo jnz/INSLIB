@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """inslib_calib_gui -- guided IMU calibration for the STM32 sensor board.
 
-Graphical front end for tools/inslib_ubx_imu_calib.py: same recording,
+Graphical front end for tools/inslib_imu_calib.py: same recording,
 same solve, same config.yaml writer. Everything that computes a number
 lives in that module (and in inslib_imu_tk.py) and is imported here, so
 the console tool and this window cannot drift apart.
@@ -71,7 +71,7 @@ import traceback
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import inslib_ubx_imu_calib as calib   # noqa: E402  (recording, solve, writer)
+import inslib_imu_calib as calib     # noqa: E402  (recording, solve, writer)
 import inslib_imu_tk as imu_tk         # noqa: E402
 import inslib_frame_align as fa        # noqa: E402  (mounting rotations)
 import inslib_mag_calib as mag_calib   # noqa: E402  (hard/soft iron)
@@ -340,8 +340,8 @@ class StillnessMeter(QtWidgets.QWidget):
         self.setMaximumHeight(52)
         self.gyr = 0.0          # [deg/s] stddev, worst axis
         self.acc = 0.0          # [m/s^2] stddev, worst axis
-        self.gyr_lim = 0.5
-        self.acc_lim = 0.3
+        self.gyr_lim = calib.STILL_MAX_GYR_STD_DPS
+        self.acc_lim = calib.STILL_MAX_ACC_STD_MPS2
         self.valid = False
 
     def set_values(self, gyr_dps, acc_mps2, valid=True):
@@ -476,13 +476,6 @@ class DemoSerial:
             0, b"\x00" * 6,               # pDOP, reserved1
             0, 0, 0)                     # headVeh, magDec, magAcc
 
-    @staticmethod
-    def _rodrigues(axis, ang):
-        k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]],
-                      [-axis[1], axis[0], 0]])
-        return (np.eye(3) * math.cos(ang) + math.sin(ang) * k
-                + (1 - math.cos(ang)) * np.outer(axis, axis))
-
     def _step(self, t):
         if t >= self._phase_end:
             self._turning = not self._turning
@@ -505,7 +498,7 @@ class DemoSerial:
         # UP: level and upright it reads (0, 0, -g), the convention ins.c
         # levels with.
         f_body = rot @ np.array([0.0, 0.0, -self.G])
-        self.rot = self._rodrigues(self.axis, -w / self.RATE_HZ) @ self.rot
+        self.rot = fa.rodrigues(self.axis * (-w / self.RATE_HZ)) @ self.rot
         return f_body, omega, rot @ self._field_n
 
     def _generate(self):
@@ -768,22 +761,11 @@ class ImuWorker(QtCore.QThread):
         self._last_scan = now
         self.sig_poses.emit({"mag_dirs": self._mag_dirs()})
         rec = self.rec
-        if rec is None or len(rec) < 500:
+        if rec is None:
             return
-        t, acc, _ = rec.arrays()
-        rate = rec.rate_hz()
-        if rate <= 0:
+        ivals, acc = rec.static_poses(self.init_sec, self.pose_sec)
+        if len(acc) == 0:
             return
-        end = int(min(np.searchsorted(t, self.init_sec), len(t) - 1))
-        if end < 100:
-            return
-        var = acc[:end + 1].var(axis=0, ddof=1)
-        norm_th = float(np.sqrt((var * var).sum()))
-        if not (norm_th > 0):
-            return
-        n_samp = max(int(self.pose_sec * rate * 0.5), 20)
-        ivals = [iv for iv in imu_tk.static_intervals(acc, 6.0 * norm_th)
-                 if iv[1] - iv[0] + 1 >= n_samp]
         dirs = np.array([acc[s:e + 1].mean(axis=0) for (s, e) in ivals]) \
             if ivals else np.zeros((0, 3))
         if len(dirs):
@@ -863,23 +845,14 @@ class SolveWorker(QtCore.QThread):
 
     def run(self):
         try:
-            cal = calib.solve(self.rec, self.gravity, self.init_sec,
-                              estimate_misalignment=self.misalignment,
-                              log=self.sig_log.emit)
+            cal, magcal = calib.solve_session(
+                self.rec, self.gravity, self.init_sec,
+                estimate_misalignment=self.misalignment,
+                with_mag=self.with_mag, field_ut=self.mag_field_ut,
+                field_source=self.mag_field_source, log=self.sig_log.emit)
         except Exception as e:
             self.sig_error.emit(str(e))
             return
-        magcal = None
-        if self.with_mag and self.rec.has_mag():
-            # A magnetometer that cannot be fitted must not cost the IMU
-            # calibration that already succeeded: report and carry on.
-            try:
-                magcal = calib.solve_mag(
-                    self.rec, cal, field_ut=self.mag_field_ut,
-                    field_source=self.mag_field_source,
-                    log=self.sig_log.emit)
-            except Exception as e:
-                self.sig_log.emit("magnetometer not calibrated: %s" % e)
         self.sig_done.emit(cal, magcal)
 
 
@@ -1995,22 +1968,15 @@ class CalibWindow(QtWidgets.QMainWindow):
         # Load (and validate) now rather than after a whole session: a
         # merge that cannot work should say so while nothing is at stake.
         self.existing = None
-        if not os.path.exists(self.out_path):
-            return
         try:
-            import yaml
-            with open(self.out_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-        except ImportError:
-            self.say("[calib] %s exists; merging into it needs PyYAML "
-                     "(pip install pyyaml), or pick a new file" % self.out_path)
+            cfg = calib.read_config(self.out_path)
+        except ValueError as e:
+            self.say("[calib] %s" % e)
             return
         except OSError as e:
             self.say("[calib] cannot read %s: %s" % (self.out_path, e))
             return
-        if not isinstance(cfg, dict):
-            self.say("[calib] %s is not a mapping at the top level, refusing "
-                     "to merge" % self.out_path)
+        if cfg is None:
             return
         self.existing = cfg
         note = (", keeping its tuned noise model"
@@ -2567,20 +2533,15 @@ class CalibWindow(QtWidgets.QMainWindow):
         am, gm = np.asarray(am), np.asarray(gm)
         if r is not None:
             am, gm = r @ am, r @ gm
-        a = am @ (np.asarray(acc) - np.asarray(ab))
-        w = gm @ (np.asarray(gyr) - np.asarray(gb))
-        return a, w
+        return (imu_tk.apply_calib(acc, am, ab),
+                imu_tk.apply_calib(gyr, gm, gb))
 
     def _apply_live_mag(self, mag):
         """The live magnetometer sample after this session's calibration."""
         if self.magcal is None or mag is None:
             return None
-        r = self._housing_matrix()
-        m = np.asarray(self.magcal.matrix, dtype=float)
-        if r is not None:
-            m = r @ m
-        return m @ (np.asarray(mag, dtype=float)
-                    - np.asarray(self.magcal.bias, dtype=float))
+        m = self.magcal.rotated(self._housing_matrix())
+        return mag_calib.apply_calib(mag, m.matrix, m.bias)
 
     def set_live_cal(self, cal, source):
         """Use `cal` (acc_M, acc_b, gyr_M, gyr_b) for the live view."""

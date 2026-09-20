@@ -41,7 +41,7 @@ and therefore the heading, is the same either way, but INSLIB gates the
 magnetometer on the field strength agreeing with its own WMM lookup, so
 the real value is the better answer whenever it is known.
 
-Used by tools/inslib_ubx_imu_calib.py and tools/inslib_calib_gui.py, which
+Used by tools/inslib_imu_calib.py and tools/inslib_calib_gui.py, which
 record the session. Nothing here does I/O.
 
 (c) Jan Zwiener (jan@zwiener.org)

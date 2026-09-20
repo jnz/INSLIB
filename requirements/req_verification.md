@@ -468,3 +468,301 @@ it on would leave the filter dropping every following epoch as too old
 converged state). Small backwards steps shall remain untouched: the
 streams share one unwrap state deliberately, and the barometer trailing
 the IMU by well under a millisecond is normal, not an anomaly.
+
+## REQ-VER-028 — Config list values in both YAML forms
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tests/test_yaml.c:scenario_block_sequence; Test: tests/test_yaml.c:scenario_malformed_list
+
+The C config reader shared by the replay and live harnesses shall read a
+list value written as a YAML block sequence
+
+```yaml
+gnss:
+  leverarm_frd:
+  - -0.01
+  - 0.04
+  - -0.015
+```
+
+identically to the inline `[-0.01, 0.04, -0.015]` the converters emit, and
+shall reject a list it cannot read in full, naming the offending key,
+instead of leaving the destination at whatever it held.
+
+This is REQ-VER-025's rule applied to the value rather than the key. A
+dataset directory is read by both `tools/replay.c` (this reader) and
+`python/replay.py` (PyYAML), and PyYAML accepts both forms. A form only
+one of them understands therefore does not produce an error anywhere: it
+produces two harnesses that disagree about the same file, each convinced
+it applied the operator's configuration. `datasets/tunnel/config.yaml` was
+in exactly that state, its lever arm reaching one harness and not the
+other.
+
+Reading the list in full is part of the same rule. A list shorter than the
+destination, or one whose text does not convert, is a mistake in the
+config and shall be reported as one. Filling the missing entries with
+zeros hands the harness a lever arm, a misalignment matrix or a fixed bias
+nobody wrote down, which is the failure REQ-VER-025 exists to prevent.
+
+The reader stays a two-level YAML subset otherwise. A nested mapping is
+still unsupported, and needs no separate rule here: its inner keys reach
+the harness under the outer section and are refused by REQ-VER-025.
+
+## REQ-VER-029 — Coasting re-acquisition error as a scored metric
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main
+
+The replay harness shall, for every gap in the position-aiding stream longer
+than `score: coast_gap_min_sec`, report the filter's position error at the
+first IMU epoch at or after the end of that gap, scored against the
+reference epoch nearest to that IMU epoch, together with the gap's duration
+and the straight-line distance across it, and shall gate that error on
+`score: lim_coast_exit_err_m` when one is configured. A reference epoch
+further than half a second, or half the gap, from that IMU epoch shall not
+be used, and the gap then counts as having no reference epoch.
+
+The sample is tied to the IMU epoch and not to the arrival of a reference
+row. With `score: ref_delay_ms` (REQ-VER-030) the reference rows no longer
+sit on the fix timestamps: at a 200 ms delay and a 5 Hz receiver the row
+describing the end of the gap lands a fraction of a millisecond before or
+after it, depending on the receiver's timestamp jitter. Waiting for a row
+at or after the gap end then skips that row whenever an IMU sample falls in
+between, and scores the next one, 200 ms later, after the returning fix has
+already been fused.
+
+A dataset whose reference comes from the same receiver as the aiding cannot
+be scored inside such a gap at all: no fixes means no reference. What the
+whole-run position RMS does score there is the state the filter is in once
+aiding returns, and it scores it perversely. A filter that coasts through
+and lands a few hundred metres out contributes those epochs to the RMS; one
+that gives the solution up produces no output at the same epochs, re-derives
+its position from the returning fix and contributes nothing. On
+`datasets/tunnel_coast` the second behaviour scores 0.86 m against the
+first's 42.7 m, so a limit on the whole-run RMS rewards discarding the
+coasting result. This metric asks the question that matters instead, in the
+one place the data can answer it: how far from the truth is the filter when
+it comes back out.
+
+Having no solution at that epoch shall count as a failure of the gate, not
+as a skipped epoch. Without that rule the metric inherits the same defect it
+exists to remove, since a filter that gave up has no error to report.
+
+The gap is a property of the aiding FILE, not of what the filter chose to
+fuse: a harness that measured the gap the filter experienced would report a
+shorter outage whenever the gate rejected fixes, which is the one case where
+the number has to stay comparable across configurations.
+
+The error shall be sampled BEFORE that epoch's measurements are fused. The
+returning fix snaps the position onto the truth in the same epoch it arrives,
+so a sample taken after the update reports how good the fix was, not how far
+the coasting drifted. Against a receiver whose first fixes out of a tunnel
+are unusable the difference stays hidden -- they are gated out and nothing
+snaps -- and it appears in full against one that comes back clean: on the
+Galileo-HAS drive five of eight simulated 100 s outages read 0.0 m that way,
+where the coasting had in fact drifted 200 to 550 m.
+
+The first reference epoch after the gap is used as it comes. The fixes a
+receiver emits in the first seconds out of a tunnel carry accuracies that
+are unusable for aiding (6275 m and 229 m horizontal on the two Wattkopf
+recordings), but their POSITION is close enough to score a coasting error of
+hundreds of metres against, and `ref.csv` carries no accuracy column that
+would let the harness pick a better epoch. Waiting a fixed dwell instead
+would score a partly re-converged filter and hide exactly what the metric is
+for.
+
+## REQ-VER-030 — Reference epochs carry their own time of validity
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main
+
+The replay harness shall accept `score: ref_delay_ms`, stating that a
+reference row timestamped T is in fact valid at T minus that delay, and shall
+score every comparison at the row's true time of validity.
+
+A dataset whose `ref.csv` is derived from the same receiver output that feeds
+`gnss.csv` inherits that output's latency. `gnss: delay_ms` tells the FILTER
+how old a fix is, so the filter correctly reports where the vehicle is now;
+the reference row still describes where it was `delay_ms` ago. Comparing the
+two at a shared timestamp therefore penalises the filter by speed times
+delay, and penalises it MORE the better it compensates. On
+`datasets/tunnel` (delay_ms 200, median speed 19.8 m/s) that product is
+3.96 m against a scored position error of mean +3.850 m with a standard
+deviation of 1.319 m: the whole reported bias is the artefact, and the
+regression limit that gates it is gating a time shift.
+
+Where the reference comes out of the same output as the aiding, the key
+shall mirror `gnss: delay_ms`. The score cannot separate the two readings of
+the same symptom -- a reference that really is `delay_ms` old, and a filter
+that anchors a timely fix `delay_ms` too early -- because both put the filter
+`delay_ms` times speed ahead of the reference row. Tying the two keys
+together keeps that ambiguity in one place: if the declared latency turns out
+to be wrong, both numbers move together, and no run scores well by pairing a
+wrong latency with a compensating reference shift.
+
+The key shall stay at 0 wherever the reference is independent of the aiding
+even when a delay is configured, which is the case for every other dataset
+carrying one: `datasets/crazyflie/*` scores against Lighthouse,
+`datasets/simulated/E_gnss_delay` against synthetic truth. It shall also stay
+at 0 where a dataset already models the latency in its DATA rather than in
+its config: `datasets/crazyflie/motors_off_time_delay_200_ms` shifts the
+`gnss.csv` timestamps by +200 ms and leaves `ref.csv` on the true time,
+which is the construction this key exists to make unnecessary.
+
+A nonzero `ref_delay_ms` together with `aiding: ref` shall be refused. There
+the reference IS the aiding, so a latency belongs in `gnss: delay_ms`, and
+shifting the reference would move the measurements with it.
+
+## REQ-VER-031 — Tunnel dataset that coasts through
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main
+
+The suite shall carry a committed real-sensor recording of a road tunnel
+passage the filter survives (`datasets/tunnel_nhc/`, a u-blox X20P
+NAV-PVT/NAV-COV car log with Galileo HAS active, across a 97.8 s total GNSS
+blackout, 1877 m chord at 15 to 21 m/s, with barometer and magnetometer), and
+gate it on the coasting re-acquisition error of REQ-VER-029 in `make
+datasets` and `make test`.
+
+This is the branch `datasets/tunnel` does not cover. That recording drives
+the coasting window to expiry and the 3D solution to a quality-loss re-arm on
+purpose; this one keeps the solution up for the whole outage and lands on the
+returning fixes. Both pass the SAME structure, the Wattkopf tunnel near
+Ettlingen, but in opposite directions: this one enters at the portal the
+other leaves by (66 m and 76 m between the corresponding fixes, chords
+1877 m and 1862 m) and descends 17 m where the other climbs 22 m. They are
+therefore two passages of one geometry rather than independent evidence
+about tunnels. What differs besides the branch and the direction is the
+hardware: 10 Hz fixes at 0.45 m reported accuracy over a 500 Hz IMU there,
+5 Hz at 0.07 m over an 800 Hz IMU here, block-averaged to 200 Hz for the
+repository and trimmed to the stretch from the first fix to 30 s after the
+tunnel exit.
+
+It is also the only committed dataset with the non-holonomic lateral
+constraint (REQ-NAV-077) enabled, so it is where a regression in that
+constraint shows up on real data rather than in a synthetic scenario.
+
+The whole-run position RMS is deliberately NOT gated here. On a dataset with
+a real outage it scores the wrong thing: a filter that abandons the coasting
+produces no output at the expensive epochs and so lands a better RMS than one
+that coasts through. REQ-VER-029's number replaces it.
+
+That gate shall be a regression tripwire, not a plausibility bound: the limit
+sits 1 m above the observed exit error, so a change that costs the coast a
+metre fails `make test`. This is affordable because the number is
+reproducible far below that. The exit errors of this dataset and
+`datasets/tunnel_odometry`, and the position RMS of `datasets/tunnel`, agree
+to the millimetre across gcc 11 and gcc 15, clang 14, -O0 to -O3, and with
+FMA contraction on and off. `datasets/tunnel`, which gives the coasting up by
+design, gates its whole-run position and ellipsoid height RMS 0.25 m above the
+observed values instead. A limit shall be retightened after an intentional improvement, since
+a stale margin hides the next regression of the same size.
+
+The IMU is block-averaged from 800 Hz to 200 Hz: the mean over N samples is
+the block's summed delta-theta and delta-v divided by its own dt, so the
+integral the strapdown forms is unchanged. On this recording that moves the
+tunnel exit error by 0.02 m against the full-rate stream. Plain decimation is
+not equivalent and shall not be used: it aliases the vibration.
+
+The recording shall not be trimmed at the front. Its only standstill is at the
+very start, and the auto-ZUPTs there are load-bearing: cutting the recording to
+300 s or 200 s before the tunnel removes all 194 of them and takes the exit
+error from 36.1 m to 42.8 m and 43.4 m. Those three figures were measured
+while the metric of REQ-VER-029 still sampled after the returning fix had
+been fused. Sampled ahead of it, the untrimmed recording exits at 91.7 m, and
+at 285.5 m with the lateral constraint disabled.
+
+## REQ-VER-032 — Odometry tunnel dataset
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: tools/replay.c:main
+
+The suite shall carry a committed real-sensor recording that aids the filter
+with a measured wheel speed (REQ-NAV-068) across a total GNSS outage
+(`datasets/tunnel_odometry/`, a car log with u-blox X20P NAV-PVT/NAV-COV,
+Galileo HAS active, OBD2 PID 0x0D speed frames, barometer and magnetometer,
+across a 100.6 s blackout and a 1875 m chord), and gate it on the coasting
+re-acquisition error of REQ-VER-029 in `make datasets` and `make test`.
+
+It is the only real-data check of the speed aiding, which is otherwise
+verified in a synthetic scenario only. The gate shall therefore be tight
+enough to fail when the odometry stops contributing, not only when the
+coasting breaks: the exit error is 22.7 m with the speed aiding and 29.2 m
+with it disabled. Like REQ-VER-031 the limit sits 1 m above the observed
+value (23.7 m).
+
+The speed scale shall be calibrated in the dataset's config, and that
+calibration shall not use the scored outage. OBD2 speed on this car reads
+about 1.8 percent low against the GNSS horizontal speed, estimated on the
+stretch before the tunnel alone. Left at 1.0 the same aiding lands the exit at
+55.4 m, worse than no odometry at all, which is a failure the tight gate also
+catches.
+
+The tunnel is the Wattkopf tunnel again, driven in the direction of
+`datasets/tunnel` (the corresponding fixes lie 27 m and 10 m apart, chords
+1875 m and 1862 m), so together with REQ-VER-031 these are three passages of
+one structure rather than independent evidence about tunnels. What this
+recording adds is the speed channel.
+
+It is cut out of a 45 min drive, from inside the standstill before the tunnel
+to 30 s after the tunnel exit, so it keeps the auto-ZUPT phase, and its IMU is
+block-averaged from 800 Hz to 200 Hz as in REQ-VER-031.
+
+## REQ-VER-033 — Static worst-case stack usage analysis
+
+- **Status:** verified
+- **Parent:** REQ-SYS-019
+- **Verification:** Demonstration: make stack (part of make check-all) compiles src/ and KFCore with the host gcc, make stack in embedded/stm32f429 compiles the whole firmware with the target toolchain, both with -fcallgraph-info=su, and both exit non-zero on recursion, VLA/alloca, an unresolved function pointer call, a library call without a stack figure or a budget overrun, the firmware run also when main() plus nested interrupts exceed _Min_Stack_Size
+
+`scripts/stack_usage.py` shall compile the given sources and compute the
+worst-case stack of every entry point as its own frame plus the largest worst
+case among its callees, from the frame sizes and call edges GCC reports with
+`-fcallgraph-info=su`. The call graph is taken after inlining and cloning,
+and static functions are qualified with their file, so equal names in
+different files do not merge.
+
+It runs in two places:
+
+- `make stack` in the top level Makefile compiles `src/` and KFCore with the
+  compiler at hand (`$(CC)`, typically x86_64) and gates the public API
+  functions against the x86_64 budgets in `scripts/stack_usage.cfg`. It is
+  part of `make check-all` and thereby of the public CI.
+- `make stack` in `embedded/stm32f429` compiles every source of the firmware
+  with its target toolchain and build flags, reading
+  `embedded/stm32f429/stack_usage.cfg` after the library config. It gates the
+  library entry points against Cortex-M4F budgets and checks that main() plus
+  the worst interrupt handler and exception frame per nesting level fit into
+  `_Min_Stack_Size` of the linker script, so the reserved stack is verified
+  instead of assumed.
+
+The run shall fail on everything that turns the figure into a guess:
+
+- a cycle in the call graph (recursion),
+- a variable length array or alloca, or a frame GCC reports as dynamic
+  without a bound,
+- a call through a function pointer whose targets are not listed in
+  `scripts/stack_usage.cfg`,
+- a call into a function that is not compiled by the analysis and has no
+  stack figure in `scripts/stack_usage.cfg`,
+- a worst case above its budget, or a budget line that matches no function,
+- for the firmware, a program stack above the reserved one.
+
+The target's library figures (newlib, libgcc) shall be measured, not
+estimated: taken from the disassembly of the toolchain's libraries along
+their deepest call chain and rounded up. The host's glibc figures are
+generous constants, which is enough for a regression gate on the library's
+own frames. A fixed margin covers the compiler generated helper calls some
+GCC releases do not record in the call graph. The budgets shall leave enough
+room that a different GCC release does not fail the gate, but not so much
+that a new large frame on the per-epoch path goes unnoticed.
+
+Not covered: link time optimization, and a user log sink beyond the figure
+assumed for it. Function pointer targets are listed by hand in the configs,
+as globs where the runtime choice is not visible to the compiler, which
+yields an upper bound.

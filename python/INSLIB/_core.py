@@ -165,6 +165,12 @@ class _CfgStruct(ctypes.Structure):
         ("gnss_vel_noise_acc_scale_ver", ctypes.c_float),
         ("gnss_vel_noise_acc_window_sec", ctypes.c_float),
         ("gnss_min_delay_ms", ctypes.c_int32),
+        # Non-holonomic lateral velocity constraint (REQ-NAV-077), appended
+        # at the end to keep every offset above it stable.
+        ("automotive_lateral_constraint", ctypes.c_int32),
+        ("automotive_lateral_stddev_mps", ctypes.c_float),
+        ("automotive_lateral_max_yaw_rate", ctypes.c_float),
+        ("automotive_lateral_after_sec", ctypes.c_float),
     ]
 
 
@@ -194,9 +200,9 @@ def _bind_family(p):
     g("init").restype = ctypes.c_int
     g("set_imu").argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_float,
                              _f3, _f3, _f3, _f3]
-    g("set_gnss_pos_ecef").argtypes = [ctypes.c_void_p, _d3, _f3]
+    g("set_gnss_pos_llh").argtypes = [ctypes.c_void_p, _d3, _f3]
     g("set_gnss_vel_ned").argtypes = [ctypes.c_void_p, _f3, _f3]
-    g("set_gnss_pos_ecef_cov").argtypes = [ctypes.c_void_p, _d3, _f9]
+    g("set_gnss_pos_llh_cov").argtypes = [ctypes.c_void_p, _d3, _f9]
     g("set_gnss_vel_ned_cov").argtypes = [ctypes.c_void_p, _f3, _f9]
     g("set_gnss_pos_vel_cov").argtypes = [ctypes.c_void_p, _f9]
     g("set_gnss_leverarm_b").argtypes = [ctypes.c_void_p, _f3]
@@ -223,7 +229,7 @@ def _bind_family(p):
     for n in ("is_ready", "deadreckoning_ms"):
         g(n).argtypes = [ctypes.c_void_p]
         g(n).restype = ctypes.c_int
-    for n in ("get_position_ecef", "get_origin_ecef"):
+    for n in ("get_position_ecef", "get_origin_ecef", "get_latlonh"):
         g(n).argtypes = [ctypes.c_void_p, _d3]
         g(n).restype = ctypes.c_int
     for n in ("get_position_local", "get_velocity_ned", "get_omega_b_nb",
@@ -377,6 +383,13 @@ class Config:
                                         # speed floor for automotive_mode
     automotive_min_yaw_stddev: float = 0.0  # [rad], 0 -> C default (5 deg);
                                         # floor on automotive_mode's fused
+    automotive_lateral_constraint: bool = False  # non-holonomic lateral
+                                        # velocity constraint (REQ-NAV-077),
+                                        # needs automotive_mode
+    automotive_lateral_stddev_mps: float = 0.0  # [m/s], 0 -> C default
+    automotive_lateral_max_yaw_rate: float = 0.0  # [rad/s], 0 -> C default
+    automotive_lateral_after_sec: float = 0.0  # [s], 0 -> C default,
+                                        # negative -> no delay
                                         # yaw stddev. Raise it where the
                                         # course-equals-heading assumption is
                                         # itself looser than a car's (e.g.
@@ -524,6 +537,7 @@ class Config:
         _bools = ("auto_init", "allow_unlimited_deadreckoning",
                   "auto_zupt_disable", "mag_field_check_disable",
                   "estimate_mag_bias", "automotive_mode", "chi2_disable",
+                  "automotive_lateral_constraint",
                   "gnss_init_dwell_disable", "gnss_stop_disable",
                   "baro_height_disable", "auto_zupt_velocity_blind_disable")
         _vec3 = ("rpy_init_stddev_rad", "gyr_bias_init_rps", "magnetic_n",
@@ -621,23 +635,28 @@ class _Base:
         # row-major (i,j)=flat[3i+j] -> column-major out[i+3j]=flat[3i+j]
         return _f9(*[flat[3 * i + j] for j in range(3) for i in range(3)])
 
-    def gnss_pos(self, ecef, var_ned, delay_ms=0):
-        """GNSS position (WGS84 ECEF [m]). ``var_ned`` is either the NED
-        variance diagonal (3 values [m^2]) or a full 3x3 NED covariance
-        (nested rows or flat row-major length 9). ``delay_ms`` states how
-        old the fix is; the residual is then anchored in the state
-        history (delayed fusion)."""
+    def gnss_pos_llh(self, llh, var_ned, delay_ms=0):
+        """GNSS position as the receiver reports it: latitude [rad],
+        longitude [rad], height above the WGS84 ellipsoid [m].
+        ``var_ned`` is the NED position variance, either a length-3
+        diagonal or a full 3x3; ``delay_ms`` is the fix's age at the
+        moment it is handed over.
+
+        This is the only position input: the filter builds its residual
+        from the geodetic difference to its own anchor. A source that is
+        natively ECEF converts first, e.g. with :func:`ecef_to_llh`, which
+        keeps that cost out of the filter's own worst case."""
         q9 = self._cov9(var_ned)
         if q9 is not None:
-            self._c("set_gnss_pos_ecef_cov")(self._h, _d3(*ecef), q9)
+            self._c("set_gnss_pos_llh_cov")(self._h, _d3(*llh), q9)
         else:
-            self._c("set_gnss_pos_ecef")(self._h, _d3(*ecef), _f3(*var_ned))
+            self._c("set_gnss_pos_llh")(self._h, _d3(*llh), _f3(*var_ned))
         if delay_ms:
             self._c("set_gnss_delay_ms")(self._h, int(delay_ms))
 
     def gnss_vel(self, vel_ned, var_ned):
         """GNSS NED velocity; ``var_ned`` diagonal (3) or full 3x3 like
-        :meth:`gnss_pos`."""
+        :meth:`gnss_pos_llh`."""
         q9 = self._cov9(var_ned)
         if q9 is not None:
             self._c("set_gnss_vel_ned_cov")(self._h, _f3(*vel_ned), q9)
@@ -760,6 +779,14 @@ class _Base:
     def position_ecef(self):
         out = _d3()
         return list(out) if self._c("get_position_ecef")(self._h, out) else None
+
+    def position_llh(self):
+        """Position as the filter holds it: [lat_rad, lon_rad, height_m]
+        above the WGS84 ellipsoid, None until the filter is initialized.
+        :meth:`position_ecef` is built FROM this, so take this one when
+        degrees are what you want."""
+        out = _d3()
+        return list(out) if self._c("get_latlonh")(self._h, out) else None
 
     def origin_ecef(self):
         """ECEF of the local NED frame origin (fixed at init). None until
@@ -904,9 +931,9 @@ def _fill_nav_state(st: State, h, rpy):
     v = h.velocity_ned()
     if v:
         st.vx_mps, st.vy_mps, st.vz_mps = v
-    ecef = h.position_ecef()
-    if ecef:
-        st.lat_rad, st.lon_rad, st.alt_m = ecef_to_llh(*ecef)
+    llh = h.position_llh()
+    if llh:
+        st.lat_rad, st.lon_rad, st.alt_m = llh
     q = h.quaternion()
     if q:
         st.qw, st.qx, st.qy, st.qz = q
@@ -940,8 +967,9 @@ def rpy_to_quat(roll, pitch, yaw):
 
 def llh_to_ecef(lat, lon, h):
     """WGS84 geodetic latitude/longitude [rad] and ellipsoidal height [m]
-    to ECEF [m]. Inverse of :func:`ecef_to_llh`; handy for feeding a known
-    reference position to :meth:`Navigator.gnss_pos` (which expects ECEF)."""
+    to ECEF [m]. Inverse of :func:`ecef_to_llh`. The filter itself never
+    needs this -- :meth:`Navigator.gnss_pos_llh` takes geodetic input --
+    so it is here for callers that have to talk ECEF to something else."""
     sl, cl = math.sin(lat), math.cos(lat)
     n = _WGS84_A / math.sqrt(1.0 - _WGS84_E2 * sl * sl)
     x = (n + h) * cl * math.cos(lon)

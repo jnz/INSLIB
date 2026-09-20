@@ -35,6 +35,25 @@ static void wmm_cell(float lat_deg, float lon_deg, int step, int* lat_idx, float
     *lon_frac = (lon_off - (float)(*lon_idx) * s) / s;
 }
 
+/* Helper function: Fold an angle in centidegrees into [-18000, +18000). */
+static float wmm_wrap_cdeg(float cdeg)
+{
+    cdeg = fmodf(cdeg + 18000.0f, 36000.0f);
+    if (cdeg < 0.0f) { cdeg += 36000.0f; }
+    return cdeg - 18000.0f;
+}
+
+/* Helper function: One declination grid node in centidegrees, interpolated in
+ * time. Both epoch values are wrapped angles, so the secular change is taken
+ * the short way round. Without that, a node that crosses the +/-180 cut
+ * between the two epochs would appear to sweep ~350 deg over five years. */
+static float wmm_decl_node_cdeg(int lat_idx, int lon_idx, float tf)
+{
+    const float start = (float)wmm_decl_start[lat_idx][lon_idx];
+    const float end   = (float)wmm_decl_end[lat_idx][lon_idx];
+    return start + wmm_wrap_cdeg(end - start) * tf;
+}
+
 /* @satisfies REQ-SYS-013 */
 float magnetic_declination_deg(float lat_deg, float lon_deg, float year)
 {
@@ -45,19 +64,24 @@ float magnetic_declination_deg(float lat_deg, float lon_deg, float year)
     /* Linear interpolation/extrapolation in time between the two epochs. */
     const float tf = (year - WMM_EPOCH_START) / (WMM_EPOCH_END - WMM_EPOCH_START);
 
-    const float v00 = (float)wmm_decl_start[li][oi] +
-                      ((float)wmm_decl_end[li][oi] - (float)wmm_decl_start[li][oi]) * tf;
-    const float v01 = (float)wmm_decl_start[li][oi + 1] +
-                      ((float)wmm_decl_end[li][oi + 1] - (float)wmm_decl_start[li][oi + 1]) * tf;
-    const float v10 = (float)wmm_decl_start[li + 1][oi] +
-                      ((float)wmm_decl_end[li + 1][oi] - (float)wmm_decl_start[li + 1][oi]) * tf;
-    const float v11 =
-        (float)wmm_decl_start[li + 1][oi + 1] +
-        ((float)wmm_decl_end[li + 1][oi + 1] - (float)wmm_decl_start[li + 1][oi + 1]) * tf;
+    const float v00 = wmm_decl_node_cdeg(li, oi, tf);
+    float       v01 = wmm_decl_node_cdeg(li, oi + 1, tf);
+    float       v10 = wmm_decl_node_cdeg(li + 1, oi, tf);
+    float       v11 = wmm_decl_node_cdeg(li + 1, oi + 1, tf);
+
+    /* Declination is a wrapped angle, so two neighbouring nodes can sit on
+     * opposite sides of the +/-180 cut while being only a few degrees apart
+     * (this happens along the agonic line trailing each magnetic dip pole).
+     * Put the neighbours on the same branch as v00 before interpolating,
+     * otherwise the interpolation runs the long way round and returns a value
+     * off by up to 180 deg. */
+    v01 = v00 + wmm_wrap_cdeg(v01 - v00);
+    v10 = v00 + wmm_wrap_cdeg(v10 - v00);
+    v11 = v00 + wmm_wrap_cdeg(v11 - v00);
 
     const float bottom = v00 + (v01 - v00) * of;
     const float top    = v10 + (v11 - v10) * of;
-    return (bottom + (top - bottom) * lf) / 100.0f;
+    return wmm_wrap_cdeg(bottom + (top - bottom) * lf) / 100.0f;
 }
 
 /* @satisfies REQ-SYS-013 */
@@ -92,6 +116,50 @@ float magnetic_field_strength_uT(float lat_deg, float lon_deg)
     const float bottom = v00 + (v01 - v00) * of;
     const float top    = v10 + (v11 - v10) * of;
     return bottom + (top - bottom) * lf;
+}
+
+/* Helper function: Great-circle distance between two positions [deg]. */
+static float wmm_gc_distance_deg(float lat_a, float lon_a, float lat_b, float lon_b)
+{
+    const float a  = lat_a * WMM_DEG2RAD;
+    const float b  = lat_b * WMM_DEG2RAD;
+    const float dl = (lon_a - lon_b) * WMM_DEG2RAD;
+
+    float c = sinf(a) * sinf(b) + cosf(a) * cosf(b) * cosf(dl);
+    if (c > 1.0f) { c = 1.0f; }
+    if (c < -1.0f) { c = -1.0f; }
+    return acosf(c) / WMM_DEG2RAD;
+}
+
+/* @satisfies REQ-SYS-018 */
+float magnetic_dip_pole_distance_deg(float lat_deg, float lon_deg)
+{
+    /* Same latitude clamp the grid queries apply, so an out-of-range caller
+       sees one consistent position. Longitude needs no wrap, the great-circle
+       formula only uses the cosine of the difference. */
+    if (lat_deg > 90.0f) { lat_deg = 90.0f; }
+    if (lat_deg < -90.0f) { lat_deg = -90.0f; }
+
+    /* How many dip poles exist is a measured property of the field, not an
+       invariant, so the table carries the count and this walks all of it.
+       Positions are tabulated at mid-epoch and not interpolated in time: the
+       drift over an epoch is well under a degree either side, which the
+       exclusion radius already carries as slack. */
+    float best = 180.0f;
+    int   i;
+    for (i = 0; i < WMM_DIP_POLE_COUNT; ++i)
+    {
+        const float d =
+            wmm_gc_distance_deg(lat_deg, lon_deg, wmm_dip_pole[i][0], wmm_dip_pole[i][1]);
+        if (d < best) { best = d; }
+    }
+    return best;
+}
+
+/* @satisfies REQ-SYS-018 */
+bool magnetic_heading_reference_valid(float lat_deg, float lon_deg)
+{
+    return magnetic_dip_pole_distance_deg(lat_deg, lon_deg) >= MAGNETIC_DIP_POLE_EXCLUSION_DEG;
 }
 
 /* @satisfies REQ-SYS-013 */

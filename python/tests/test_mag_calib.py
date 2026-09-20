@@ -27,7 +27,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(REPO, "tools"))
 import inslib_frame_align as fa    # noqa: E402
 import inslib_mag_calib as mc      # noqa: E402
-import inslib_ubx_imu_calib as calib   # noqa: E402  (the config writer)
+import inslib_imu_calib as calib     # noqa: E402  (the config writer)
 
 G = 9.80665
 FIELD_UT = 48.5

@@ -12,6 +12,13 @@ Dropping every n-th sample instead would fold vibration into the signal band.
 Each block keeps the timestamp of its LAST sample, so that dt times the
 averaged rate spans exactly the interval the block covers.
 
+A capture can carry gaps in the IMU stream (a few stray samples before a
+long pause, a dropped USB burst). The input rate is therefore taken from the
+MEDIAN sample interval, not from the total span, which a single gap would
+shrink into a wrong decimation factor. The stream is also split at every gap
+and each contiguous stretch is decimated on its own, so no block ever
+averages samples from both sides of a gap.
+
 The other streams are already low rate and are copied unchanged.
 
 (c) Jan Zwiener (jan@zwiener.org)
@@ -20,6 +27,10 @@ The other streams are already low rate and are copied unchanged.
 import argparse
 import os
 import shutil
+
+# An interval this many times the median counts as a gap. Well above the
+# jitter a USB or UART timestamp shows, well below a real dropout.
+GAP_FACTOR = 5.0
 
 
 def read_imu(path):
@@ -49,6 +60,43 @@ def decimate(rows, factor):
     return out
 
 
+def median_interval_us(rows):
+    dts = sorted(b[0] - a[0] for a, b in zip(rows, rows[1:]))
+    return dts[len(dts) // 2]
+
+
+def split_at_gaps(rows, gap_us):
+    """Contiguous stretches of rows, cut wherever the interval exceeds gap_us."""
+    segments, start = [], 0
+    for i in range(1, len(rows)):
+        if rows[i][0] - rows[i - 1][0] > gap_us:
+            segments.append(rows[start:i])
+            start = i
+    segments.append(rows[start:])
+    return segments
+
+
+def decimate_stream(rows, hz):
+    """Decimate an IMU stream to about hz, robust to gaps.
+
+    Returns (out, rate_hz, factor, n_gaps). The factor comes from the median
+    interval, and every stretch between gaps is block-averaged separately,
+    dropping its own incomplete tail rather than borrowing samples across the
+    gap."""
+    dt_us = median_interval_us(rows)
+    if dt_us <= 0:
+        raise SystemExit("imu.csv: non-increasing timestamps, cannot estimate the rate")
+    rate = 1e6 / dt_us
+    factor = max(int(round(rate / hz)), 1)
+    segments = split_at_gaps(rows, GAP_FACTOR * dt_us)
+    if factor == 1:
+        return rows, rate, factor, len(segments) - 1
+    out = []
+    for seg in segments:
+        out.extend(decimate(seg, factor))
+    return out, rate, factor, len(segments) - 1
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -65,10 +113,7 @@ def main():
     if len(rows) < 2:
         raise SystemExit("%s: too few samples" % src_imu)
 
-    span = (rows[-1][0] - rows[0][0]) / 1e6
-    rate = (len(rows) - 1) / span
-    factor = max(int(round(rate / args.hz)), 1)
-    out = decimate(rows, factor) if factor > 1 else rows
+    out, rate, factor, n_gaps = decimate_stream(rows, args.hz)
 
     dst_imu = os.path.join(args.out, "imu.csv")
     with open(dst_imu, "w", newline="\n") as fh:
@@ -91,6 +136,9 @@ def main():
           "imu.csv %.1f -> %.1f MB"
           % (args.dataset, rate, rate / factor, factor, len(rows), len(out),
              before / 1048576.0, after / 1048576.0))
+    if n_gaps:
+        print("  %d gap(s) over %.0f x the median interval in imu.csv, each "
+              "stretch decimated separately" % (n_gaps, GAP_FACTOR))
 
 
 if __name__ == "__main__":

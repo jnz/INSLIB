@@ -256,7 +256,7 @@ void ins_quat_to_axis_angle(const float q[4], float axis[3], float* angle_rad)
     float qn[4] = {q[0], q[1], q[2], q[3]};
     ins_quat_normalize(qn);
 
-    /* Clamp to [-1, 1] (branchless) so acosf stays well-defined. */
+    /* Clamp to [-1, 1] so acosf stays well-defined. */
     const float w = fmaxf(-1.0f, fminf(1.0f, qn[0]));
 
     const float s = SQRTF((1.0f - w * w) > 0.0f ? (1.0f - w * w) : 0.0f);
@@ -281,6 +281,15 @@ void ins_quat_to_axis_angle(const float q[4], float axis[3], float* angle_rad)
  * ============================================================================
  */
 
+/* INS_WGS84_B and INS_WGS84_EP2 are stored as literals so the conversion
+   below needs no square root to set up, which makes them a second spelling of
+   INS_WGS84_A and INS_WGS84_E2. A _Static_assert would be the natural place
+   to hold the two spellings against each other, but the comparison is a
+   floating point one and C11 wants an integer constant expression there,
+   which clang rejects outright and gcc only tolerates outside -pedantic. The
+   check therefore lives in the test suite, see
+   test_ins_math.c:test_wgs84_constants_consistent. */
+
 void ins_ecef_to_latlonh(const double xyz[3], double* lat_rad, double* lon_rad, double* height_m)
 {
     const double a  = INS_WGS84_A;
@@ -292,19 +301,39 @@ void ins_ecef_to_latlonh(const double xyz[3], double* lat_rad, double* lon_rad, 
     const double p = sqrt(x * x + y * y);
     *lon_rad       = atan2(y, x);
 
-    /* Bowring's iterative method. Converges in 2-3 iterations. */
-    double lat = atan2(z, p * (1.0 - e2));
-    double h   = 0.0;
-    int    i;
-    for (i = 0; i < 6; ++i)
-    {
-        const double sl = sin(lat);
-        const double N  = a / sqrt(1.0 - e2 * sl * sl);
-        h               = p / cos(lat) - N;
-        lat             = atan2(z, p * (1.0 - e2 * N / (N + h)));
-    }
+    /* Bowring's closed form via the parametric (reduced) latitude theta.
+       One pass, no iteration, so the instruction sequence is the same for
+       every input, which is what a caller with a worst case execution time
+       to hold needs. The error against the converged solution grows with
+       height: below a micrometre up to aircraft altitudes, about a
+       millimetre at 400 km and a few decimetres at geostationary altitude.
+       Anything reaching past low orbit wants an iterative solution. */
+    const double theta = atan2(z * a, p * INS_WGS84_B);
+    const double st    = sin(theta);
+    const double ct    = cos(theta);
+    /* The denominator turns negative only for points within about 43 km of
+       the geocentre, where no position the filters work with can lie. It is
+       floored so such an input still comes back as a latitude inside
+       [-pi/2, pi/2] instead of one reflected past the pole. */
+    double den = p - e2 * a * ct * ct * ct;
+    if (den < 0.0) { den = 0.0; }
+    const double lat = atan2(z + INS_WGS84_EP2 * INS_WGS84_B * st * st * st, den);
+
+    /* N and the two height forms share sin(lat). cos(lat) comes from the
+       identity rather than from a second call to the trigonometric
+       library: it is only ever used where it is the larger of the two and
+       therefore well conditioned, and a double cosine is expensive on a
+       target without a double-precision FPU. */
+    const double sl = sin(lat);
+    const double cl = sqrt(1.0 - sl * sl); /* |lat| <= pi/2, so cos >= 0 */
+    const double N  = a / sqrt(1.0 - e2 * sl * sl);
+
+    /* p/cos(lat) collapses at the poles and z/sin(lat) collapses at the
+       equator, so the height is taken from whichever of the two divisors
+       is the larger. Both arms cost one division, the branch does not
+       make the run time depend on the input. */
     *lat_rad  = lat;
-    *height_m = h;
+    *height_m = (cl > fabs(sl)) ? (p / cl - N) : (z / sl - N * (1.0 - e2));
 }
 
 void ins_latlonh_to_ecef(double lat_rad, double lon_rad, double height_m, double xyz[3])
@@ -348,13 +377,19 @@ void ins_rotmat_n_to_e(double lat_rad, double lon_rad, float R[9])
     MAT_ELEM(R, 2, 2, 3, 3) = -sL;
 }
 
+/* @satisfies REQ-SYS-022 */
 void ins_calc_omega_n_in(double lat_rad, double height_m, const float vel_ned[3],
                          float omega_n_in[3], float omega_n_ie_out[3], float omega_n_en_out[3])
 {
-    const double sl = sin(lat_rad);
-    const double cl = cos(lat_rad);
-    const double a  = INS_WGS84_A;
-    const double e2 = INS_WGS84_E2;
+    /* Single precision throughout, which the magnitudes allow: the Earth
+       rate is 7.3e-5 rad/s and the transport rate is a velocity divided by
+       an Earth radius. */
+    const float lat = (float)lat_rad;
+    const float h   = (float)height_m;
+    const float sl  = sinf(lat);
+    const float cl  = cosf(lat);
+    const float a   = (float)INS_WGS84_A;
+    const float e2  = (float)INS_WGS84_E2;
 
     /* tan(lat) = sin/cos drives the vertical (azimuth) transport rate and
        diverges at the poles (cos -> 0): a north-slaved NED frame is
@@ -366,20 +401,19 @@ void ins_calc_omega_n_in(double lat_rad, double height_m, const float vel_ned[3]
        usable anyway) and leaves all lower latitudes untouched. copysign
        preserves the (physically non-negative) cos sign so out-of-range
        latitudes stay well-behaved too. */
-    const double cl_safe = copysign(fmax(fabs(cl), INS_POLE_COS_FLOOR), cl);
-    const double tl      = sl / cl_safe;
+    const float cl_safe = copysignf(fmaxf(fabsf(cl), INS_POLE_COS_FLOOR), cl);
+    const float tl      = sl / cl_safe;
 
-    const double denom      = 1.0 - e2 * sl * sl;
-    const double sqrt_denom = sqrt(denom);
-    const double Rn         = a * (1.0 - e2) / (denom * sqrt_denom); /* meridian */
-    const double Re         = a / sqrt_denom;                        /* prime vertical */
+    const float denom      = 1.0f - e2 * sl * sl;
+    const float sqrt_denom = sqrtf(denom);
+    const float Rn         = a * (1.0f - e2) / (denom * sqrt_denom); /* meridian */
+    const float Re         = a / sqrt_denom;                         /* prime vertical */
 
     /* Earth rotation rate in n-frame */
-    const float wie_n[3] = {(float)(INS_WGS84_OMEGA * cl), 0.0f, (float)(-INS_WGS84_OMEGA * sl)};
+    const float wie_n[3] = {(float)INS_WGS84_OMEGA * cl, 0.0f, -(float)INS_WGS84_OMEGA * sl};
 
-    const float wen_n[3] = {(float)((double)vel_ned[1] / (Re + height_m)),
-                            (float)(-(double)vel_ned[0] / (Rn + height_m)),
-                            (float)(-(double)vel_ned[1] * tl / (Re + height_m))};
+    const float wen_n[3] = {vel_ned[1] / (Re + h), -vel_ned[0] / (Rn + h),
+                            -vel_ned[1] * tl / (Re + h)};
 
     omega_n_in[0] = wie_n[0] + wen_n[0];
     omega_n_in[1] = wie_n[1] + wen_n[1];
@@ -418,42 +452,67 @@ void ins_gravity_ned(float lat_rad, float height_m, float gravity_n[3])
     gravity_n[2] = g;
 }
 
+/* Curvature radii of the meridian and the prime vertical at one latitude,
+   plus the cosine the east/longitude term divides by, all in single
+   precision.
+
+   The geodetic side of both mappings below is double because the caller
+   forms it by subtracting two absolute coordinates, and at a latitude of
+   about 0.85 rad a single-precision step is 0.38 m while the difference
+   itself is metre-scale. That cancellation is over by the time the radii
+   are needed: what happens here is a multiplication by about 6.4e6 m,
+   where single precision carries 8e-8 relative, under a micrometre on a
+   metre-scale residual. A double sine, cosine and square root cost around
+   ten times their single-precision counterparts on a part without a
+   double-precision FPU, and this sits on the per-epoch path.
+
+   cos(lat) is floored: toward the pole the east term divides by it, and a
+   single-precision cosine of a latitude that close to pi/2 can round to
+   zero or past it into the wrong sign. The floor keeps the mapping finite
+   and signed, the same bound the transport rate uses for tan(lat). */
+static void ins_curvature_radii(double lat_rad, double height_m, float* Rn_h, float* Re_h_cl)
+{
+    const float latf = (float)lat_rad;
+    const float sl   = sinf(latf);
+    float       cl   = cosf(latf);
+    const float e2   = (float)INS_WGS84_E2;
+    const float hf   = (float)height_m;
+
+    if (cl < (float)INS_POLE_COS_FLOOR) { cl = (float)INS_POLE_COS_FLOOR; }
+
+    const float denom      = 1.0f - e2 * sl * sl;
+    const float sqrt_denom = SQRTF(denom);
+    const float Rn         = (float)(INS_WGS84_A * (1.0 - INS_WGS84_E2)) / (denom * sqrt_denom);
+    const float Re         = INS_WGS84_A_F / sqrt_denom;
+
+    *Rn_h    = Rn + hf;
+    *Re_h_cl = (Re + hf) * cl;
+}
+
 void ins_dned_to_dlatlonh(const float dxyz_n[3], double lat_rad, double height_m,
                           double dlatlonh[3])
 {
-    const double sl = sin(lat_rad);
-    const double cl = cos(lat_rad);
-    const double a  = INS_WGS84_A;
-    const double e2 = INS_WGS84_E2;
-
-    const double denom      = 1.0 - e2 * sl * sl;
-    const double sqrt_denom = sqrt(denom);
-    const double Rn         = a * (1.0 - e2) / (denom * sqrt_denom);
-    const double Re         = a / sqrt_denom;
+    float Rn_h, Re_h_cl;
+    ins_curvature_radii(lat_rad, height_m, &Rn_h, &Re_h_cl);
 
     /* dnorth -> dlat; deast -> dlon, ddown -> -dheight */
-    dlatlonh[0] = (double)dxyz_n[0] / (Rn + height_m);
-    dlatlonh[1] = (double)dxyz_n[1] / ((Re + height_m) * cl);
+    dlatlonh[0] = (double)(dxyz_n[0] / Rn_h);
+    dlatlonh[1] = (double)(dxyz_n[1] / Re_h_cl);
     dlatlonh[2] = -(double)dxyz_n[2];
 }
 
 void ins_dlatlonh_to_dned(const double dlatlonh[3], double lat_rad, double height_m,
                           float dxyz_n[3])
 {
-    /* Exact inverse of ins_dned_to_dlatlonh (same curvature radii). */
-    const double sl = sin(lat_rad);
-    const double cl = cos(lat_rad);
-    const double a  = INS_WGS84_A;
-    const double e2 = INS_WGS84_E2;
-
-    const double denom      = 1.0 - e2 * sl * sl;
-    const double sqrt_denom = sqrt(denom);
-    const double Rn         = a * (1.0 - e2) / (denom * sqrt_denom);
-    const double Re         = a / sqrt_denom;
+    /* Exact inverse of ins_dned_to_dlatlonh: same radii, same cosine floor,
+       from the same helper, so the two stay each other's inverse wherever
+       either of them is defined. */
+    float Rn_h, Re_h_cl;
+    ins_curvature_radii(lat_rad, height_m, &Rn_h, &Re_h_cl);
 
     /* dlat -> dnorth; dlon -> deast; dheight -> -ddown */
-    dxyz_n[0] = (float)(dlatlonh[0] * (Rn + height_m));
-    dxyz_n[1] = (float)(dlatlonh[1] * (Re + height_m) * cl);
+    dxyz_n[0] = (float)dlatlonh[0] * Rn_h;
+    dxyz_n[1] = (float)dlatlonh[1] * Re_h_cl;
     dxyz_n[2] = (float)(-dlatlonh[2]);
 }
 

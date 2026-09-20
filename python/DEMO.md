@@ -1,6 +1,6 @@
-# Live demo: ins replay in PlotJuggler
+# Live demo: INSLIB replay in PlotJuggler
 
-A step-by-step walkthrough to watch the ins solution converge live and
+A step-by-step walkthrough to watch the INSLIB solution converge live and
 compare it against the ground truth, using the committed `fog` dataset
 replay (MEMS ADAHRS vs. an independent FOG strapdown attitude
 reference, see `datasets/fog/config.yaml`).
@@ -25,7 +25,7 @@ make pylib
 #    or the AppImage / snap / flatpak from https://plotjuggler.io
 ```
 
-The `fog` dataset is already committed under `datasets/fog/` — no
+The `fog` dataset is already included under `datasets/fog/` — no
 download step needed.
 
 Optional: `pip install pymavlink` if you also want the MAVLink output.

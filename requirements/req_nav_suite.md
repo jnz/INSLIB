@@ -337,6 +337,12 @@ WGS84 (as in REQ-SUITE-008) and report false otherwise, since without
 that anchor the origin is only the prescribed init position and the
 result would be a fictitious absolute coordinate.
 
+Both directions shall use the same geodetic step ins maintains its own
+anchor with (REQ-NAV-080), origin plus the local offset mapped through
+the curvature radii, so that a position converted here and the filter's
+own position book-keeping agree rather than answering the same question
+with two different approximations.
+
 ## REQ-SUITE-015 — Zero-rotation update drives the vertical zero-velocity update
 
 - **Status:** verified
@@ -644,3 +650,17 @@ Diagnostic only, like the three cross-checks it sits alongside
 (ins/ARS gyro bias, ins/baro_alt vertical velocity, ins/baro_alt
 height): it does not correct nav_suite_get_rpy() or force a resync,
 since neither estimator is authoritative over the other.
+
+## REQ-SUITE-024 — One ECEF to geodetic conversion per GNSS epoch
+
+- **Status:** deleted
+- **Parent:** REQ-SUITE-008
+- **Verification:** Inspection: superseded, there is no conversion left to share
+
+Superseded by REQ-NAV-079, which took ECEF out of the measurement
+interface. This requirement made ins publish the ECEF to geodetic
+conversion it performed for its own fusion so that the wrapper's vertical
+offset filter did not repeat it. With the fix stated geodetically there is
+no conversion on the epoch path at all: both consumers read the same
+number out of the measurement, and the accessor that carried it between
+them (ins_get_gnss_fix_llh) is gone with it.

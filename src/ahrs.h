@@ -243,6 +243,16 @@ typedef struct
        position is known, then yaw is referenced to true north). */
     float declination_rad;       /**< true = magnetic + declination */
     float mag_field_expected_uT; /**< WMM total field; 0 -> no gate */
+    bool  mag_heading_usable;    /**< false inside a dip pole exclusion zone,
+                                      where magnetometer yaw is dropped. True
+                                      until a position says otherwise */
+    bool declination_applied;    /**< true once a position outside every
+                                      exclusion zone has set declination_rad */
+    bool yaw_on_magnetic_north;  /**< true while the yaw carries magnetometer
+                                      fusion made before any declination was
+                                      applied, i.e. it points at magnetic
+                                      north and only a re-framing turns it
+                                      into a true heading */
 
     /* Error-state covariance as UDU factorisation: P = U * diag(d) * U'
        (U is n x n unit upper triangular, column-major). Fusion uses the

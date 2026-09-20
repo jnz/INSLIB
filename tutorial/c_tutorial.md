@@ -67,20 +67,18 @@ int main(void)
     /* Example data: a random spot in Munich, 520 m ellipsoidal. The
      * filter works in a local NED frame, this is where its origin sits. */
     const double lat = DEG2RAD(48.1372), lon = DEG2RAD(11.5756), h = 520.0;
-    double ref_ecef[3];
-    ins_latlonh_to_ecef(lat, lon, h, ref_ecef);
 
     /* 2. Initial values and noise assumptions. Zeros pick sane consumer
-     *    MEMS defaults, so we only set what we care about. x_ecef fixes the
+     *    MEMS defaults, so we only set what we care about. The position fixes the
      *    local-frame origin (a coarse guess is fine - auto_init refines the
      *    solution from the first real fix).
      *    Initial position is has 5 m precision, initial velocity is zero
      *    with a precision of 1 m/s, initial roll/pitch/yaw is 5° deg precise.
      */
     ins_init_t init = {0};
-    init.x_ecef[0] = ref_ecef[0];
-    init.x_ecef[1] = ref_ecef[1];
-    init.x_ecef[2] = ref_ecef[2];
+    init.llh[0] = lat;
+    init.llh[1] = lon;
+    init.llh[2] = h;
     init.pos_init_stddev_m = 5.0f; /* [m]   trust the first fix ~5 m  */
     init.vel_init_stddev_mps = 1.0f; /* [m/s] trust in init. velocity */
     init.rpy_init_stddev_rad[0] = DEG2RAD(5.0f);
@@ -121,16 +119,19 @@ int main(void)
         m.gyr.data[1]  = 0.0f;
         m.gyr.data[2]  = 0.0f;
 
-        /* GNSS once per second: ECEF position + a diagonal NED covariance
-         * (here 2 m horizontal, 4 m vertical 1-sigma -> variance in m^2). */
+        /* GNSS once per second: position + a diagonal NED covariance
+         * (here 2 m horizontal, 4 m vertical 1-sigma -> variance in m^2).
+         * The fix goes in as the receiver reports it, latitude, longitude
+         * and height, which is the form the filter fuses in. A source that
+         * is natively ECEF converts once with ins_ecef_to_latlonh(). */
         if (k % 100 == 0) {
-            m.gnss_pos.is_valid    = true;
-            m.gnss_pos.xyz_ecef[0] = ref_ecef[0];
-            m.gnss_pos.xyz_ecef[1] = ref_ecef[1];
-            m.gnss_pos.xyz_ecef[2] = ref_ecef[2];
-            m.gnss_pos.Qll_ned[0]  = 2.0f * 2.0f; /* var N */
-            m.gnss_pos.Qll_ned[4]  = 2.0f * 2.0f; /* var E */
-            m.gnss_pos.Qll_ned[8]  = 4.0f * 4.0f; /* var D */
+            m.gnss_pos.is_valid   = true;
+            m.gnss_pos.llh[0]     = lat;
+            m.gnss_pos.llh[1]     = lon;
+            m.gnss_pos.llh[2]     = h;
+            m.gnss_pos.Qll_ned[0] = 2.0f * 2.0f; /* var N */
+            m.gnss_pos.Qll_ned[4] = 2.0f * 2.0f; /* var E */
+            m.gnss_pos.Qll_ned[8] = 4.0f * 4.0f; /* var D */
         }
 
         ins_update(&ins, &m);
@@ -142,16 +143,13 @@ int main(void)
         return 0;
     }
 
-    double pos_ecef[3];
+    double llh[3];
     float  roll, pitch, yaw;
-    ins_get_position_ecef(&ins, pos_ecef);
+    ins_get_latlonh(&ins, llh); /* lat [rad], lon [rad], h over the ellipsoid */
     ins_get_rpy(&ins, &roll, &pitch, &yaw);
 
-    double out_lat, out_lon, out_h;
-    ins_ecef_to_latlonh(pos_ecef, &out_lat, &out_lon, &out_h);
-
     printf("position : lat %.6f deg  lon %.6f deg  h %.1f m\n",
-           out_lat / D2R, out_lon / D2R, out_h);
+           llh[0] / D2R, llh[1] / D2R, llh[2]);
     printf("attitude : roll %.2f  pitch %.2f  yaw %.2f deg\n",
            roll / D2R, pitch / D2R, yaw / D2R);
     return 0;
@@ -243,7 +241,7 @@ velocity alone. Set it to 1 if you want a combined fuse.
 You do not need GNSS. Any system that reports a local NED position -
 SteamVR lighthouse, UWB, a motion-capture rig, even a total station can aid
 the filter through `local_pos` instead. You still give a *coarse* Earth
-anchor at init (`x_ecef`), but only so the filter knows the local gravity
+anchor at init (`llh`), but only so the filter knows the local gravity
 and where true north is, it is never used as an aiding measurement.
 
 The only change from the example above is what you put in the measurement
@@ -251,7 +249,7 @@ each epoch:
 
 ```c
 /* A 10 Hz indoor tracker reporting position in the filter's local NED
- * frame (origin = the x_ecef you gave at init). 1 cm 1-sigma per axis. */
+ * frame (origin = the position you gave at init). 1 cm 1-sigma per axis. */
 if (k % 10 == 0) {
     m.local_pos.is_valid   = true;
     m.local_pos.pos_ned[0] = 1.5f;  /* north [m] */
@@ -304,6 +302,33 @@ have:
 
 Every field is documented in `src/ins.h` - this header is the reference
 for the whole API.
+
+## Calibrating your IMU (no fixture needed)
+
+A cheap MEMS IMU straight out of the box has bias, scale factor and axis
+misalignment errors that the filter can only partly estimate on its own,
+and a magnetometer is off by hard and soft iron. INSLIB includes a
+calibration tool that measures all of it without a turntable or a
+calibration rig, from one recording of your own sensor:
+
+1. Leave the unit completely still for about 20 s.
+2. Then pick it up, turn it to a new attitude (any, it does not have to be
+   level), put it down and hold it for a few seconds. Repeat 20 to 30
+   times.
+3. Log this as `imu.csv` (`t_us, gyr xyz [rad/s], acc xyz [m/s^2]`) and,
+   if you have one, `mag.csv` (`t_us, mag xyz [uT]`), FRD axes, one clock.
+
+```sh
+python3 tools/inslib_imu_calib.py --csv mysession/ -o config.yaml
+```
+
+The result lands in `config.yaml` as column-major 3x3 matrices and bias
+vectors in exactly the model the filter applies,
+`corrected = M * (raw - fixed_bias)`. Copy them into
+`opt.imu_acc_misalignment`, `opt.imu_gyr_misalignment`,
+`opt.imu_acc_fixed_bias`, `opt.imu_gyr_fixed_bias` and, for the
+magnetometer, `opt.mag_misalignment` / `opt.mag_fixed_bias`. The CSV
+path works with any IMU.
 
 ## Beyond the bare filter: `nav_suite`
 

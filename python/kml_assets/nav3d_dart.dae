@@ -7,10 +7,12 @@
   single fin hangs below the plate (belly/down marker). Model space is
   declared Z_UP with +Y forward, so it lines up directly with nav3d's
   own NED-style reasoning (only the up-axis sign differs from body FRD's
-  down-axis) -- see the axis-mapping comment in nav3d_kml.py.
+  down-axis), see the axis-mapping comment in nav3d_kml.py.
 -->
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
   <asset>
+    <created>2025-07-19T00:00:00Z</created>
+    <modified>2025-07-19T00:00:00Z</modified>
     <up_axis>Z_UP</up_axis>
   </asset>
   <library_materials>

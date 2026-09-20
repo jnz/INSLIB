@@ -26,8 +26,8 @@ keywords = ["navigation", "kalman-filter", "ins", "gnss", "imu", "ahrs"]
 [project.optional-dependencies]
 mavlink = ["pymavlink"]
 plot = ["matplotlib"]
-kml = ["simplekml"]
-replay = ["pyyaml", "pymavlink", "matplotlib", "simplekml"]
+kml = ["simplekml", "pyproj"]
+replay = ["pyyaml", "pymavlink", "matplotlib", "simplekml", "pyproj", "Pillow"]
 # The host-side tools in tools/: pyserial for the serial link,
 # pyubx2 for GNSS UBX decode, pymavlink for --mavlink.
 recv = ["pyserial", "pyubx2", "pymavlink"]

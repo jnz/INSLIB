@@ -53,6 +53,13 @@ def _llh_to_ecef(lat, lon, h):
             (n * (1.0 - _WGS84_E2) + h) * math.sin(lat))
 
 
+def _ecef_to_llh(x, y, z):
+    """For a recording that stores its fixes in ECEF: the filter takes
+    lat/lon/h, so the conversion happens here rather than inside it."""
+    from ._core import ecef_to_llh
+    return tuple(ecef_to_llh(x, y, z))
+
+
 # --------------------------------------------------------------------------
 # Unit conversions: every mapped field can declare its source unit; values
 # are converted to ins's conventions (SI, radians, Pa, int64 us).
@@ -354,13 +361,16 @@ def _peek_first_fix(gnss):
     return None
 
 
-def _fix_to_ecef(rec, fmt):
+def _fix_to_llh(rec, fmt):
+    """The fix as lat/lon/h in radians, the form the filter takes. A
+    recording that stores ECEF is converted here, in the caller, which is
+    where that cost belongs."""
     p = rec["pos"]
     if fmt == "llh_deg":
-        return _llh_to_ecef(math.radians(p[0]), math.radians(p[1]), p[2])
+        return (math.radians(p[0]), math.radians(p[1]), p[2])
     if fmt == "llh_rad":
-        return _llh_to_ecef(p[0], p[1], p[2])
-    return tuple(p)
+        return tuple(p)
+    return _ecef_to_llh(p[0], p[1], p[2])
 
 
 def _fix_pos_cov(rec, gnss):
@@ -473,9 +483,9 @@ def run(cfg_path, args):
             fix = next_gnss[1]
             next_gnss = next(gnss_iter, None)
         if fix is not None:
-            nav.gnss_pos(_fix_to_ecef(fix, gnss.pos_format),
-                         _fix_pos_cov(fix, gnss),
-                         delay_ms=gnss.delay_ms)
+            nav.gnss_pos_llh(_fix_to_llh(fix, gnss.pos_format),
+                             _fix_pos_cov(fix, gnss),
+                             delay_ms=gnss.delay_ms)
             if "vel_ned" in fix:
                 nav.gnss_vel(fix["vel_ned"], _fix_vel_cov(fix, gnss))
                 if "cov_pos_vel" in fix:

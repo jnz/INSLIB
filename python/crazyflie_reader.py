@@ -325,7 +325,7 @@ class Pipeline:
         self._t_prev = None
         self._n_imu = 0
         self._n_est = 0
-        self._fix = None          # pending (ecef, var3, yaw_ned) for on_imu
+        self._fix = None          # pending (llh, var3, yaw_ned) for on_imu
         self._fix_new = False
         self._baro_pa = None
         self._baro_new = False
@@ -368,7 +368,7 @@ class Pipeline:
         roll_ned, pitch_ned, yaw_ned = quat_to_rpy(q_ned)
         var3 = tuple(max(var3[i], self.var_floor[i]) for i in range(3))
         ecef, lat, lon, h = self._ned_to_llh(n, e, d)
-        self._fix = (ecef, var3, yaw_ned)
+        self._fix = ((lat, lon, h), var3, yaw_ned)
         self._fix_new = True
         self._cf = {"pos_ned": (n, e, d),
                     "att_deg": (math.degrees(roll_ned), math.degrees(pitch_ned),
@@ -397,8 +397,8 @@ class Pipeline:
         self._t_prev = t_us
         self.nav.imu(t_us, dt, acc_frd, gyr_frd, self.acc_var, self.gyr_var)
         if self._fix_new:
-            ecef, var3, yaw = self._fix
-            self.nav.gnss_pos(ecef, var3)
+            llh, var3, yaw = self._fix
+            self.nav.gnss_pos_llh(llh, var3)
             if yaw is not None and math.isfinite(yaw):
                 self.nav.yaw(yaw, self.yaw_stddev)
             self._fix_new = False

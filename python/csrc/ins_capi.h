@@ -238,6 +238,13 @@ extern "C"
         /* GNSS fusion rate limit (REQ-NAV-074): min time between two fused
            GNSS epochs [ms]. 0 -> ins's default (10 Hz), <0 -> no limit. */
         int32_t gnss_min_delay_ms;
+        /* Non-holonomic lateral velocity constraint (REQ-NAV-077).
+           Appended at the end for ctypes offset stability. */
+        int32_t automotive_lateral_constraint;   /**< 0/1 */
+        float   automotive_lateral_stddev_mps;   /**< [m/s], 0 -> default */
+        float   automotive_lateral_max_yaw_rate; /**< [rad/s], 0 -> default */
+        float   automotive_lateral_after_sec;    /**< [s], 0 -> default,
+                                                      negative -> no delay */
     } ins_cfg_t;
 
     /* Solution mode returned by ins_suite_get_mode (mirrors nav_suite_mode_t). */
@@ -258,13 +265,16 @@ extern "C"
 
     void ins_core_set_imu(void* h, int64_t t_us, float dt_sec, const float acc[3],
                           const float gyr[3], const float acc_var[3], const float gyr_var[3]);
-    void ins_core_set_gnss_pos_ecef(void* h, const double ecef[3], const float var_ned[3]);
+    /* The fix as latitude [rad], longitude [rad], height above the WGS84
+     * ellipsoid [m], the form the fusion works in (REQ-NAV-079). An
+     * ECEF-native source converts with ins_ecef_to_latlonh() first. */
+    void ins_core_set_gnss_pos_llh(void* h, const double llh[3], const float var_ned[3]);
     void ins_core_set_gnss_vel_ned(void* h, const float vel_ned[3], const float var_ned[3]);
     /* Full-covariance variants (column-major 3x3 NED blocks) and the
      * optional pos/vel cross block (element (i,j) = cov(pos_i, vel_j),
      * only consumed when both pos and vel are valid) -- together the full
      * 6x6 covariance of [pos; vel]. */
-    void ins_core_set_gnss_pos_ecef_cov(void* h, const double ecef[3], const float Qll_ned[9]);
+    void ins_core_set_gnss_pos_llh_cov(void* h, const double llh[3], const float Qll_ned[9]);
     void ins_core_set_gnss_vel_ned_cov(void* h, const float vel_ned[3], const float Qll_ned[9]);
     void ins_core_set_gnss_pos_vel_cov(void* h, const float Q_pos_vel_ned[9]);
     void ins_core_set_gnss_leverarm_b(void* h, const float lever_b[3]);
@@ -319,6 +329,11 @@ extern "C"
     int ins_core_is_ready(void* h);
     int ins_core_deadreckoning_ms(void* h);
     int ins_core_get_position_ecef(void* h, double out_ecef[3]);
+    /* The geodetic anchor as the filter holds it: lat [rad], lon [rad],
+     * height over the ellipsoid [m]. Cheaper and more direct than taking
+     * the ECEF above and converting it back, which is where it comes from
+     * (REQ-NAV-078). */
+    int ins_core_get_latlonh(void* h, double out_llh[3]);
     int ins_core_get_position_local(void* h, float out_ned[3]);
     int ins_core_get_velocity_ned(void* h, float out_ned[3]);
     int ins_core_get_quaternion(void* h, float out_wxyz[4]);
@@ -368,9 +383,9 @@ extern "C"
 
     void ins_suite_set_imu(void* h, int64_t t_us, float dt_sec, const float acc[3],
                            const float gyr[3], const float acc_var[3], const float gyr_var[3]);
-    void ins_suite_set_gnss_pos_ecef(void* h, const double ecef[3], const float var_ned[3]);
+    void ins_suite_set_gnss_pos_llh(void* h, const double llh[3], const float var_ned[3]);
     void ins_suite_set_gnss_vel_ned(void* h, const float vel_ned[3], const float var_ned[3]);
-    void ins_suite_set_gnss_pos_ecef_cov(void* h, const double ecef[3], const float Qll_ned[9]);
+    void ins_suite_set_gnss_pos_llh_cov(void* h, const double llh[3], const float Qll_ned[9]);
     void ins_suite_set_gnss_vel_ned_cov(void* h, const float vel_ned[3], const float Qll_ned[9]);
     void ins_suite_set_gnss_pos_vel_cov(void* h, const float Q_pos_vel_ned[9]);
     void ins_suite_set_gnss_leverarm_b(void* h, const float lever_b[3]);
@@ -519,6 +534,11 @@ extern "C"
     int ins_suite_is_ready(void* h);
     int ins_suite_deadreckoning_ms(void* h);
     int ins_suite_get_position_ecef(void* h, double out_ecef[3]);
+    /* The geodetic anchor as the filter holds it: lat [rad], lon [rad],
+     * height over the ellipsoid [m]. Cheaper and more direct than taking
+     * the ECEF above and converting it back, which is where it comes from
+     * (REQ-NAV-078). */
+    int ins_suite_get_latlonh(void* h, double out_llh[3]);
     int ins_suite_get_position_local(void* h, float out_ned[3]);
     int ins_suite_get_velocity_ned(void* h, float out_ned[3]);
     int ins_suite_get_quaternion(void* h, float out_wxyz[4]);

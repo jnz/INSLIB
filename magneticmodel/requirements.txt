@@ -4,3 +4,8 @@
 # run `make wmm` when the WMM epoch changes or the model is updated.
 #   pip install -r magneticmodel/requirements.txt
 pygeomag>=1.1
+
+# wmm_error_analysis.py only (measures the shipped table against the exact
+# spherical-harmonics model). matplotlib is needed for its --plot option.
+numpy>=1.24
+matplotlib>=3.5

@@ -81,6 +81,197 @@ static void test_ecef_roundtrip(void)
     CHECK_NEAR(h2, h, 1e-5, "ecef_h");
 }
 
+/* REQ-SYS-021: the local tangent-plane mapping evaluates its curvature radii
+ * in single precision. Checked against the same mapping done entirely in
+ * double here in the test, over the displacements and latitudes the
+ * requirement puts a number on, plus the two properties that have to survive
+ * regardless: the pair stays mutually inverse, and the pole stays finite. */
+static void test_dned_dlatlonh_precision(void)
+{
+    static const double lats_deg[] = {0.0, 15.0, 45.0, -45.0, 60.0, 85.0, -85.0};
+    static const double dists_m[]  = {1.0, 100.0, 10000.0, 100000.0};
+    static const double heights[]  = {0.0, 500.0, 12000.0};
+
+    double worst_rel = 0.0, worst_roundtrip_rel = 0.0;
+    int    il, id, ih;
+
+    for (il = 0; il < (int)(sizeof(lats_deg) / sizeof(lats_deg[0])); ++il)
+    {
+        for (id = 0; id < (int)(sizeof(dists_m) / sizeof(dists_m[0])); ++id)
+        {
+            for (ih = 0; ih < (int)(sizeof(heights) / sizeof(heights[0])); ++ih)
+            {
+                const double lat = lats_deg[il] * M_PI / 180.0;
+                const double h   = heights[ih];
+                const double d   = dists_m[id];
+
+                /* Reference: the identical formula, all double. */
+                const double sl         = sin(lat);
+                const double cl         = cos(lat);
+                const double denom      = 1.0 - INS_WGS84_E2 * sl * sl;
+                const double sqrt_denom = sqrt(denom);
+                const double Rn         = INS_WGS84_A * (1.0 - INS_WGS84_E2) / (denom * sqrt_denom);
+                const double Re         = INS_WGS84_A / sqrt_denom;
+
+                /* A displacement of d spread over all three axes. */
+                const float  dned[3]  = {(float)(d * 0.6), (float)(d * 0.8), (float)(-d * 0.3)};
+                const double ref_dlat = (double)dned[0] / (Rn + h);
+                const double ref_dlon = (double)dned[1] / ((Re + h) * cl);
+
+                double dllh[3];
+                ins_dned_to_dlatlonh(dned, lat, h, dllh);
+
+                const double rel_lat = fabs(dllh[0] - ref_dlat) / fabs(ref_dlat);
+                const double rel_lon = fabs(dllh[1] - ref_dlon) / fabs(ref_dlon);
+                if (rel_lat > worst_rel) { worst_rel = rel_lat; }
+                if (rel_lon > worst_rel) { worst_rel = rel_lon; }
+
+                /* And back: what went in has to come out. */
+                float back[3];
+                ins_dlatlonh_to_dned(dllh, lat, h, back);
+                int k;
+                for (k = 0; k < 3; ++k)
+                {
+                    const double rel = fabs((double)back[k] - (double)dned[k]) / d;
+                    if (rel > worst_roundtrip_rel) { worst_roundtrip_rel = rel; }
+                }
+            }
+        }
+    }
+
+    printf("dned<->dlatlonh: worst %.3g relative vs double, round trip %.3g relative\n", worst_rel,
+           worst_roundtrip_rel);
+    /* The east term divides by cos(lat), whose error is the rounded latitude
+       amplified by tan(lat), so the bound has to cover 85 degrees. The round
+       trip is tighter: both directions take the same cosine. */
+    CHECK_TRUE(worst_rel < 1e-5, "within 1e-5 of the double mapping");
+    CHECK_TRUE(worst_roundtrip_rel < 1e-6, "mutually inverse to single precision");
+
+    /* The pole: cos(lat) is floored, so the longitude term stays finite and
+       keeps its sign instead of dividing by a rounded-to-zero cosine. */
+    {
+        static const double polar[] = {89.0, 89.999, 90.0, -90.0};
+        int                 k;
+        int                 bad = 0;
+        for (k = 0; k < (int)(sizeof(polar) / sizeof(polar[0])); ++k)
+        {
+            const double lat     = polar[k] * M_PI / 180.0;
+            const float  dned[3] = {10.0f, 10.0f, 1.0f};
+            double       dllh[3];
+            float        back[3];
+
+            ins_dned_to_dlatlonh(dned, lat, 0.0, dllh);
+            if (!isfinite(dllh[0]) || !isfinite(dllh[1]) || !isfinite(dllh[2])) { bad++; }
+            if (dllh[1] <= 0.0) { bad++; } /* east of here is still east */
+
+            ins_dlatlonh_to_dned(dllh, lat, 0.0, back);
+            if (fabs((double)back[1] - 10.0) > 1e-3) { bad++; }
+        }
+        CHECK_TRUE(bad == 0, "poles stay finite, signed and invertible");
+    }
+}
+
+/* REQ-SYS-020: INS_WGS84_B and INS_WGS84_EP2 are stored as literals so the
+ * closed-form conversion needs no square root to set up, which makes them a
+ * second spelling of INS_WGS84_A and INS_WGS84_E2 that can drift away from
+ * them. This is the consistency check geodetic_toolbox.c cannot hold as a
+ * _Static_assert, because a floating point comparison is not an integer
+ * constant expression and clang refuses one there. The tolerances are a few
+ * ulp wide: what this catches is an ellipsoid changed in one place only, and
+ * that moves both constants by kilometres. */
+static void test_wgs84_constants_consistent(void)
+{
+    CHECK_NEAR(INS_WGS84_B, INS_WGS84_A * sqrt(1.0 - INS_WGS84_E2), 1e-6, "wgs84_b_matches_a_e2");
+    CHECK_NEAR(INS_WGS84_EP2, INS_WGS84_E2 / (1.0 - INS_WGS84_E2), 1e-15, "wgs84_ep2_matches_e2");
+}
+
+/* REQ-SYS-020: the closed-form ECEF -> geodetic conversion against the exact
+ * forward transform. ins_latlonh_to_ecef() is itself closed form and exact, so
+ * the round-trip error IS the conversion error, with no iterative reference to
+ * argue about. Checked as an aggregate worst case over the grid rather than
+ * per point, which would bury the log. */
+static void test_ecef_to_latlonh_closed_form(void)
+{
+    /* The envelope the requirement puts a number on. */
+    static const double heights[] = {-1000.0, 0.0, 300.0, 12000.0, 30000.0};
+    static const double lons[]    = {0.0, 1.7, -2.9};
+
+    double worst_lat_mm = 0.0, worst_lon_mm = 0.0, worst_h_mm = 0.0;
+    int    finite_fail = 0, range_fail = 0;
+    int    ilat, ih, ilon;
+
+    for (ilat = -90; ilat <= 90; ++ilat)
+    {
+        for (ih = 0; ih < (int)(sizeof(heights) / sizeof(heights[0])); ++ih)
+        {
+            for (ilon = 0; ilon < (int)(sizeof(lons) / sizeof(lons[0])); ++ilon)
+            {
+                const double lat = (double)ilat * M_PI / 180.0;
+                const double lon = lons[ilon];
+                double       xyz[3], lat2, lon2, h2;
+
+                ins_latlonh_to_ecef(lat, lon, heights[ih], xyz);
+                ins_ecef_to_latlonh(xyz, &lat2, &lon2, &h2);
+
+                if (!isfinite(lat2) || !isfinite(lon2) || !isfinite(h2)) { finite_fail++; }
+                if (fabs(lat2) > M_PI / 2.0 + 1e-12 || fabs(lon2) > M_PI + 1e-12) { range_fail++; }
+
+                /* Metres at the surface, so latitude and longitude errors are
+                   comparable to the height error. Longitude is skipped at the
+                   poles, where it carries no information. */
+                const double dlat_mm = fabs(lat2 - lat) * INS_WGS84_A * 1000.0;
+                const double dh_mm   = fabs(h2 - heights[ih]) * 1000.0;
+                if (dlat_mm > worst_lat_mm) { worst_lat_mm = dlat_mm; }
+                if (dh_mm > worst_h_mm) { worst_h_mm = dh_mm; }
+                if (ilat > -89 && ilat < 89)
+                {
+                    const double dlon_mm = fabs(lon2 - lon) * INS_WGS84_A * cos(lat) * 1000.0;
+                    if (dlon_mm > worst_lon_mm) { worst_lon_mm = dlon_mm; }
+                }
+            }
+        }
+    }
+
+    printf("closed-form ECEF->LLH worst case: lat %.6f mm, lon %.6f mm, h %.6f mm\n", worst_lat_mm,
+           worst_lon_mm, worst_h_mm);
+    CHECK_TRUE(finite_fail == 0, "ecef_llh_finite");
+    CHECK_TRUE(range_fail == 0, "ecef_llh_in_range");
+    CHECK_TRUE(worst_lat_mm < 1.0, "ecef_llh_lat_within_1mm");
+    CHECK_TRUE(worst_lon_mm < 1.0, "ecef_llh_lon_within_1mm");
+    CHECK_TRUE(worst_h_mm < 1.0, "ecef_llh_h_within_1mm");
+
+    /* The pole is the case the height formula has to switch branches for:
+       p/cos(lat) is 0/0 there. */
+    {
+        double xyz[3] = {0.0, 0.0, INS_WGS84_B + 100.0};
+        double lat, lon, h;
+        ins_ecef_to_latlonh(xyz, &lat, &lon, &h);
+        CHECK_NEAR(lat, M_PI / 2.0, 1e-12, "ecef_llh_north_pole_lat");
+        CHECK_NEAR(h, 100.0, 1e-6, "ecef_llh_north_pole_h");
+        xyz[2] = -(INS_WGS84_B + 100.0);
+        ins_ecef_to_latlonh(xyz, &lat, &lon, &h);
+        CHECK_NEAR(lat, -M_PI / 2.0, 1e-12, "ecef_llh_south_pole_lat");
+        CHECK_NEAR(h, 100.0, 1e-6, "ecef_llh_south_pole_h");
+    }
+
+    /* Degenerate inputs from inside the ellipsoid, up to the geocentre
+       itself: defined and finite, latitude still a latitude. */
+    {
+        static const double inner[][3] = {
+            {0.0, 0.0, 0.0}, {1000.0, 0.0, 0.0}, {0.0, 0.0, 1000.0}, {-3.0e6, 2.0e6, 1.0e6}};
+        int k;
+        int bad = 0;
+        for (k = 0; k < (int)(sizeof(inner) / sizeof(inner[0])); ++k)
+        {
+            double lat, lon, h;
+            ins_ecef_to_latlonh(inner[k], &lat, &lon, &h);
+            if (!isfinite(lat) || !isfinite(lon) || !isfinite(h)) { bad++; }
+            if (fabs(lat) > M_PI / 2.0 + 1e-12) { bad++; }
+        }
+        CHECK_TRUE(bad == 0, "ecef_llh_inside_ellipsoid_defined");
+    }
+}
+
 static void test_rotation_rate_small(void)
 {
     /* With omega = 0, q_new must equal q. */
@@ -142,6 +333,82 @@ static void test_transport_rate_pole(void)
     ins_calc_omega_n_in(M_PI / 4.0, 0.0, vel, omega, wie, wen);
     const double Re = INS_WGS84_A / sqrt(1.0 - INS_WGS84_E2 * 0.5);
     CHECK_NEAR(wen[2], (float)(-100.0 / Re), 1e-9, "midlat_az_unchanged");
+}
+
+static void test_omega_n_in_precision(void)
+{
+    /* The n-frame rate runs in single precision (REQ-SYS-022). Both terms
+       it carries are small -- the Earth rate is 7.3e-5 rad/s and the
+       transport rate is a velocity over an Earth radius -- so a float has
+       room to spare. Held against the same formula evaluated entirely in
+       double, over the latitudes the NED mechanization is meant for. */
+    static const double lats_deg[] = {0.0, 15.0, 45.0, -45.0, 60.0, -60.0, 80.0, -80.0};
+    static const double heights[]  = {0.0, 500.0, 12000.0, 30000.0};
+    static const float  vels[][3]  = {{0.0f, 0.0f, 0.0f},
+                                      {30.0f, 30.0f, 1.0f},
+                                      {200.0f, 200.0f, 10.0f},
+                                      {0.0f, 300.0f, 0.0f},
+                                      {600.0f, 600.0f, 20.0f}};
+    double              worst_abs  = 0.0;
+    int                 il, ih, iv;
+
+    for (il = 0; il < (int)(sizeof(lats_deg) / sizeof(lats_deg[0])); ++il)
+    {
+        for (ih = 0; ih < (int)(sizeof(heights) / sizeof(heights[0])); ++ih)
+        {
+            for (iv = 0; iv < (int)(sizeof(vels) / sizeof(vels[0])); ++iv)
+            {
+                const double lat = lats_deg[il] * M_PI / 180.0;
+                const double h   = heights[ih];
+
+                /* Reference: the identical formula, all double. */
+                const double sl     = sin(lat);
+                const double cl     = cos(lat);
+                const double tl     = sl / cl;
+                const double denom  = 1.0 - INS_WGS84_E2 * sl * sl;
+                const double sd     = sqrt(denom);
+                const double Rn     = INS_WGS84_A * (1.0 - INS_WGS84_E2) / (denom * sd);
+                const double Re     = INS_WGS84_A / sd;
+                const double ref[3] = {INS_WGS84_OMEGA * cl + (double)vels[iv][1] / (Re + h),
+                                       -(double)vels[iv][0] / (Rn + h),
+                                       -INS_WGS84_OMEGA * sl - (double)vels[iv][1] * tl / (Re + h)};
+
+                float omega[3];
+                int   k;
+                ins_calc_omega_n_in(lat, h, vels[iv], omega, NULL, NULL);
+                for (k = 0; k < 3; ++k)
+                {
+                    const double e = fabs((double)omega[k] - ref[k]);
+                    if (e > worst_abs) { worst_abs = e; }
+                }
+            }
+        }
+    }
+
+    printf("omega_n_in: worst %.3g rad/s vs double (%.3g of the Earth rate)\n", worst_abs,
+           worst_abs / INS_WGS84_OMEGA);
+    /* 1e-9 rad/s is 2e-4 deg/h of attitude drift, orders below the bias
+       stability of any gyro these filters run on. */
+    CHECK_TRUE(worst_abs < 1e-9, "n-frame rate within 1e-9 rad/s of the double formula");
+
+    /* Every finite input must give a finite rate, including the poles and
+       latitudes handed in out of range. */
+    {
+        static const double edge_deg[] = {89.0, 89.999, 90.0, -90.0, 90.5, -120.0};
+        const float         v[3]       = {100.0f, 100.0f, 0.0f};
+        int                 k, bad = 0;
+        for (k = 0; k < (int)(sizeof(edge_deg) / sizeof(edge_deg[0])); ++k)
+        {
+            float w[3];
+            int   i;
+            ins_calc_omega_n_in(edge_deg[k] * M_PI / 180.0, 0.0, v, w, NULL, NULL);
+            for (i = 0; i < 3; ++i)
+            {
+                if (!isfinite(w[i]) || fabs((double)w[i]) > 1.0) { bad++; }
+            }
+        }
+        CHECK_TRUE(bad == 0, "edge latitudes stay finite and bounded");
+    }
 }
 
 static void test_cross_matrix(void)
@@ -451,14 +718,108 @@ static void test_wmm_model(void)
     CHECK_TRUE(b[2] > 0.0f, "wmm_ned_down_positive");  /* dip down */
 }
 
+/* Declination is a wrapped angle in (-180, +180], so two neighbouring grid
+   nodes can straddle that cut while being a few degrees apart. Interpolating
+   the raw tabulated values then runs the long way round. Both the spatial and
+   the temporal interpolation have cells where this happens, along the agonic
+   line trailing each dip pole. Near 89 S / 148 E the four surrounding nodes
+   are -176.5, +178.5, -178.0 and +176.0 deg, which used to average to about
+   +36 deg instead of +180. */
+static void test_wmm_declination_wraparound(void)
+{
+    /* Reference values from the exact spherical-harmonics model (pygeomag).
+       The horizontal field here is a healthy 16 uT, so the declination is
+       well defined and the grid resolves it. */
+    CHECK_NEAR(magnetic_declination_deg(-89.0f, 148.0f, 2027.5f), 179.77, 0.5,
+               "wmm_wrap_south_pole_side");
+    CHECK_NEAR(magnetic_declination_deg(-88.0f, 148.0f, 2027.5f), 179.39, 0.5,
+               "wmm_wrap_south_88deg");
+    CHECK_NEAR(magnetic_declination_deg(-85.0f, 148.0f, 2027.5f), 177.91, 0.5,
+               "wmm_wrap_south_85deg");
+
+    /* Crossing the cut must not produce a jump between two neighbouring
+       queries either, so walking the meridian stays continuous. */
+    float prev = magnetic_declination_deg(-89.0f, 140.0f, 2027.5f);
+    for (int i = 1; i <= 20; ++i)
+    {
+        const float lon  = 140.0f + (float)i;
+        const float now  = magnetic_declination_deg(-89.0f, lon, 2027.5f);
+        const float step = fabsf((float)ins_wrap_pi_bounded((now - prev) * (float)M_PI / 180.0f));
+        char        name[56];
+        snprintf(name, sizeof(name), "wmm_wrap_continuous_lon[%d]", i);
+        CHECK_TRUE(step < 0.35f, name); /* < 20 deg per 1 deg of longitude */
+        prev = now;
+    }
+
+    /* Temporal wrap: the nodes at lat 90, lon 160 and 165 sit at +174 deg in
+       the first epoch and -176 deg in the second. Interpolating those raw
+       values would sweep ~350 deg over five years and put mid-epoch near
+       zero, so the three sampled years must stay near +/-180 instead. */
+    const float t0 = magnetic_declination_deg(89.9f, 162.0f, 2025.0f);
+    const float t1 = magnetic_declination_deg(89.9f, 162.0f, 2027.5f);
+    const float t2 = magnetic_declination_deg(89.9f, 162.0f, 2030.0f);
+    CHECK_TRUE(fabsf(t0) > 150.0f, "wmm_wrap_time_start");
+    CHECK_TRUE(fabsf(t1) > 150.0f, "wmm_wrap_time_mid");
+    CHECK_TRUE(fabsf(t2) > 150.0f, "wmm_wrap_time_end");
+}
+
+/* At a magnetic dip pole the horizontal field vanishes, so the declination is
+   ill-conditioned no matter how fine the grid is. The model reports the
+   distance to the nearest pole so a caller can drop magnetic heading aiding
+   there instead of trusting a meaningless declination.
+
+   The pole coordinates below are the mid-epoch positions of the tabulated
+   epoch, and the poles drift (the northern one by ~33 km per year), so
+   regenerating wmm_lut.h for a new epoch will break these. That is
+   deliberate. Re-derive them from the new table and re-run
+   magneticmodel/wmm_error_analysis.py at --step 0.5 to confirm the exclusion
+   radius still holds, rather than widening the tolerances. */
+static void test_wmm_dip_pole_zone(void)
+{
+    /* Far from both poles the reference is valid and the distance is large. */
+    CHECK_TRUE(magnetic_heading_reference_valid(48.137f, 11.575f), "wmm_dip_munich_valid");
+    CHECK_TRUE(magnetic_dip_pole_distance_deg(48.137f, 11.575f) > 20.0f, "wmm_dip_munich_far");
+
+    /* The north dip pole sits near 85 N / 133 E at mid-epoch. A query right
+       there must report ~0 distance and an invalid reference. */
+    const float d_pole = magnetic_dip_pole_distance_deg(85.24f, 132.69f);
+    CHECK_TRUE(d_pole < 1.0f, "wmm_dip_north_distance_zero");
+    CHECK_TRUE(!magnetic_heading_reference_valid(85.24f, 132.69f), "wmm_dip_north_invalid");
+    /* Same for the southern one, which sits at a far lower latitude (~64 S)
+       and is therefore NOT excluded by any plain latitude limit. */
+    CHECK_TRUE(!magnetic_heading_reference_valid(-63.75f, 134.69f), "wmm_dip_south_invalid");
+    CHECK_TRUE(magnetic_dip_pole_distance_deg(-63.75f, 134.69f) < 1.0f,
+               "wmm_dip_south_distance_zero");
+
+    /* The zone has to actually cover where the grid fails: at 86 N / 136 E the
+       interpolated declination is off by ~105 deg against the exact model. */
+    CHECK_TRUE(!magnetic_heading_reference_valid(86.0f, 136.0f),
+               "wmm_dip_degenerate_point_excluded");
+
+    /* Distance is a great-circle angle, so it stays bounded and does not care
+       how the caller expresses longitude. */
+    const float d_ref  = magnetic_dip_pole_distance_deg(10.0f, 20.0f);
+    const float d_wrap = magnetic_dip_pole_distance_deg(10.0f, 380.0f);
+    CHECK_NEAR(d_wrap, d_ref, 1e-2, "wmm_dip_distance_lon_wrap");
+    CHECK_TRUE(d_ref >= 0.0f && d_ref <= 180.0f, "wmm_dip_distance_bounded");
+
+    /* Out-of-range latitude clamps like every other query in the module. */
+    CHECK_NEAR(magnetic_dip_pole_distance_deg(120.0f, 11.0f),
+               magnetic_dip_pole_distance_deg(90.0f, 11.0f), 1e-2, "wmm_dip_distance_lat_clamp");
+}
+
 int main(void)
 {
     test_quat_identity();
     test_rpy_roundtrip();
     test_ecef_roundtrip();
+    test_wgs84_constants_consistent();
+    test_dned_dlatlonh_precision();
+    test_ecef_to_latlonh_closed_form();
     test_rotation_rate_small();
     test_rotation_rate_known();
     test_transport_rate_pole();
+    test_omega_n_in_precision();
     test_cross_matrix();
     test_matrix_to_quat_roundtrip();
     test_quat_normalize_degenerate();
@@ -471,6 +832,8 @@ int main(void)
     test_gravity();
     test_wmm_model();
     test_wmm_grid_edges();
+    test_wmm_declination_wraparound();
+    test_wmm_dip_pole_zone();
     printf("\n%d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

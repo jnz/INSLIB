@@ -22,7 +22,7 @@ Example::
     from INSLIB import Navigator, Config
     nav = Navigator(Config(auto_init=True))
     nav.imu(t_us, dt, acc, gyr)          # begins an epoch
-    nav.gnss_pos(ecef, var_ned)          # optional aiding, add what you have
+    nav.gnss_pos_llh(llh, var_ned)       # optional aiding, add what you have
     nav.mag(mag_uT, mag_var)
     nav.baro(pressure_pa)
     nav.update()                         # runs the filter for this epoch
@@ -55,7 +55,7 @@ class Solution:
     vel_ned: tuple = None       # NED velocity [m/s] or None
     lat_rad: float = math.nan
     lon_rad: float = math.nan
-    alt_m: float = math.nan     # ellipsoid height from INSLIB's ECEF solution
+    alt_m: float = math.nan     # ellipsoid height from INSLIB's geodetic anchor
     height_m: float = math.nan  # best height above the NED-origin datum
                                 # [m, positive up]: ins under fresh aiding,
                                 # else the baro filter, else coasting ins
@@ -392,9 +392,12 @@ class Navigator(_Base):
         sol.pos_ecef = tuple(self.position_ecef() or ()) or None
         sol.pos_local = tuple(self.position_local() or ()) or None
         sol.vel_ned = tuple(self.velocity_ned() or ()) or None
-        if sol.pos_ecef:
-            from ._core import ecef_to_llh
-            sol.lat_rad, sol.lon_rad, sol.alt_m = ecef_to_llh(*sol.pos_ecef)
+        # Straight from the filter's own anchor rather than from pos_ecef:
+        # that one is built FROM these three, so converting it back would be
+        # a round trip for a value already on hand.
+        llh = self.position_llh()
+        if llh:
+            sol.lat_rad, sol.lon_rad, sol.alt_m = llh
         h = self.height()
         if h is not None:
             sol.height_m = h
@@ -425,10 +428,10 @@ class Navigator(_Base):
         # (height()/height_ellipsoid(), REQ-SUITE-007/008: ins under fresh
         # aiding, else baro, matching Navigator's module docstring), not
         # just as a fallback for a NaN. _fill_nav_state() above already
-        # populated z_m/alt_m straight from ins's raw local/ECEF position,
-        # which stays finite from initialization onward (position_local()/
-        # position_ecef() only check is_initialized, not is_ready() or a
-        # real WGS84 anchor) -- e.g. while merely coasting, or before any
+        # populated z_m/alt_m straight from ins's raw local/geodetic
+        # position, which stays finite from initialization onward
+        # (position_local()/position_llh() only check is_initialized, not
+        # is_ready() or a real WGS84 anchor) -- e.g. while merely coasting, or before any
         # GNSS fix has ever anchored the origin, ins's own value is not
         # NaN but is also not the best height the suite actually has. (A
         # GNSS quality loss is not one of those cases: that re-arms ins,
