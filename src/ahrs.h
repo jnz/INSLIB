@@ -5,7 +5,7 @@
  *
  * An error-state Kalman filter that corrects an attitude quaternion and a
  * gyroscope bias vector with accelerometer (leveling) and optional magnetometer
- * (heading) measurements. Runs standalone next to the full ins filter (see
+ * (heading) measurements. Runs standalone or next to the full INS filter (see
  * nav_suite.h for a wrapper that runs both).
  *
  * Two modes:
@@ -30,10 +30,7 @@
  *
  * Zero-rotation update (ZARU, opt-in, ahrs_update's zero_rotation_update
  * parameter): a caller-supplied "we know omega_b_nb == 0 this epoch" flag fuses
- * a direct gyro-bias measurement. Unlike ins, this filter has no
- * position/velocity state, so it cannot detect stillness on its own; the
- * trigger must come from outside (nav_suite passes through ins's own
- * velocity-aware auto-ZUPT/ZARU detector).
+ * a direct gyro-bias measurement.
  *
  * Notes:
  *  - The Earth rotation rate (15 deg/h) is not corrected.
@@ -45,6 +42,15 @@
  *    attitude.
  *
  * All memory is part of the ahrs_t struct - no heap is used.
+ *
+ * Roll/pitch-only builds: define AHRS_NO_MAG (compiler command line, for
+ * ahrs.c only) to leave out the magnetometer code. ahrs.c then no longer
+ * references magnetic_model.c and wmm_lut.h, so neither has to be copied or
+ * linked. ahrs_init() rejects AHRS_MODE_AHRS in such a build, and
+ * ahrs_set_position()/ahrs_mag_heading() are not declared. The structs are
+ * unchanged, so a mix of AHRS_NO_MAG and regular translation units is
+ * layout compatible. nav_suite needs the magnetometer code, do not use it with
+ * this define.
  *
  */
 
@@ -100,15 +106,30 @@ typedef struct
 
     /* Sensor noise model */
     float gyr_noise_psd;  /**< gyro spectral noise density [(rad/s)/sqrt(Hz)]
-                               (0 -> default, shared with ins, see
+                               (0 -> default, shared with INS, see
                                sensor_defaults.h) */
     float gyr_bias_rw;    /**< gyro bias random walk [(rad/s^2)/sqrt(Hz)]
-                               (0 -> default, shared with ins, see
+                               (0 -> default, shared with INS, see
                                sensor_defaults.h) */
     float acc_noise_mps2; /**< accelerometer measurement noise stddev [m/s^2],
                                should cover the worst-case vibration and
                                centrifugal forces of the target environment.
                                (0 -> default) */
+
+    /** Extra attitude process noise [rad/sqrt(s)], added on top of the
+     *  gyr_noise_psd-driven one, for the model errors the sensor noise does
+     *  not describe (gyro scale factor and misalignment under rotation, a
+     *  non-rigid mount). The tuning knob, while gyr_noise_psd stays the
+     *  sensor's own figure. Same role as ins_init_t's field of that name.
+     *  (<= 0 -> none: the generic gyr_noise_psd default already carries a
+     *  typical MEMS IMU's margin, set this when gyr_noise_psd is a good
+     *  sensor's own, much smaller figure) */
+    float rpy_pred_stddev_rad_sqrts;
+
+    /** IMU loss timeout [s] (REQ-AHRS-029): a sample this long after the
+     *  previous one stops the filter, which latches its gyro bias for the
+     *  restart (ahrs_get_bias_carry). (0 -> default) */
+    float imu_loss_timeout_sec;
 
     /* Tuning */
     float kalman_update_dt_sec;    /**< covariance-prediction period [s];
@@ -165,8 +186,8 @@ typedef struct
 
     /* Zero-rotation update (ZARU, REQ-AHRS-016): opt-in, driven by the caller's
        explicit "omega_b_nb == 0 this epoch" flag, e.g. nav_suite's own flag OR
-       ins's velocity-aware auto-ZUPT/ZARU detector (this filter has no
-       position/velocity state, so unlike ins it cannot detect stillness on its
+       INS's velocity-aware auto-ZUPT/ZARU detector (this filter has no
+       position/velocity state, so unlike INS it cannot detect stillness on its
        own). Directly measures the gyro bias states from the gyro averaged over
        the current trigger run. Earth rotation rate is NOT corrected. */
     float zero_rot_stddev_rps; /**< 1-sigma zero-rotation-update noise
@@ -215,7 +236,7 @@ typedef struct
                                           restart threshold [rad]
                                           (roll/pitch/yaw; yaw entry
                                           unused in ARS mode). 0 ->
-                                          default (45/45/90 deg); < 0 ->
+                                          default, < 0 ->
                                           that axis is not checked */
     float restart_warmup_sec;        /**< grace period after init before
                                           the precision check arms [s]
@@ -342,6 +363,15 @@ typedef struct
                                    marked the filter uninitialized
                                    (REQ-AHRS-023) */
 
+    /** Gyro bias latched by an IMU loss (REQ-AHRS-029), kept until the next
+        ahrs_init. */
+    struct
+    {
+        bool  valid;
+        float gyr_bias_rps[3];        /**< as of the loss */
+        float gyr_bias_stddev_rps[3]; /**< already inflated and clamped */
+    } bias_carry;
+
     /* Outlier downweighting (REQ-SYS-006, REQ-AHRS-019). */
     uint32_t n_downweighted; /**< ahrs_fuse() calls whose chi2 test tripped and
                                   was downweighted rather than dropped;
@@ -349,7 +379,7 @@ typedef struct
                                   set */
 
     /* Overconfidence / covariance-collapse watchdog (REQ-AHRS-020): the
-       attitude analogue of ins's REQ-NAV-040. Flags when the reported attitude
+       attitude analogue of INS's REQ-NAV-040. Flags when the reported attitude
        1-sigma becomes physically implausible. Purely diagnostic. Covers
        roll/pitch in both modes, plus yaw in AHRS mode. min_att_stddev_deg is
        the smallest per-axis value seen since ahrs_init. */
@@ -403,8 +433,7 @@ extern "C"
      *  to mag_freq_hz), and, if triggered, a zero-rotation update
      *  (throttled like the covariance prediction).
      *
-     *  Timestamps must be monotonic; a backwards step is ignored (the epoch only
-     *  re-anchors the internal clocks and clears the zero-rotation accumulator),
+     *  Timestamps must be monotonic, a backwards step is ignored,
      *  a gap larger than 0.2 s skips the attitude integration. Non-finite
      *  gyro/acc samples drop the epoch, a non-finite magnetometer sample is
      *  ignored (both counted in n_invalid_input).
@@ -413,16 +442,13 @@ extern "C"
      *  @param[in] t Timestamp [us].
      *  @param[in] gyr_rps Gyroscope measurement, body frame [rad/s].
      *  @param[in] acc_mps2 Accelerometer (specific force), body frame [m/s^2].
-     *  @param[in] mag_b Magnetometer, body frame. Expected in uT (WMM units);
+     *  @param[in] mag_b Magnetometer, body frame. Expected in uT (WMM units),
      *                   only the direction is used for heading, so any
      *                   consistent unit works unless the field-strength gate
      *                   is enabled (that needs uT). Pass NULL if unavailable.
      *                   Ignored in ARS mode.
      *  @param[in] zero_rotation_update True if the caller knows
-     *                   omega_b_nb == 0 this epoch (an external stillness
-     *                   detector, e.g. nav_suite's explicit flag or ins's
-     *                   auto-ZUPT/ZARU detector; see ahrs_config_t's ZARU
-     *                   comment for why this filter needs that externally). */
+     *                   omega_b_nb == 0 this epoch. */
     void ahrs_update(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const float acc_mps2[3],
                      const float mag_b[3], bool zero_rotation_update);
 
@@ -486,7 +512,7 @@ extern "C"
 
     /** @brief Get current attitude quaternion.
      *  @param[in] a The filter instance.
-     *  @param[out] q Body-to-NED quaternion (Hamilton, q[0] = w).
+     *  @param[out] q Body-to-NED unit quaternion (Hamilton, q[0] = w).
      *  @return false if the filter is not initialized/healthy. */
     bool ahrs_get_quaternion(const ahrs_t* a, float q[4]);
 
@@ -500,8 +526,8 @@ extern "C"
      *  @param[in] a The filter instance.
      *  @param[out] roll_stddev_rad Roll 1-sigma [rad].
      *  @param[out] pitch_stddev_rad Pitch 1-sigma [rad].
-     *  @param[out] yaw_stddev_rad Yaw 1-sigma [rad]; 0 in ARS mode (no
-     *              filtered yaw state -- yaw free-integrates).
+     *  @param[out] yaw_stddev_rad Yaw 1-sigma [rad], 0 in ARS mode (no
+     *              filtered yaw state - yaw free-integrates).
      *  @return false if the filter is not initialized/healthy. */
     bool ahrs_get_rpy_stddev(const ahrs_t* a, float* roll_stddev_rad, float* pitch_stddev_rad,
                              float* yaw_stddev_rad);
@@ -511,6 +537,25 @@ extern "C"
      *  @param[out] gyr_bias_stddev_rps Gyroscope bias 1-sigma [rad/s].
      *  @return false if the filter is not initialized/healthy. */
     bool ahrs_get_bias_gyr_stddev(const ahrs_t* a, float gyr_bias_stddev_rps[3]);
+
+    /** @brief Gyro bias latched by an IMU loss (REQ-AHRS-029), to seed
+     *  ahrs_config_t.gyr_bias_init_rps / gyr_bias_init_stddev_rps of the
+     *  restart.
+     *
+     *  @param[in] a The filter instance.
+     *  @param[out] gyr_bias_rps Gyro bias [rad/s].
+     *  @param[out] gyr_bias_stddev_rps Its 1-sigma, inflated and clamped [rad/s].
+     *  @return false if the filter has not stopped on an IMU loss since its
+     *  last ahrs_init(). */
+    bool ahrs_get_bias_carry(const ahrs_t* a, float gyr_bias_rps[3], float gyr_bias_stddev_rps[3]);
+
+    /** @brief Stop the filter on an IMU loss detected by the caller
+     *  (REQ-AHRS-029), e.g. nav_suite, which sees epochs without IMU that the
+     *  filter itself never gets. Latches the gyro bias carry, no-op if the
+     *  filter is not running.
+     *
+     *  @param[in,out] a The filter instance. */
+    void ahrs_stop_imu_loss(ahrs_t* a);
 
     /** @brief Report whether the velocity-blind auto-ZARU fallback
      *  (ahrs_config_t.auto_zaru_disable) currently considers the platform
@@ -546,6 +591,7 @@ extern "C"
      *      again with false. */
     void ahrs_set_auto_zaru_disable(ahrs_t* a, bool disable);
 
+#ifndef AHRS_NO_MAG
     /** @brief Supply the current position so the filter can apply the World
      *  Magnetic Model (declination + expected field strength).
      *
@@ -569,6 +615,7 @@ extern "C"
      *  @param[in] lon_rad Longitude [rad].
      *  @param[in] year Decimal year (e.g. 2027.5) for the WMM epoch. */
     void ahrs_set_position(ahrs_t* a, float lat_rad, float lon_rad, float year);
+#endif /* AHRS_NO_MAG */
 
     /* ------------------------------------------------------------------------
      * Initialisation heuristics (static helpers, no filter instance needed)
@@ -584,6 +631,7 @@ extern "C"
      *  @param[out] pitch_rad Estimated pitch [rad]. */
     void ahrs_leveling_from_acc(const float acc_mps2[3], float* roll_rad, float* pitch_rad);
 
+#ifndef AHRS_NO_MAG
     /** @brief Tilt-compensated magnetic heading.
      *
      *  Yaw of the body relative to magnetic north (declination is NOT
@@ -595,6 +643,7 @@ extern "C"
      *  @param[in] pitch_rad Current pitch [rad].
      *  @return Heading [rad] in (-pi, pi]. */
     float ahrs_mag_heading(const float mag_b[3], float roll_rad, float pitch_rad);
+#endif /* AHRS_NO_MAG */
 
 #ifdef __cplusplus
 }

@@ -118,6 +118,10 @@ NAV_SRC          := src/ins.c src/geodetic_toolbox.c src/magnetic_model.c src/lo
 MATH_SRC         := src/geodetic_toolbox.c src/magnetic_model.c
 SUITE_SRC        := src/ins.c src/geodetic_toolbox.c src/magnetic_model.c src/ahrs.c src/baro_alt.c src/nav_suite.c src/log.c
 KFCORE_SRC       := KFCore/c/linalg.c KFCore/c/kalman_udu.c KFCore/c/miniblas.c
+# Roll/pitch-only attitude filter (ahrs.c built with AHRS_NO_MAG): everything
+# it needs, and deliberately no magnetic_model.c.
+AHRS_NOMAG_SRC   := src/ahrs.c src/geodetic_toolbox.c
+AHRS_NOMAG_FLAGS := -DAHRS_NO_MAG
 KFCORE_SRC_MATH  := KFCore/c/linalg.c KFCore/c/miniblas.c
 
 # KFCore is a git submodule: a plain `git clone` (without --recursive)
@@ -172,6 +176,7 @@ FW_RNG_E2E  := embedded/tests/test_ranging_e2e.c
 TEST_CORE := $(BUILD_DIR)/test_core$(EXE)
 TEST_MATH := $(BUILD_DIR)/test_math$(EXE)
 TEST_AHRS := $(BUILD_DIR)/test_ahrs$(EXE)
+TEST_AHRS_NOMAG := $(BUILD_DIR)/test_ahrs_nomag$(EXE)
 TEST_BARO := $(BUILD_DIR)/test_baro$(EXE)
 TEST_LOG  := $(BUILD_DIR)/test_log$(EXE)
 TEST_YAML := $(BUILD_DIR)/test_yaml$(EXE)
@@ -225,8 +230,8 @@ ifneq (1,$(words $(shell gcc -dumpmachine 2>&1)))
 # without a compiler, so only abort for these (no goal at all means the
 # default target, which builds).
 CC_GOALS := all test test-asan check-all coverage readme-coverage \
-            $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_BARO) $(TEST_LOG) \
-            test_core test_math test_ahrs test_baro test_log \
+            $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_AHRS_NOMAG) $(TEST_BARO) $(TEST_LOG) \
+            test_core test_math test_ahrs test_ahrs_nomag test_baro test_log \
             $(REPLAY) replay $(INSRCV) insrcv \
             pylib pytest datasets datasets-fog datasets-kfgins \
             datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
@@ -267,9 +272,9 @@ endif
 .PHONY: all test clean coverage coverage-clean readme-coverage datasets datasets-kfgins \
         datasets-fog datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
         datasets-pedestrian datasets-inertial-roundtrip \
-        simulated crazyflie reqs pylib pytest wmm doc doxygen test-asan \
+        simulated crazyflie tutorials reqs pylib pytest wmm doc doxygen test-asan \
         format format-check cppcheck clang-tidy stack readme-stack check-all insrcv \
-        test_core test_math test_ahrs test_baro test_log test_cfg test_yaml \
+        test_core test_math test_ahrs test_ahrs_nomag test_baro test_log test_cfg test_yaml \
         replay inspostgui-exe
 
 # --- Build output directory --------------------------------------------------
@@ -288,6 +293,7 @@ endif
 test_core: $(TEST_CORE)
 test_math: $(TEST_MATH)
 test_ahrs: $(TEST_AHRS)
+test_ahrs_nomag: $(TEST_AHRS_NOMAG)
 test_baro: $(TEST_BARO)
 test_log:  $(TEST_LOG)
 test_yaml: $(TEST_YAML)
@@ -311,8 +317,8 @@ replay:    $(REPLAY)
 # this repo's own noisy fault-injection tests opt out.
 TEST_LOG_LEVEL_CFLAGS := -DLOG_LEVEL=LOG_LEVEL_NONE
 
-all: $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_BARO) $(TEST_LOG) $(TEST_YAML) \
-     $(ALL_TEST_CFG)
+all: $(TEST_CORE) $(TEST_MATH) $(TEST_AHRS) $(TEST_AHRS_NOMAG) $(TEST_BARO) $(TEST_LOG) \
+     $(TEST_YAML) $(ALL_TEST_CFG)
 
 $(TEST_CORE): $(NAV_SRC) $(KFCORE_SRC) tests/test_ins_core.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
@@ -322,6 +328,11 @@ $(TEST_MATH): $(MATH_SRC) $(KFCORE_SRC_MATH) tests/test_ins_math.c $(NAV_HDR) | 
 
 $(TEST_AHRS): $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
+
+# Neither magnetic_model.c nor log.c is linked (logging is compiled out), so
+# the build itself proves the magnetometer-free ahrs.c is self-contained.
+$(TEST_AHRS_NOMAG): $(AHRS_NOMAG_SRC) $(KFCORE_SRC) tests/test_ahrs_nomag.c $(NAV_HDR) | $(BUILD_DIR)
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(AHRS_NOMAG_FLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 $(TEST_BARO): $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
@@ -348,6 +359,7 @@ test: all
 	$(RUN)$(TEST_CORE)
 	$(RUN)$(TEST_MATH)
 	$(RUN)$(TEST_AHRS)
+	$(RUN)$(TEST_AHRS_NOMAG)
 	$(RUN)$(TEST_BARO)
 	$(RUN)$(TEST_LOG)
 	$(RUN)$(TEST_YAML)
@@ -356,6 +368,7 @@ test: all
 	$(RUN_TEST_RNG_E2E)
 	@$(MAKE) --no-print-directory simulated
 	@$(MAKE) --no-print-directory crazyflie
+	@$(MAKE) --no-print-directory tutorials
 	@$(MAKE) --no-print-directory datasets
 
 tests: test
@@ -376,6 +389,7 @@ test-asan: | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(NAV_SRC) $(KFCORE_SRC) tests/test_ins_core.c $(LDLIBS) -o $(BUILD_DIR)/test_core_asan
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(MATH_SRC) $(KFCORE_SRC_MATH) tests/test_ins_math.c $(LDLIBS) -o $(BUILD_DIR)/test_math_asan
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c $(LDLIBS) -o $(BUILD_DIR)/test_ahrs_asan
+	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(AHRS_NOMAG_FLAGS) $(SAN_FLAGS) $(INCLUDES) $(AHRS_NOMAG_SRC) $(KFCORE_SRC) tests/test_ahrs_nomag.c $(LDLIBS) -o $(BUILD_DIR)/test_ahrs_nomag_asan
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(SAN_FLAGS) $(INCLUDES) $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(LDLIBS) -o $(BUILD_DIR)/test_baro_asan
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(INCLUDES) src/log.c tests/test_log.c $(LDLIBS) -o $(BUILD_DIR)/test_log_asan
 ifneq ($(HAVE_EMBEDDED),)
@@ -386,6 +400,7 @@ endif
 	./$(BUILD_DIR)/test_core_asan
 	./$(BUILD_DIR)/test_math_asan
 	./$(BUILD_DIR)/test_ahrs_asan
+	./$(BUILD_DIR)/test_ahrs_nomag_asan
 	./$(BUILD_DIR)/test_baro_asan
 	./$(BUILD_DIR)/test_log_asan
 ifneq ($(HAVE_EMBEDDED),)
@@ -602,6 +617,12 @@ pytest: $(PYLIB)
 	    fi; \
 	    echo "standalone runner: all test files passed"; \
 	fi
+
+# The code in tutorial/*.md, built and run as the text says and compared with
+# the printed expected output (REQ-VER-042). The C programs need only the
+# compiler, the Python scripts the binding, so the library is built first.
+tutorials: $(PYLIB)
+	CC="$(CC)" $(PYTHON) python/tests/test_tutorials.py
 
 # Real MEMS ADAHRS vs. an independent FOG strapdown attitude reference, real
 # GNSS position/velocity aiding (see datasets/fog/config.yaml).

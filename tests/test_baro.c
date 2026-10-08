@@ -806,15 +806,37 @@ static void scenario_baro_time_anomaly(void)
     baro_alt_update(&b, t, f_b, q, pressure_from_altitude(base_alt), 0.0f, false);
     CHECK_TRUE(b.is_initialized, "continues after re-anchor");
 
-    /* Forward gap > 0.2 s: the propagation is skipped (an absurd
-       specific force over the gap must NOT be integrated), baro fusion
-       still runs. */
+    /* Forward gap of 0.15 s: ordinary jitter, integrated as usual. */
+    t += (baro_alt_time_us_t)(0.15 * US_PER_SEC);
+    baro_alt_update(&b, t, f_b, q, pressure_from_altitude(base_alt), 0.0f, true);
+    float h, ab, ab_sd;
+    CHECK_TRUE(baro_alt_get_height(&b, &h), "0.15 s gap: still running");
+    CHECK_TRUE(!baro_alt_get_bias_carry(&b, &ab, &ab_sd), "0.15 s gap: no carry");
+
+    /* Forward gap of 1 s: an accelerometer loss (REQ-BARO-027). The filter
+       stops instead of integrating an absurd specific force over the gap,
+       and keeps its a_b for the restart. */
+    b.x[2]                  = 0.07f; /* recognizable a_b */
     const float f_absurd[3] = {0.0f, 0.0f, -(GRAVITY + 10.0f)};
-    t += US_PER_SEC; /* 1 s gap */
+    t += US_PER_SEC;
     baro_alt_update(&b, t, f_absurd, q, pressure_from_altitude(base_alt), 0.0f, true);
-    float h;
-    CHECK_TRUE(baro_alt_get_height(&b, &h), "healthy after gap");
-    CHECK_NEAR(h, 0.0, 0.2, "gap epoch not integrated");
+    CHECK_TRUE(!baro_alt_get_height(&b, &h), "1 s gap: filter stopped");
+    CHECK_TRUE(baro_alt_get_bias_carry(&b, &ab, &ab_sd), "1 s gap: a_b carried");
+    CHECK_NEAR(ab, 0.07, 1e-6, "carried a_b = estimate before the gap");
+    CHECK_TRUE(ab_sd > 0.0f && ab_sd <= b.cfg.acc_bias_init_stddev_mps2,
+               "carried 1-sigma clamped to the cold-start prior");
+
+    /* Restart on the old datum, seeded from the carry. */
+    const float h0_before         = b.h0_baro_m;
+    const float p_now             = pressure_from_altitude(base_alt);
+    cfg.acc_bias_init_mps2        = ab;
+    cfg.acc_bias_init_stddev_mps2 = ab_sd;
+    CHECK_TRUE(baro_alt_init(&b, &cfg, t, p_now, baro_alt_pressure_to_altitude(p_now) - h0_before,
+                             0.0f) == 0,
+               "restart");
+    CHECK_NEAR(b.h0_baro_m, h0_before, 1e-3, "restart keeps the datum");
+    CHECK_TRUE(baro_alt_get_acc_bias(&b, &ab), "a_b after the restart");
+    CHECK_NEAR(ab, 0.07, 1e-6, "restart starts from the carried a_b");
 }
 
 /* ---------------------------------------------------------------------------
@@ -4351,16 +4373,20 @@ static void scenario_nav_suite_mcdc_guards(void)
     memset(&sb, 0, sizeof(sb));
     CHECK_TRUE(nav_suite_init(&sb, &init, &opt) == 0, "init (yaw hint, post-bootstrap)");
     {
-        ins_measurements_t m;
-        memset(&m, 0, sizeof(m));
-        m.timestamp        = t + US_PER_SEC / 100;
-        m.strapdown_dt_sec = 0.01f;
-        m.acc.is_valid     = true;
-        m.gyr.is_valid     = true;
-        m.acc.data[2]      = -GRAVITY;
-        nav_suite_update(&sb, &m);
+        int k;
+        for (k = 1; k <= 20; ++k) /* past the leveling window (REQ-SUITE-028) */
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp        = t + k * (US_PER_SEC / 100);
+            m.strapdown_dt_sec = 0.01f;
+            m.acc.is_valid     = true;
+            m.gyr.is_valid     = true;
+            m.acc.data[2]      = -GRAVITY;
+            nav_suite_update(&sb, &m);
+        }
     }
-    CHECK_TRUE(sb.ars.is_initialized, "ARS bootstrapped on the first epoch");
+    CHECK_TRUE(sb.ars.is_initialized, "ARS bootstrapped once the leveling window is full");
     const float rpy_init_yaw_before = sb.ars_cfg.rpy_init_rad[2];
     nav_suite_set_init_att_hint(&sb, 0.0f, 0.0f, 0.0f, DEG2RAD(42.0f), DEG2RAD(5.0f));
     CHECK_NEAR(sb.ars_cfg.rpy_init_rad[2], rpy_init_yaw_before, 1e-9,

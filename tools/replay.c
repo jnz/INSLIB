@@ -344,6 +344,8 @@ typedef struct
     float ahrs_gyr_noise_psd;            /* [rad/s/sqrt(Hz)] */
     float ahrs_gyr_bias_rw;              /* [rad/s^2/sqrt(Hz)] */
     float ahrs_acc_noise_mps2;           /* [m/s^2] */
+    float ahrs_rpy_pred_stddev_rad_sqrts; /* [rad/sqrt(s)], extra attitude
+                                   noise, 0 -> none (REQ-AHRS-027) */
     float ahrs_gyr_bias_init_stddev_deg; /* [deg/s], 0 -> the static-window
                                    seed's own stddev (or ahrs.c's built-in
                                    default if the window found nothing) */
@@ -696,6 +698,10 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "ahrs.gyr_noise_psd")) { c->ahrs_gyr_noise_psd = (float)d; }
     else if (!strcmp(full, "ahrs.gyr_bias_rw")) { c->ahrs_gyr_bias_rw = (float)d; }
     else if (!strcmp(full, "ahrs.acc_noise_mps2")) { c->ahrs_acc_noise_mps2 = (float)d; }
+    else if (!strcmp(full, "ahrs.rpy_pred_stddev_rad_sqrts"))
+    {
+        c->ahrs_rpy_pred_stddev_rad_sqrts = (float)d;
+    }
     else if (!strcmp(full, "ahrs.gyr_bias_init_stddev_rps_deg"))
     {
         c->ahrs_gyr_bias_init_stddev_deg = (float)d;
@@ -1957,6 +1963,7 @@ int main(int argc, char** argv)
         (cfg.ahrs_gyr_bias_rw > 0.0f) ? cfg.ahrs_gyr_bias_rw : cfg.gyr_bias_rw;
     g_suite.ars_cfg.acc_noise_mps2 =
         (cfg.ahrs_acc_noise_mps2 > 0.0f) ? cfg.ahrs_acc_noise_mps2 : 0.25f;
+    g_suite.ars_cfg.rpy_pred_stddev_rad_sqrts = cfg.ahrs_rpy_pred_stddev_rad_sqrts;
     if (have_bias0)
     {
         int k;
@@ -1981,6 +1988,7 @@ int main(int argc, char** argv)
         g_suite.ahrs_cfg.gyr_noise_psd  = g_suite.ars_cfg.gyr_noise_psd;
         g_suite.ahrs_cfg.gyr_bias_rw    = g_suite.ars_cfg.gyr_bias_rw;
         g_suite.ahrs_cfg.acc_noise_mps2 = g_suite.ars_cfg.acc_noise_mps2;
+        g_suite.ahrs_cfg.rpy_pred_stddev_rad_sqrts = g_suite.ars_cfg.rpy_pred_stddev_rad_sqrts;
         for (k = 0; k < 3; ++k)
         {
             g_suite.ahrs_cfg.gyr_bias_init_rps[k] = g_suite.ars_cfg.gyr_bias_init_rps[k];

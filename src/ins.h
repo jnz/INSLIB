@@ -25,7 +25,7 @@
  * Double precision is only used for the absolute-position anchor: the n-frame
  * origin (origin_llh) and the current lat/lon/height (latlonh, book-kept
  * incrementally from the float n-frame deltas), both geodetic. The hot path
- * (strapdown, predict, fusion corrections) is float-only, and ECEF is a form
+ * (strapdown, predict, fusion corrections) is float-only, and ECEF/llh is a form
  * of the interface rather than of the filter: it is converted where a caller
  * hands one in or asks for one, never per epoch (REQ-NAV-080).
  *
@@ -248,9 +248,9 @@ typedef struct
 /** @brief Range to an anchor at a known position (REQ-NAV-082).
  *
  *  A range measurement: the
- *  distance between the platform's ranging antenna and the anchor/satellite.
- *  The range is expected calibrated (hardware delay offset, oscillator offset, scale),
- *  the filter only weights it with stddev_m and rejects chi2 outliers.
+ *  distance between the platform's receiver and the anchor/satellite.
+ *  The range is expected calibrated, the filter only weights it with stddev_m
+ *  and rejects chi2 outliers.
  *
  *  The anchor is stated in ECEF. */
 typedef struct
@@ -265,7 +265,7 @@ typedef struct
     bool     is_valid;     /**< is this entry usable? */
 } ins_meas_range_t;
 
-/** @brief Optional external attitude/gyro-bias initial attitude for ins's own
+/** @brief Optional external attitude/gyro-bias initial attitude for INS's own
  * auto-init bootstrap and re-acquisition (REQ-NAV-048), e.g. from a
  * continuously-running AHRS. */
 typedef struct
@@ -372,8 +372,7 @@ typedef struct
        entry with its own time of validity. Same "new sample only" contract as
        the barometer: a latched is_valid re-fuses one reading every epoch. */
     ins_meas_range_t range[INS_RANGE_MAX]; /**< range entries, any subset valid */
-    float            range_leverarm_b[3];  /**< ranging antenna lever arm,
-                                                body frame [m] */
+    float            range_leverarm_b[3];  /**< ranging lever arm, body frame [m] */
 } ins_measurements_t;
 
 /** @brief Initial values supplied to ins_init(). */
@@ -381,8 +380,8 @@ typedef struct
 {
     ins_time_us_t time; /**< initial timestamp [us] */
     /* Start position and velocity, in the frames the filter works in: it
-       anchors geodetically and mechanizes in NED (REQ-NAV-081). A caller
-       holding ECEF converts once at startup with ins_ecef_to_latlonh().
+       anchors geodetically (llh) and mechanizes in NED (REQ-NAV-081). A caller
+       holding ECEF must convert e.g. with ins_ecef_to_latlonh() first.
 
        An all-zero block is a legal start, namely where the equator meets
        the prime meridian at ellipsoid height 0, and is NOT rejected as
@@ -620,7 +619,7 @@ typedef struct
      * in coordinated flight has its heading aligned with the *airspeed* vector,
      * not the *ground* velocity vector GNSS measures, so a crosswind adds a
      * crab-angle error a car does not have. */
-    float automotive_min_yaw_stddev; /**< 0 -> 5 deg default */
+    float automotive_min_yaw_stddev; /**< 0 -> default */
 
     /* Non-holonomic lateral velocity constraint (REQ-NAV-077): a synthetic
      * measurement stating that a wheeled vehicle does not travel sideways,
@@ -819,17 +818,7 @@ typedef struct
      * ins_measurements_t.speed, which carries only the per-sample noise: the
      * two terms here describe the INSTALLATION, which the sensor cannot report.
      *
-     * The error of this sensor class splits into a per-sample part that does
-     * not grow with speed (an OBD-II PID 0x0D value is quantized to 1 km/h) and
-     * a multiplicative part that does (the vehicle's speed signal carries a
-     * scale error of a few percent from rolling radius, tyre wear and the
-     * scaling the ECU applies, and its sign is not predictable: the
-     * type-approval margin that keeps an indicated speed from ever falling
-     * below the true one constrains the DASHBOARD, not this reading). Fusing
-     * the raw value against the per-sample noise alone would present that
-     * systematic bias as independent evidence and pull the velocity states
-     * permanently off, so speed_scale removes the calibrated part and
-     * speed_stddev_rel prices what is left:
+     * Model:
      *
      *     z = speed_scale * speed_mps
      *     R = stddev_mps^2 + (speed_stddev_rel * z)^2
@@ -893,11 +882,12 @@ typedef struct
      * antenna lever arm adds under rotation (REQ-NAV-076), since what the
      * receiver averaged is the motion of the phase centre.
      *
-     * A Doppler velocity is the average over the receiver's measurement
-     * interval while the filter fuses it against an instantaneous state. The
-     * two differ by roughly a*T/2 under acceleration - a systematic error the
-     * reported accuracy cannot contain, because it belongs to the platform
-     * rather than to the signal.
+     * A GNSS Doppler/carrier-phase velocity is the average over the receiver's
+     * measurement interval while the filter fuses it against an instantaneous
+     * state. The two differ by roughly a*T/2 under acceleration - a systematic
+     * error the reported accuracy cannot contain. Basically trust the IMU
+     * more during dynamic GNSS antenna movements - and downweight the
+     * GNSS velocity measurement(s).
      *
      * Stated in the stddev domain, [m/s] of extra velocity noise per [m/s^2]
      * of acceleration. Raise both for a receiver whose velocity is
@@ -953,6 +943,11 @@ typedef struct
      * line of sight keeps growing, the ranges stop counting and the window
      * expires as it would without them. */
     float range_aiding_max_hpos_stddev_m; /**< [m] (0 -> default) */
+
+    /* IMU loss (REQ-NAV-089): once the last IMU sample is this old, on any
+     * epoch, the filter stops and re-arms with its biases carried. nav_suite
+     * hands the same value to the ARS/AHRS and baro_alt. */
+    float imu_loss_timeout_sec; /**< [s] (0 -> default) */
 } ins_options_t;
 
 /** @brief Nominal state vector (float-only, local n-frame). */
@@ -1117,7 +1112,23 @@ typedef struct
     uint16_t last_range_anchor_id; /**< anchor_id of the last fused entry */
     uint32_t n_range_pos_aiding;   /**< epochs whose ranges counted as position
                                         aiding (REQ-NAV-085) */
+    uint32_t n_imu_loss;           /**< IMU losses that stopped the filter
+                                        (REQ-NAV-089) */
 } ins_diag_t;
+
+/** @brief Accelerometer leveling window (REQ-NAV-047, REQ-SUITE-028): the
+ *  newest INS_AUTOINIT_SAMPLES_MAX IMU samples, oldest dropped first. Shared by
+ *  the ins auto-init and the ARS/AHRS bootstrap of nav_suite. */
+typedef struct
+{
+    int count; /**< samples held */
+    struct
+    {
+        ins_time_us_t t;             /**< sample timestamp */
+        float         acc[3];        /**< specific force [m/s^2] */
+        float         gyr[3];        /**< angular rate [rad/s] */
+    } buf[INS_AUTOINIT_SAMPLES_MAX]; /**< oldest first */
+} ins_level_window_t;
 
 /** @brief Main filter instance.
  *
@@ -1225,6 +1236,8 @@ typedef struct
 
     /* Timing / status */
     ins_time_us_t t_last_kalman_predict;  /**< last Kalman prediction step */
+    ins_time_us_t t_last_imu;             /**< last IMU sample (REQ-NAV-089) */
+    bool          have_last_imu;          /**< t_last_imu is set */
     uint32_t      time_dropped_run;       /**< consecutive epochs dropped as
                                                 older than INS_MAX_DELAY_MS,
                                                 cleared by any epoch that is
@@ -1246,20 +1259,13 @@ typedef struct
        coherent (REQ-NAV-033). t_pending_imu / t_pending_fix track the last-seen
        IMU sample and usable position fix so the start gate can check their
        temporal alignment. */
-    bool          is_collecting;    /**< true while waiting for the start gate */
-    bool          have_pending_imu; /**< an IMU sample was seen this epoch */
-    bool          have_pending_fix; /**< a usable position fix was seen this epoch */
-    ins_time_us_t t_pending_imu;    /**< timestamp of the last-seen IMU sample */
-    ins_time_us_t t_pending_fix;    /**< timestamp of the last-seen usable fix */
-    int           autoinit_count;   /**< samples collected in autoinit_buf so far */
-    struct
-    {
-        ins_time_us_t t;                      /**< sample timestamp */
-        float         acc[3];                 /**< bias-corrected specific force [m/s^2] */
-        float         gyr[3];                 /**< bias-corrected angular rate [rad/s] */
-    } autoinit_buf[INS_AUTOINIT_SAMPLES_MAX]; /**< static-window buffer for
-                                                      the auto-init leveling
-                                                      bootstrap */
+    bool               is_collecting;    /**< true while waiting for the start gate */
+    bool               have_pending_imu; /**< an IMU sample was seen this epoch */
+    bool               have_pending_fix; /**< a usable position fix was seen this epoch */
+    ins_time_us_t      t_pending_imu;    /**< timestamp of the last-seen IMU sample */
+    ins_time_us_t      t_pending_fix;    /**< timestamp of the last-seen usable fix */
+    ins_level_window_t autoinit_win;     /**< bias-corrected IMU samples for the
+                                              auto-init leveling bootstrap */
 
     /* Most recent magnetometer sample seen while still uninitialized, cached so
        the auto-init heading bootstrap can use it even when the bootstrap fix
@@ -1356,16 +1362,19 @@ typedef struct
                                        bad fixes is not broken by the gaps
                                        between them */
 
-    /* IMU biases carried across a quality-loss re-arm (REQ-NAV-061). Only that
-       re-arm populates this; ins_rearm_collecting clears it, so a health
-       shutdown or a time-jump reset can never inherit one. */
+    /* IMU and magnetometer biases carried across a quality-loss or IMU-loss
+       re-arm (REQ-NAV-061). Only those re-arms populate this;
+       ins_rearm_collecting clears it, so a health shutdown or a restarted time
+       source can never inherit one. */
     struct
     {
         bool  valid;
         float acc_bias[3];          /**< [m/s^2] as of the exit epoch */
         float gyr_bias[3];          /**< [rad/s] as of the exit epoch */
+        float mag_bias[3];          /**< [uT] as of the exit epoch, 18-state only */
         float acc_bias_stddev_mps2; /**< already inflated and clamped */
         float gyr_bias_stddev_rps;  /**< already inflated and clamped */
+        float mag_bias_stddev_ut;   /**< already inflated and clamped */
     } bias_carry;                   /**< IMU bias carried across a quality-loss re-arm
                                          (REQ-NAV-061) */
 
@@ -1747,6 +1756,35 @@ extern "C"
      *  @return Pointer to the internal, read-only diagnostics record (see
      *  ins_diag_t), or NULL if @p f is NULL. */
     const ins_diag_t* ins_get_diag(const ins_t* f);
+
+    /** @brief Add one IMU sample to a leveling window, dropping the oldest
+     *  once it is full.
+     *
+     *  @param[in,out] w The window.
+     *  @param[in] t Sample timestamp [us].
+     *  @param[in] acc Specific force [m/s^2].
+     *  @param[in] gyr Angular rate [rad/s]. */
+    void ins_level_window_push(ins_level_window_t* w, ins_time_us_t t, const float acc[3],
+                               const float gyr[3]);
+
+    /** @brief Accelerometer leveling over the samples of the last
+     *  opt->auto_init_window_sec (REQ-NAV-047): roll/pitch from the median
+     *  specific force, classified as quasi-static with
+     *  opt->auto_init_static_gyr_rps / auto_init_static_acc_mps2.
+     *
+     *  @param[in] w The window.
+     *  @param[in] opt Options holding the window/threshold fields (0 -> default).
+     *  @param[in] require_full Only solve once the window spans its full
+     *  length (or the buffer is full).
+     *  @param[out] roll Roll [rad].
+     *  @param[out] pitch Pitch [rad].
+     *  @param[out] rp_stddev_floor 0 if quasi-static, else the minimum
+     *  roll/pitch 1-sigma the caller has to report
+     *  (opt->auto_init_moving_rpy_stddev_rad) [rad].
+     *  @return false if the window holds too few samples. */
+    bool ins_level_window_solve(const ins_level_window_t* w, const ins_options_t* opt,
+                                bool require_full, float* roll, float* pitch,
+                                float* rp_stddev_floor);
 
     /** @brief Report whether the automatic ZUPT/ZARU detector
      *  (opt.auto_zupt_*, see ins_auto_zupt_detect) currently considers

@@ -75,6 +75,79 @@ def test_gnss_outage_cut_is_anchored_on_the_first_imu_sample():
     assert not any(lo <= (fx["t_us"] - t0) / 1e6 < hi for fx in cut.fixes)
 
 
+def test_replay_without_reference_csv():
+    import shutil
+    with tempfile.TemporaryDirectory() as d:
+        ds = os.path.join(d, "noref")
+        shutil.copytree(test_range_stream.A_IDEAL, ds)
+        os.remove(os.path.join(ds, "ref.csv"))
+        cfg = os.path.join(ds, "config.yaml")
+        with open(cfg, encoding="utf-8", newline="") as f:
+            txt = f.read()
+        # init: ref cannot work without the reference, and is refused
+        p = subprocess.run([sys.executable, os.path.join(REPO, "tools", "replay.py"),
+                            ds], capture_output=True, text=True, cwd=REPO,
+                           encoding="utf-8", errors="replace")
+        assert p.returncode != 0 and "init: ref" in p.stdout + p.stderr
+        with open(cfg, "w", encoding="utf-8", newline="") as f:
+            f.write(re.sub(r"(?m)^init:\s*ref", "init: auto", txt))
+        summary_json = os.path.join(d, "summary.json")
+        p = subprocess.run([sys.executable, os.path.join(REPO, "tools", "replay.py"),
+                            ds, "--summary-json", summary_json],
+                           capture_output=True, text=True, cwd=REPO,
+                           encoding="utf-8", errors="replace")
+        assert p.returncode == 0, p.stdout[-2000:] + p.stderr[-2000:]
+        with open(summary_json, encoding="utf-8") as f:
+            assert json.load(f)["scored_epochs"] == 0
+        gui = _gui()
+        if gui is None:
+            return
+        raw, _cfg_path, data_dir = gui.load_raw_config(ds)
+        spec = gui.merge_spec(raw)
+        assert gui.validate_spec(spec, data_dir) == []
+
+
+def test_estimate_stays_in_the_replay_frame_after_an_origin_reset():
+    import math
+    lat0, lon0, h0 = math.radians(48.9003), math.radians(8.4787), 387.0
+    o0 = replay.llh_to_ecef(lat0, lon0, h0)
+    # ins restarted 31 m south, 10 m west and 1 m below the first origin
+    lat1 = lat0 - 31.0 / 6.37e6
+    lon1 = lon0 - 10.0 / (6.39e6 * math.cos(lat0))
+    h1 = h0 - 1.0
+    o1 = replay.llh_to_ecef(lat1, lon1, h1)
+    local = (2.0, -3.0, 0.5)   # ins position in its new frame
+
+    class Nav:
+        def __init__(self, origin, pos):
+            self.o, self.p = origin, pos
+
+        def origin_ecef(self):
+            return list(self.o)
+
+        def position_local(self):
+            return None if self.p is None else list(self.p)
+
+    class Run:
+        origin_ecef = list(o0)
+        origin_lat, origin_lon = lat0, lon0
+
+    # Where that position is, independently: new origin plus the rotated
+    # offset, then into the replay frame like the reference.
+    r_n2e = replay.ned_to_ecef_rot(lat1, lon1)
+    d = replay._matvec_rm(r_n2e, local)
+    ecef = [o1[i] + d[i] for i in range(3)]
+    lat, lon, h = replay.ecef_to_llh(*ecef)
+    want = replay.ref_to_local_ned({"lat_rad": lat, "lon_rad": lon, "h_m": h},
+                                   list(o0), lat0, lon0)
+    got = replay_core.ins_pos_in_replay_frame(Nav(o1, local), Run())
+    assert max(abs(got[i] - want[i]) for i in range(3)) < 0.01, (got, want)
+    assert abs(got[0] - (-29.0)) < 0.2 and abs(got[1] - (-13.0)) < 0.2, got
+    # Same origin: unchanged. No position: None.
+    assert replay_core.ins_pos_in_replay_frame(Nav(o0, local), Run()) == list(local)
+    assert replay_core.ins_pos_in_replay_frame(Nav(o1, None), Run()) is None
+
+
 def _summary_block(text):
     """The summary from "replayed ..." to the end of the findings, without
     the library's own log lines and without blank lines."""
@@ -169,6 +242,7 @@ if __name__ == "__main__":
     fails = 0
     for fn in (test_gnss_outage_windows_parse,
                test_gnss_outage_cut_is_anchored_on_the_first_imu_sample,
+               test_estimate_stays_in_the_replay_frame_after_an_origin_reset,
                test_gui_worker_and_replay_py_agree,
                test_gui_config_editor_covers_the_schema):
         try:

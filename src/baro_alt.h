@@ -140,6 +140,14 @@ typedef struct
      * variance regardless of the innovation size. Set through nav_suite_init()'s
      * propagation of ins_options_t.chi2_disable (REQ-SUITE-011). */
     bool chi2_disable; /**< true -> never chi2-downweight a fusion */
+
+    /** Accelerometer loss timeout [s] (REQ-BARO-027): an epoch this long
+     *  after the previous one stops the filter, which latches its a_b for the
+     *  restart (baro_alt_get_bias_carry). (0 -> default) */
+    float imu_loss_timeout_sec;
+    /** Initial a_b [m/s^2], e.g. the carry of a stopped instance
+     *  (REQ-BARO-027). */
+    float acc_bias_init_mps2;
 } baro_alt_config_t;
 
 /** @brief Filter instance. Initialise with baro_alt_init(). */
@@ -170,9 +178,18 @@ typedef struct
                                              non-finite state (health check) */
 
     /* Diagnostics (monotonic since baro_alt_init) */
-    uint32_t n_fuse_fail;     /**< failed fusion attempts */
-    uint32_t n_restart;       /**< times the precision watchdog marked the
-                                   filter uninitialized (REQ-BARO-021) */
+    uint32_t n_fuse_fail; /**< failed fusion attempts */
+    uint32_t n_restart;   /**< times the precision watchdog marked the
+                               filter uninitialized (REQ-BARO-021) */
+
+    /** a_b latched by an accelerometer loss (REQ-BARO-027), kept until the
+        next baro_alt_init. */
+    struct
+    {
+        bool  valid;
+        float acc_bias_mps2;        /**< as of the loss */
+        float acc_bias_stddev_mps2; /**< already inflated and clamped */
+    } bias_carry;
     uint32_t n_invalid_input; /**< epochs/samples dropped at the
                                    baro_alt_update() boundary (non-finite
                                    acc/quaternion or non-finite/implausible
@@ -434,6 +451,25 @@ extern "C"
      *  @param[in] pressure_pa Static pressure [Pa].
      *  @return Altitude above the p0 level [m]. */
     float baro_alt_pressure_to_altitude(float pressure_pa);
+
+    /** @brief a_b latched by an accelerometer loss (REQ-BARO-027), to seed
+     *  baro_alt_config_t.acc_bias_init_mps2 / acc_bias_init_stddev_mps2 of
+     *  the restart.
+     *
+     *  @param[in] b The filter instance.
+     *  @param[out] acc_bias_mps2 a_b [m/s^2].
+     *  @param[out] acc_bias_stddev_mps2 Its 1-sigma, inflated and clamped [m/s^2].
+     *  @return false if the filter has not stopped on a loss since its last
+     *  baro_alt_init(). */
+    bool baro_alt_get_bias_carry(const baro_alt_t* b, float* acc_bias_mps2,
+                                 float* acc_bias_stddev_mps2);
+
+    /** @brief Stop the filter on an accelerometer loss detected by the caller
+     *  (REQ-BARO-027), e.g. nav_suite. Latches the a_b carry, no-op if the
+     *  filter is not running.
+     *
+     *  @param[in,out] b The filter instance. */
+    void baro_alt_stop_imu_loss(baro_alt_t* b);
 
     /** @brief Is this a plausible static pressure sample?
      *  (finite and within ~16 km altitude .. below sea level)

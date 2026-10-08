@@ -493,6 +493,11 @@ extern "C"
      *  [rad/s^2/sqrt(Hz)] (<=0 -> ahrs's own default, no-op); same timing
      *  contract as ins_suite_set_ahrs_gyr_noise. */
     void ins_suite_set_ahrs_gyr_bias_rw(void* h, float density_rps2_sqrthz);
+    /** Set the ARS's/AHRS's SHARED extra attitude process noise
+     *  [rad/sqrt(s)], added on top of the gyro noise (<=0 -> none,
+     *  no-op); same timing contract as
+     *  ins_suite_set_ahrs_gyr_noise. */
+    void ins_suite_set_ahrs_rpy_pred_stddev(void* h, float stddev_rad_sqrts);
     /** Set the ARS's/AHRS's SHARED initial gyro-bias uncertainty [rad/s],
      *  all 3 axes (<=0 -> ahrs default, 1/1/5 deg/s xy/z). An INITIAL
      *  CONDITION, not a process-noise rate -- but it dominates yaw's

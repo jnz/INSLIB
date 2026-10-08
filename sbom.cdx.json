@@ -3,13 +3,13 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-09-28T00:00:00Z",
+    "timestamp": "2026-10-08T00:00:00Z",
     "component": {
       "type": "library",
       "name": "INSLIB",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "licenses": [{ "license": { "id": "AGPL-3.0-only" } }],
-      "purl": "pkg:github/jnz/INSLIB@v1.2.0"
+      "purl": "pkg:github/jnz/INSLIB@v1.2.1"
     }
   },
   "components": [

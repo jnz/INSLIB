@@ -31,6 +31,12 @@ as such.
 Feed it a long static log (ideally a few hours): the sensor sitting still on a
 bench, the longer the better for a stable RRW.
 
+Besides the two config values it reports the datasheet figures, for
+comparing a unit against its spec: the white noise as noise density and as
+angle/velocity random walk (the same coefficient, per sqrt(Hz) or per
+sqrt(h)), and the bias instability B = Allan deviation minimum / 0.664
+(IEEE Std 952, the flat floor flicker noise leaves at sqrt(2 ln2/pi) * B).
+
 Usage:
     python3 tools/allan_variance.py <imu.csv | dataset-dir> [options]
 
@@ -55,7 +61,6 @@ import argparse
 import math
 import os
 import sys
-import textwrap
 
 try:
     import numpy as np
@@ -82,6 +87,11 @@ _G = 9.80665
 # clusters is roughly a 25% 1-sigma uncertainty on the point itself, which
 # is about as loose as a fit input should get.
 MIN_CLUSTERS_FOR_FIT = 10
+
+# Bias instability B (IEEE Std 952): flicker (1/f) noise leaves a flat floor
+# in the Allan deviation at sigma = sqrt(2 ln2 / pi) * B = 0.664 * B, so B is
+# that floor divided by 0.664. Datasheets quote it as "Allan minimum / 0.664".
+BIAS_INSTABILITY_FACTOR = math.sqrt(2.0 * math.log(2.0) / math.pi)
 # A curve point counts toward an asymptote when its local log-log slope is
 # within this of the ideal (-1/2 for white noise, +1/2 for the random walk).
 ASYMPTOTE_SLOPE_TOL = 0.25
@@ -273,6 +283,20 @@ def _analyze_axis(taus, adev, duration):
             "tau_rise": float(rise[0]) if len(rise) else None}
 
 
+def _bias_instability(taus, adev, tau_max):
+    """(B, tau_at_min, resolved) of one axis: the Allan deviation minimum
+    over the trustworthy averaging times, divided by 0.664. A minimum at the
+    longest trustworthy tau is no floor yet (the curve is still falling
+    there), so it is only an upper bound, flagged by resolved=False."""
+    ok = (taus <= tau_max) & np.isfinite(adev) & (adev > 0.0)
+    if not np.any(ok):
+        return None, None, False
+    idx = np.flatnonzero(ok)
+    i_min = idx[int(np.argmin(adev[idx]))]
+    return (float(adev[i_min]) / BIAS_INSTABILITY_FACTOR, float(taus[i_min]),
+            bool(i_min != idx[-1]))
+
+
 def _tau_grid(tau0, duration, n=60):
     """Log-spaced averaging times from a few samples up to ~1/4 of the
     record (beyond that too few clusters remain), always including the RRW
@@ -392,6 +416,7 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
     has one (and how long it lasts)."""
     tau = RRW_TAU_S
     t_us, gyr, acc = read_imu(imu_path)
+    t_first_us = int(t_us[0])   # untrimmed start, the reference for "into the recording"
     if skip_start_sec > 0.0 or skip_end_sec > 0.0:
         t_rel = (t_us - t_us[0]) / 1e6
         keep = ((t_rel >= skip_start_sec)
@@ -409,7 +434,7 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
 
     taus = _tau_grid(tau0, duration)
     trimmed = (" (trimmed)" if skip_start_sec > 0.0 or skip_end_sec > 0.0 else "")
-    _progress_done(f"{n} samples, {_fmt_hms(duration)} @ {fs:.2f} Hz{trimmed}"
+    _progress_done(f"{n} samples, {_fmt_hms(duration)} @ {fs:.0f} Hz{trimmed}"
                    f" -> {len(taus)} averaging times, fitting up to "
                    f"tau={duration / MIN_CLUSTERS_FOR_FIT:.0f} s")
     progress_base = 0
@@ -433,12 +458,21 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
                         "check the recording is static and in m/s^2")
     # The Allan estimator integrates the samples assuming one uniform tau0,
     # so a dropout is silently treated as if no time had passed there.
+    # The worst gap is located by its last sample before the dropout, both as
+    # the raw file timestamp (to find the line) and as time since the start
+    # of the recording (to relate it to e.g. the bias-trace plot).
     gap_thresh = 10.0 * tau0
     n_gaps = int(np.count_nonzero(dt > gap_thresh))
+    gap_worst = None
     if n_gaps:
+        i_gap = int(np.argmax(dt))
+        gap_worst = {"len_s": float(dt[i_gap]), "t_us": int(t_us[i_gap]),
+                     "t_rel_s": (int(t_us[i_gap]) - t_first_us) / 1e6}
         warnings.append(f"{n_gaps} sampling gap(s) longer than {gap_thresh*1e3:.0f} ms "
-                        f"(worst {float(np.max(dt))*1e3:.0f} ms) - the Allan estimator "
-                        "assumes a uniform sample period and ignores them")
+                        f"(worst {gap_worst['len_s']*1e3:.0f} ms after t_us="
+                        f"{gap_worst['t_us']}, {_fmt_hms(gap_worst['t_rel_s'])} into the "
+                        "recording) - the Allan estimator assumes a uniform sample "
+                        "period and ignores them")
 
     # Rough stillness check: did the platform get disturbed (picked up,
     # bumped) somewhere in the middle of an otherwise-static recording?
@@ -460,15 +494,17 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
 
     result = {
         "n": n, "duration": duration, "fs": fs, "tau0": tau0,
+        "trimmed": bool(trimmed), "n_gaps": n_gaps, "gap_worst": gap_worst,
         "tau_rrw": tau, "warnings": warnings, "curves": {},
         "rrw": {}, "arw": {}, "diag": diag, "bias_trace": bias_trace,
         "motion_segments": motion_segments,
         "rrw_resolved": {}, "rrw_fit_mask": {},
+        "bi": {}, "bi_tau": {}, "bi_resolved": {},
         "tau_fit_max": duration / MIN_CLUSTERS_FOR_FIT,
     }
     for name, series in (("gyr", gyr), ("acc", acc)):
         rrw_axis, arw_axis, resolved_axis, mask_axis, curves = [], [], [], [], []
-        rise_axis = []
+        rise_axis, bi_axis = [], []
         for ax in range(3):
             _progress(f"Allan deviation: {name} {'xyz'[ax]}",
                       progress_base + len(rise_axis), 6)
@@ -480,12 +516,16 @@ def analyze(imu_path, skip_start_sec=0.0, skip_end_sec=0.0):
             resolved_axis.append(a["resolved"])
             mask_axis.append(a["mask"])
             rise_axis.append(a["tau_rise"])
+            bi_axis.append(_bias_instability(ta, ad, duration / MIN_CLUSTERS_FOR_FIT))
         progress_base += 3
         result["curves"][name] = curves
         result["rrw"][name] = rrw_axis
         result["arw"][name] = arw_axis
         result["rrw_resolved"][name] = resolved_axis
         result["rrw_fit_mask"][name] = mask_axis
+        result["bi"][name] = [b for b, _, _ in bi_axis]
+        result["bi_tau"][name] = [t for _, t, _ in bi_axis]
+        result["bi_resolved"][name] = [ok for _, _, ok in bi_axis]
 
         dead = [a for a, k in zip("xyz", rrw_axis) if k is None]
         if dead:
@@ -545,8 +585,114 @@ def _load_config_imu(path):
 
 def _fmt_now(cur, sugg):
     if cur and cur > 0:
-        return f"  (now {cur:.3e}, x{sugg / cur:.1f})"
+        return f"  (now {cur:.2g}, x{sugg / cur:.2g})"
     return "  (not set)"
+
+
+_DEG = 180.0 / math.pi
+
+# Every coefficient in the units it is met in. The SI unit comes first (the
+# filter's), the others are the SAME number rescaled: the white-noise
+# coefficient N is at once the noise density a datasheet quotes per
+# sqrt(Hz) and the angle/velocity random walk it quotes per sqrt(h), since
+# rad/s/sqrt(Hz) = rad/sqrt(s). Each entry: (ascii unit, unicode unit,
+# scale from SI, term or ""). ASCII for the console, which on Windows may
+# not encode the symbols, unicode for the PDF.
+_COEFF_UNITS = {
+    ("gyr", "arw"): [
+        ("rad/s/sqrt(Hz)", "rad/s/√Hz", 1.0, ""),
+        ("deg/s/sqrt(Hz)", "°/s/√Hz", _DEG, "noise density"),
+        ("deg/sqrt(h)", "°/√h", _DEG * 60.0, "angle random walk"),
+    ],
+    ("acc", "arw"): [
+        ("m/s^2/sqrt(Hz)", "m/s²/√Hz", 1.0, "noise density"),
+        ("(mm/s^2)/sqrt(Hz)", "(mm/s²)/√Hz", 1000.0, "noise density"),
+        ("m/s/sqrt(h)", "m/s/√h", 60.0, "velocity random walk"),
+        ("(mm/s)/sqrt(h)", "(mm/s)/√h", 60000.0, "velocity random walk"),
+    ],
+    ("gyr", "rrw"): [
+        ("rad/s/sqrt(s)", "rad/s/√s", 1.0, ""),
+        ("deg/s/sqrt(s)", "°/s/√s", _DEG, ""),
+        ("deg/h/sqrt(h)", "°/h/√h", _DEG * 3600.0 * 60.0, ""),
+    ],
+    ("acc", "rrw"): [
+        ("m/s^2/sqrt(s)", "m/s²/√s", 1.0, ""),
+        ("(mm/s^2)/sqrt(s)", "(mm/s²)/√s", 1000.0, ""),
+    ],
+    # scale None: the averaging time of the minimum instead of the value.
+    ("gyr", "bi"): [
+        ("rad/s", "rad/s", 1.0, ""),
+        ("deg/h", "°/h", _DEG * 3600.0, "bias instability"),
+        ("s", "s", None, "at averaging time tau"),
+    ],
+    ("acc", "bi"): [
+        ("m/s^2", "m/s²", 1.0, ""),
+        ("mm/s^2", "mm/s²", 1000.0, "bias instability"),
+        ("s", "s", None, "at averaging time tau"),
+    ],
+}
+
+# (sensor, kind, heading) in report order.
+_COEFF_SECTIONS = (
+    ("gyr", "arw", "gyro white noise, -1/2 asymptote at tau=1 s"
+                   " (noise density = angle random walk ARW, same number)"),
+    ("gyr", "bi", "gyro bias instability, Allan deviation minimum / 0.664"),
+    ("gyr", "rrw", "gyro bias random walk (RRW), +1/2 asymptote at tau=3 s"
+                   " (same number in each unit)"),
+    ("acc", "arw", "accel white noise, -1/2 asymptote at tau=1 s"
+                   " (noise density = velocity random walk VRW, same number)"),
+    ("acc", "bi", "accel bias instability, Allan deviation minimum / 0.664"),
+    ("acc", "rrw", "accel bias random walk (RRW), +1/2 asymptote at tau=3 s"),
+)
+
+
+def _coeff_cells(result, name, kind, scale, unicode=False):
+    """Per-axis value strings of one coefficient in one unit. A value that
+    came from the upper bound rather than a real fit is prefixed '<=' so it
+    can never be mistaken for a measurement."""
+    vals = result[kind][name] if scale is not None else result[f"{kind}_tau"][name]
+    resolved = result.get(f"{kind}_resolved", {}).get(name)
+    cells = []
+    for i, v in enumerate(vals):
+        if v is None:
+            cells.append("n/a")
+            continue
+        if scale is None:
+            cells.append(f"{v:.0f}")
+            continue
+        lead = "" if resolved is None or resolved[i] else ("≤" if unicode else "<=")
+        cells.append(lead + (f"{v:.1e}" if scale == 1.0 else _fmt_sig2(v * scale)))
+    return cells
+
+
+def _fmt_sig2(v):
+    """Two significant digits, plain decimal where that stays readable. The
+    estimates are not better than that (fit uncertainty, axis spread, and
+    a filter is tuned in factors of two anyway), so more digits would only
+    suggest a precision the numbers do not have."""
+    a = abs(v)
+    if a == 0.0 or not math.isfinite(v):
+        return f"{v:g}"
+    if a < 1e-3 or a >= 1e4:
+        return f"{v:.1e}"
+    return f"{v:.{max(0, 1 - math.floor(math.log10(a)))}f}"
+
+
+def _config_lines(result, config_imu, unicode=False):
+    """(key, value, unit, remark) of the suggested config.yaml imu: values."""
+    sq = "²" if unicode else "^2"
+    rt = "√s" if unicode else "sqrt(s)"
+    rows = []
+    for key, unit in (("gyr_psd", f"(rad/s){sq}/Hz"), ("acc_psd", f"(m/s{sq}){sq}/Hz"),
+                      ("gyr_bias_rw", f"rad/s/{rt}"), ("acc_bias_rw", f"m/s{sq}/{rt}")):
+        val = result[key]
+        remark = _fmt_now(config_imu.get(key), val).strip()
+        if unicode:
+            remark = remark.replace(", x", ", ×")
+        if key.endswith("bias_rw") and not result[f"{key[:3]}_bias_rw_resolved"]:
+            remark += "  UPPER BOUND (not resolved)"
+        rows.append((key, val, unit, remark))
+    return rows
 
 
 def format_report(result, config_imu=None):
@@ -555,51 +701,25 @@ def format_report(result, config_imu=None):
     r = result
     out = []
     out.append(f"Allan-variance IMU noise analysis "
-               f"(n={r['n']}, {r['duration']:.0f} s @ {r['fs']:.1f} Hz)")
+               f"(n={r['n']}, {r['duration']:.0f} s @ {r['fs']:.0f} Hz)")
     for w in r["warnings"]:
         out.append(f"  WARNING: {w}")
 
-    def _axes(vals, unit, resolved=None):
-        """One line of per-axis values. A value that came from the upper
-        bound rather than a real fit is prefixed '<=' so it can never be
-        mistaken for a measurement."""
-        cells = []
-        for i, v in enumerate(vals):
-            if v is None:
-                cells.append(f"{'xyz'[i]}: n/a")
-                continue
-            lead = "" if resolved is None or resolved[i] else "<="
-            cells.append(f"{'xyz'[i]}: {lead}{v:.3e}")
-        return "    " + "   ".join(cells) + f"  {unit}"
+    for name, kind, heading in _COEFF_SECTIONS:
+        out.append(f"  {heading}:")
+        for unit, _, scale, term in _COEFF_UNITS[(name, kind)]:
+            cells = _coeff_cells(r, name, kind, scale)
+            line = "    " + "  ".join(f"{'xyz'[i]}: {c:<12}" for i, c in enumerate(cells))
+            out.append((f"{line}  {unit:<17}" + (f"  ({term})" if term else "")).rstrip())
 
-    out.append(f"  gyro bias random walk (RRW), +1/2 asymptote at tau={r['tau_rrw']:g} s:")
-    out.append(_axes(r["rrw"]["gyr"], "rad/s/sqrt(s)", r["rrw_resolved"]["gyr"]))
-    out.append(f"  accel bias random walk (RRW), +1/2 asymptote at tau={r['tau_rrw']:g} s:")
-    out.append(_axes(r["rrw"]["acc"], "m/s^2/sqrt(s)", r["rrw_resolved"]["acc"]))
-
-    out.append("  suggested bias random walk for config.yaml `imu:` "
-               "(worst axis):")
-    for key, unit in (("gyr_bias_rw", "rad/s/sqrt(s)"), ("acc_bias_rw", "m/s^2/sqrt(s)")):
-        val = r[key]
-        note = "" if r[f"{key[:3]}_bias_rw_resolved"] else "  UPPER BOUND (not resolved)"
-        out.append(f"    {key}: {val:.3e}   # {unit}"
-                   f"{_fmt_now(config_imu.get(key), val)}{note}")
-
-    # N (the ARW/VRW coefficient) is an AMPLITUDE spectral density; the
+    # N (the white-noise coefficient) is an AMPLITUDE spectral density; the
     # config's *_psd is the POWER one, i.e. N^2. Both are printed because
     # datasheets quote the former and the filter wants the latter, and
     # reporting only one invites squaring it twice or not at all.
-    out.append("  gyro white noise (ARW), -1/2 asymptote at tau=1 s:")
-    out.append(_axes(r["arw"]["gyr"], "rad/s/sqrt(Hz)  (= rad/sqrt(s))"))
-    out.append("  accel white noise (VRW), -1/2 asymptote at tau=1 s:")
-    out.append(_axes(r["arw"]["acc"], "m/s^2/sqrt(Hz)"))
-
-    out.append("  config psd = that coefficient SQUARED (PSD - a power "
-               "spectral density):")
-    out.append(f"    gyr_psd: {r['gyr_psd']:.3e}   # (rad/s)^2/Hz"
-               f"{_fmt_now(config_imu.get('gyr_psd'), r['gyr_psd'])}")
-    out.append(f"    acc_psd: {r['acc_psd']:.3e}   # (m/s^2)^2/Hz"
-               f"{_fmt_now(config_imu.get('acc_psd'), r['acc_psd'])}")
+    out.append("  suggested config.yaml `imu:` values (psd = (Nx^2 + Ny^2 + Nz^2)/3,"
+               " N = noise density; bias_rw = worst axis):")
+    for key, val, unit, remark in _config_lines(r, config_imu):
+        out.append(f"    {key + ':':<13}{val:.1e}   # {unit:<16}{remark}")
     return "\n".join(out)
 
 
@@ -635,39 +755,146 @@ def _ref_line_anchors(result, name):
     return x_left, x_right, k_rrw, n_arw
 
 
-def _wrap_report_text(text, width=100):
-    """Word-wrap each line of a report to `width` chars, keeping its
-    leading whitespace as indent (continuation lines get 2 extra spaces)
-    - format_report()'s WARNING lines especially can run well past a
-    monospace page's usable width otherwise."""
-    out = []
-    for line in text.split("\n"):
-        stripped = line.lstrip()
-        indent = line[:len(line) - len(stripped)]
-        if not stripped:
-            out.append(line)
-            continue
-        wrapped = textwrap.wrap(stripped, width=max(20, width - len(indent))) or [""]
-        out.append(indent + wrapped[0])
-        out.extend(indent + "  " + cont for cont in wrapped[1:])
-    return "\n".join(out)
+def _place_text(fig, x, y, text, **kw):
+    """Draw `text` with its top at figure fraction `y` and return the
+    figure-fraction y of its bottom edge, including a bbox frame if one is
+    given. The report page is stacked from these measurements, so a longer
+    warning or an extra coefficient row pushes the blocks below it down
+    instead of overlapping them."""
+    t = fig.text(x, y, text, va="top", ha="left", **kw)
+    renderer = fig.canvas.get_renderer()
+    patch = t.get_bbox_patch()
+    if patch is not None:
+        t.update_bbox_position_size(renderer)
+        bbox = patch.get_window_extent(renderer)
+    else:
+        bbox = t.get_window_extent(renderer=renderer)
+    return float(bbox.transformed(fig.transFigure.inverted()).y0)
+
+
+# Frame of the report page's config.yaml and warnings boxes.
+_BOX_STYLE = dict(boxstyle="square,pad=0.7", fc="#f0f0f0", ec="black", lw=0.8)
 
 
 def _report_page(result, config_imu):
-    """Text-only page for the --plot PDF's 2nd page: dataset stats plus the
-    same report printed to the console (format_report)."""
+    """The --plot PDF's 2nd page: the console report laid out as a page,
+    recording stats, warnings in a highlighted box, all coefficients in one
+    table in SI and datasheet units, and the config.yaml values in a box
+    ready to copy."""
     import matplotlib.pyplot as plt
+    r = result
     fig = plt.figure(figsize=(8.5, 11))
-    fig.text(0.5, 0.97, "Allan-variance IMU noise analysis - report",
-             ha="center", fontsize=13, weight="bold")
-    stats = (
-        f"samples        : {result['n']}\n"
-        f"duration       : {result['duration']:.1f} s  ({_fmt_hms(result['duration'])})\n"
-        f"sample rate    : {result['fs']:.2f} Hz\n"
-        f"sample period  : {result['tau0'] * 1000:.3f} ms\n"
-    )
-    body = _wrap_report_text(stats + "\n" + format_report(result, config_imu))
-    fig.text(0.06, 0.90, body, va="top", ha="left", fontsize=9, family="monospace")
+    x0, x1 = 0.07, 0.93
+    fig.text(0.5, 0.965, "Allan-variance IMU noise analysis - report",
+             ha="center", fontsize=14, weight="bold")
+
+    def note(y, paragraphs):
+        """Small grey footnote, each paragraph wrapped to the page width."""
+        lines = []
+        for par in paragraphs:
+            lines.extend(_wrap_to_width(fig, par, 7.2, x1 - x0))
+        return _place_text(fig, x0, y, "\n".join(lines), fontsize=7.2,
+                           color="#555555", linespacing=1.35)
+
+    def heading(y, text):
+        return _place_text(fig, x0, y, text, fontsize=10.5, weight="bold",
+                           color="#1f3b5a") - 0.006
+
+    # --- recording ---------------------------------------------------------
+    y = heading(0.93, "Recording")
+    gap = r.get("gap_worst")
+    gap_txt = ("none" if not gap else
+               f"{r['n_gaps']}, worst {gap['len_s'] * 1e3:.0f} ms after t_us={gap['t_us']}"
+               f" ({_fmt_hms(gap['t_rel_s'])} into the recording)")
+    stats = [
+        ("samples", f"{r['n']}"),
+        ("duration", f"{_fmt_hms(r['duration'])}  ({r['duration']:.0f} s)"
+                     + ("  trimmed" if r.get("trimmed") else "")),
+        ("sample rate", f"{r['fs']:.0f} Hz"),
+        ("sample period", f"{r['tau0'] * 1000:.3f} ms"),
+        ("sampling gaps", gap_txt),
+    ]
+    y = _place_text(fig, x0 + 0.01, y, "\n".join(f"{k:<15}{v}" for k, v in stats),
+                    fontsize=8.5, family="monospace", linespacing=1.45) - 0.015
+
+    # --- config.yaml ---------------------------------------------------------
+    y = heading(y, "Suggested config.yaml values")
+    cfg = ["imu:"]
+    for key, val, unit, remark in _config_lines(r, config_imu, unicode=True):
+        # Without --config there is nothing to compare against, and a
+        # "(not set)" on every line would only be noise in the box.
+        remark = remark.replace("(not set)", "").strip()
+        cfg.append(f"  {key + ':':<13}{val:.1e}    # {unit:<13}{remark}".rstrip())
+    y = _place_text(fig, x0 + 0.012, y - 0.008, "\n".join(cfg), fontsize=8.5,
+                    family="monospace", linespacing=1.5, bbox=_BOX_STYLE) - 0.025
+    y = note(y, ["psd = (Nx² + Ny² + Nz²)/3, N = noise density. bias_rw = worst axis.",
+             "Static values are a floor: in motion, vibration and model errors add"
+             " to them."]) - 0.018
+
+    # --- warnings ----------------------------------------------------------
+    if r["warnings"]:
+        y = heading(y, f"Warnings ({len(r['warnings'])})")
+        lines = []
+        for w in r["warnings"]:
+            wrapped = _wrap_to_width(fig, w.replace("<=", "≤").replace("tau", "τ"),
+                                     8.0, (x1 - x0) - 0.06)
+            lines.append("•  " + wrapped[0])
+            lines.extend("    " + ln for ln in wrapped[1:])
+        y = _place_text(fig, x0 + 0.012, y - 0.008, "\n".join(lines), fontsize=8.0,
+                        linespacing=1.35, bbox=_BOX_STYLE) - 0.02
+
+    # --- coefficient table ---------------------------------------------------
+    y = heading(y, "Noise coefficients (per axis)")
+    rows, row_kind = [], []
+    for name, kind, title in _COEFF_SECTIONS:
+        rows.append([title.replace("tau", "τ"), "", "", "", ""])
+        row_kind.append("section")
+        for _, unit, scale, term in _COEFF_UNITS[(name, kind)]:
+            cells = _coeff_cells(r, name, kind, scale, unicode=True)
+            rows.append([f"    {term.replace('tau', 'τ')}" if term else "", unit] + cells)
+            row_kind.append("value")
+    row_h = 0.0148
+    h = row_h * (len(rows) + 1)
+    ax = fig.add_axes([x0, y - h, x1 - x0, h])
+    ax.axis("off")
+    tbl = ax.table(cellText=rows, colLabels=["", "unit", "x", "y", "z"],
+                   colWidths=[0.40, 0.18, 0.14, 0.14, 0.14],
+                   cellLoc="left", bbox=[0.0, 0.0, 1.0, 1.0])
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7.2)
+    for (ri, ci), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#c8ccd2")
+        cell.set_linewidth(0.5)
+        if ri == 0:
+            cell.set_facecolor("#1f3b5a")
+            cell.get_text().set_color("white")
+            cell.get_text().set_weight("bold")
+        elif row_kind[ri - 1] == "section":
+            cell.set_facecolor("#e8edf3")
+            cell.get_text().set_weight("bold")
+            cell.visible_edges = "TB" if ci else "LTB"
+            if ci == 4:
+                cell.visible_edges = "RTB"
+        if ci >= 2 and ri > 0:
+            cell.get_text().set_family("monospace")
+    # A section title spans the whole row. As cell text it would be painted
+    # over by the cells to its right, so it is drawn on top of the table.
+    n_rows = len(rows) + 1
+    for ri, kind in enumerate(row_kind, start=1):
+        if kind == "section":
+            ax.text(0.012, 1.0 - (ri + 0.5) / n_rows, tbl[ri, 0].get_text().get_text(),
+                    transform=ax.transAxes, va="center", ha="left", fontsize=7.2,
+                    weight="bold", zorder=10)
+            tbl[ri, 0].get_text().set_text("")
+    y = y - h - 0.012
+    y = note(y, ["Noise density and angle/velocity random walk are the same number:"
+                 " rad/s/√Hz = rad/√s, and ×60 turns 1/√s into 1/√h.",
+                 "Bias instability B: flicker noise leaves a flat Allan floor at"
+                 " σ = √(2 ln2/π)·B = 0.664·B, hence minimum / 0.664 (IEEE Std 952).",
+                 "≤ marks an upper bound: for the random walk the record is too short"
+                 " for the +1/2 branch, for the bias instability the curve is still"
+                 " falling at the longest trustworthy τ."]) - 0.025
+
     return fig
 
 
@@ -767,6 +994,11 @@ def _formulas_page():
         ("m", r"$\sigma(\tau) = K\sqrt{\tau/3} \ \Rightarrow\ "
               r"K = \sigma_{+1/2}(3\,\mathrm{s})$"),
         ("gap", ""),
+        ("p", r"Bias instability (flicker noise, flat floor of the curve), read out"
+              r" at the minimum (IEEE Std 952):"),
+        ("m", r"$\sigma_{min} = \sqrt{2\ln 2/\pi}\ B \approx 0.664\,B"
+              r" \ \Rightarrow\ B = \sigma_{min}/0.664$"),
+        ("gap", ""),
         ("p", r"$K$ is exactly the process-noise density the filter's bias_rw"
               r" parameter expects (units $[\mathrm{unit}/\sqrt{s}]$). Per Kalman"
               r" predict step, and over an unaided coast of $T$ seconds:"),
@@ -863,33 +1095,33 @@ def _bias_motion_page(result):
     def _win_txt(sec):
         return f"{sec/60.0:.0f} min" if sec >= 90.0 else f"{sec:.0f} s"
 
-    gyr_trace = np.degrees(trace["gyr_mean"]) * 3600.0                 # deg/h
+    gyr_trace = np.degrees(trace["gyr_mean"]) * 3600.0                 # °/h
     gyr_trace -= np.median(gyr_trace, axis=0)
     for i, lbl in enumerate("xyz"):
         axes[0, 0].plot(t_h_trace, gyr_trace[:, i], lw=0.8, label=lbl)
     axes[0, 0].set_ylim(*_robust_ylim(gyr_trace))
     axes[0, 0].set_title(f"gyro bias trace ({_win_txt(trace_win)} mean, rel. to median)")
-    axes[0, 0].set_ylabel("bias [deg/h]")
+    axes[0, 0].set_ylabel("bias [°/h]")
 
-    acc_trace = trace["acc_mean"] * 1000.0                             # mm/s^2
+    acc_trace = trace["acc_mean"] * 1000.0                             # mm/s²
     acc_trace -= np.median(acc_trace, axis=0)
     for i, lbl in enumerate("xyz"):
         axes[0, 1].plot(t_h_trace, acc_trace[:, i], lw=0.8, label=lbl)
     axes[0, 1].set_ylim(*_robust_ylim(acc_trace))
     axes[0, 1].set_title(f"accel bias trace ({_win_txt(trace_win)} mean, rel. to median)")
-    axes[0, 1].set_ylabel("bias [mm/s^2]")
+    axes[0, 1].set_ylabel("bias [mm/s²]")
 
     axes[1, 0].semilogy(t_h, np.degrees(diag["gyr_peak_rps"]), color="tab:gray", lw=0.6)
     axes[1, 0].axhline(MOTION_GYR_THRESH_DPS, color="tab:red", ls="--", lw=1,
-                       label=f"motion threshold {MOTION_GYR_THRESH_DPS:g} deg/s")
+                       label=f"motion threshold {MOTION_GYR_THRESH_DPS:g} °/s")
     axes[1, 0].set_title("gyro peak deviation from rest (stillness check)")
-    axes[1, 0].set_ylabel("peak |gyro - median| [deg/s]")
+    axes[1, 0].set_ylabel("peak |gyro − median| [°/s]")
 
     axes[1, 1].semilogy(t_h, diag["acc_peak_mps2"], color="tab:gray", lw=0.6)
     axes[1, 1].axhline(MOTION_ACC_THRESH_MPS2, color="tab:red", ls="--", lw=1,
-                       label=f"motion threshold {MOTION_ACC_THRESH_MPS2:g} m/s^2")
+                       label=f"motion threshold {MOTION_ACC_THRESH_MPS2:g} m/s²")
     axes[1, 1].set_title("accel peak deviation from rest (stillness check)")
-    axes[1, 1].set_ylabel("peak |accel - median| [m/s^2]")
+    axes[1, 1].set_ylabel("peak |accel − median| [m/s²]")
 
     segments = result.get("motion_segments") or []
     for seg in segments:
@@ -923,7 +1155,7 @@ def plot_curves(result, out_path, config_imu=None):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     tau_rrw = result["tau_rrw"]
     tau_fit_max = result["tau_fit_max"]
-    for axi, (name, unit) in enumerate((("gyr", "rad/s"), ("acc", "m/s^2"))):
+    for axi, (name, unit) in enumerate((("gyr", "rad/s"), ("acc", "m/s²"))):
         axp = axes[axi]
         for ax, (ta, ad) in enumerate(result["curves"][name]):
             axp.loglog(ta, ad, lw=1.0, label="xyz"[ax])
@@ -954,7 +1186,7 @@ def plot_curves(result, out_path, config_imu=None):
         arw_x = np.array([x_left, x_right])
         arw_y = n_arw * (arw_x / ARW_TAU_S) ** -0.5
         axp.loglog(arw_x, arw_y, "--", color="tab:blue", lw=1.2,
-                  label="white noise -1/2 asymptote, fit")
+                  label="white noise −1/2 asymptote, fit")
         axp.plot(ARW_TAU_S, n_arw, "o", color="tab:blue", ms=5)
         axp.axvline(ARW_TAU_S, color="tab:blue", ls=":", lw=0.7, alpha=0.5)
 
@@ -970,10 +1202,10 @@ def plot_curves(result, out_path, config_imu=None):
         axp.set_ylim(float(np.min(y_all)) / 1.5, float(np.max(y_all)) * 1.5)
 
         axp.set_title(f"{name} Allan deviation")
-        axp.set_xlabel("tau [s]")
-        axp.set_ylabel(f"sigma [{unit}]")
+        axp.set_xlabel("τ [s]")
+        axp.set_ylabel(f"σ [{unit}]")
         axp.grid(True, which="both", alpha=0.3)
-        axp.legend(fontsize=6.5, loc="upper left")
+        axp.legend(fontsize=6.5, loc="lower right", framealpha=0.85)
     fig.tight_layout()
 
     if os.path.splitext(out_path)[1].lower() == ".pdf":

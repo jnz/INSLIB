@@ -58,6 +58,21 @@ def test_ecef_roundtrip():
     assert abs(h - _H) < 1e-4
 
 
+def test_config_defers_defaults_to_c():
+    """Config keeps no tuning numbers of its own: every numeric default is
+    0, which the C library resolves to its own default. A number here would
+    be a second copy of an ins.c constant, silently diverging from it."""
+    import dataclasses
+    for f in dataclasses.fields(Config):
+        v = f.default
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, tuple):
+            assert all(x == 0 for x in v), f"{f.name} defaults to {v}"
+        elif isinstance(v, (int, float)):
+            assert v == 0, f"{f.name} defaults to {v}"
+
+
 def test_rpy_to_quat_identity():
     """Zero attitude -> identity quaternion; 90 deg yaw -> [c,0,0,s]."""
     q = rpy_to_quat(0.0, 0.0, 0.0)
@@ -448,6 +463,7 @@ def test_automotive_yaw_from_gnss_course():
 
 _TESTS = [
     test_ecef_roundtrip,
+    test_config_defers_defaults_to_c,
     test_rpy_to_quat_identity,
     test_ins_level_convergence,
     test_predict_correct_equivalence,

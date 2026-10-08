@@ -16,9 +16,9 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.7% (4129/4140) |
-| C1 (Branch) | 92.2% (2757/2989) |
-| MC/DC | 92.1% (2735/2968) |
+| C0 (Line) | 99.6% (4261/4277) |
+| C1 (Branch) | 91.9% (2832/3081) |
+| MC/DC | 91.8% (2810/3060) |
 <!-- COVERAGE:END -->
 
 <!-- STACK:START -->
@@ -26,8 +26,8 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Entry point | x86_64-linux-gnu, GCC 14.2.0 |
 |---|---:|
-| `nav_suite_update()` | 13488 |
-| `ins_update()` | 12112 |
+| `nav_suite_update()` | 13216 |
+| `ins_update()` | 11840 |
 | `ahrs_update()` | 8240 |
 | `baro_alt_update()` | 7904 |
 | `nav_suite_init()` | 2704 |
@@ -43,10 +43,10 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 ## Overview
 
 INSLIB is a portable C library for 3D navigation state estimation.  Its core is
-a set of Kalman filters fusing measurements from an inertial
-measurement unit (IMU) with GNSS/GPS measurements, barometer, magnetometer,
-local position references, absolute yaw references, scalar ground speed and
-zero-velocity / zero-rotation information.
+a set of Kalman filters fusing measurements from an inertial measurement unit
+(IMU) with GNSS/GPS measurements, barometer, magnetometer, local position
+references, absolute yaw references (GNSS compassing), scalar ground speed
+(wheel thicks) and zero-velocity / zero-rotation information.
 
 **Typical use cases:**
 * Drones (UAVs) and autonomous vehicles
@@ -67,36 +67,29 @@ helper programs and GUI apps are included in this repository.
 * Battle tested heavily with real world data and edge cases
 * Measurement delay compensation and estimation (e.g. GNSS/GPS receivers typically have more than 100-200 milliseconds of latency due to processing, internal filtering, UART transmission, etc.)
 * Suited for UAVs: during a GNSS outage the filter keeps providing an inertial-fused altitude (via the parallel `baro_alt` vertical channel) and full attitude, not just raw IMU integration
-* UAVs that only need roll/pitch, no yaw/heading, can skip the magnetometer entirely: the standalone `AHRS_MODE_ARS` mode (5-state, freely-integrated yaw) runs from IMU data alone
+* UAVs that only need roll/pitch, no yaw/heading, can skip the magnetometer entirely: the standalone `AHRS_MODE_ARS` mode (5-state, gyro compass yaw) runs from IMU data alone
 * Robust UDU/Bierman-Thornton Kalman Filter routines for numerically robust square-root filtering (effective precision for covariance is increased)
 * Worst-Case-Execution Time (WCET) friendly: no unbounded loops, recursion, suitable for real-time control loops
-* **Known stack usage**: static worst-case stack analysis of every public API function (`make stack`, using GCC's `-fcallgraph-info`), deliberately failing on recursion, variable length arrays or unresolved function pointer calls, so the stack of the task running the filter can be sized from a number instead of a guess
-* Strong static code analysis tests (undefined behaviour sanitizer **UBSan, ASan**)
+* **Known stack usage**: static worst-case stack analysis of every public API function (`make stack`, using GCC's `-fcallgraph-info`)
+* Static code analysis tests (incl. undefined behaviour sanitizer **UBSan**, address sanitizer **ASan**)
 * Built-in light-weight World Magnetic Model (WMM) for magnetometer declination compensation
 * No heap, no OS dependencies, portable code: runs on bare-metal **embedded** targets as well as on a desktop computer
 * 32-bit float (IEEE 754) for most calculations (except for GNSS/GPS coordinates), no 64-bit double precision hardware floating point unit (FPU) required
 * Calibration tools included to calibrate sensor bias, scale, and misalignment without expensive calibration hardware (Tedaldi et al., ICRA 2014)
 
 
-## Library Architecture Block Diagram
-
-![Block diagram](doc/figures/block_diagram.svg)
-
 ## Post Processing Quickstart
 
 ![Post processing GUI screenshot](doc/figures/inspostgui_screenshot.png)
 
 `inspostgui.py` is a GUI to post-process measurements: open a dataset's config
-YAML (it sits next to the CSVs, a directory may hold several variants such as
-`config.yaml` and `config_experimental.yaml`), tweak its settings, and replay it.
-Keyboard: `F5` run, `Space` pause/resume, `Esc` stop, `Ctrl+O` open,
-`Ctrl+S` save the config, `Ctrl+1`..`Ctrl+5` switch tab.
+YAML (contains filter settings and points to the `.csv` files), tweak its
+settings, and replay it.
 
 **Windows, no Python needed:** download `inspostgui-<version>-windows-x64.zip` from the
 [latest release](https://github.com/jnz/INSLIB/releases/latest), unzip it (keep the folder
 together) and start `inspostgui.exe`. Windows may show a SmartScreen warning, the
-executable is not code signed. Everywhere else, or to work on the code, run it
-from source:
+code is not signed. Otherwise run the Python source directly:
 
 ```sh
 sh python/setup_venv.sh               # one-time (also runs `make pylib`)
@@ -107,13 +100,14 @@ python3 tools/inspostgui.py datasets/fog
 ### `.csv` Data Format
 
 The input format is plain CSV, one file per sensor. First item is a common
-`t_us` timestamp in microseconds. IMU example:
+`t_us` timestamp in microseconds. IMU (gyroscope and accelerometer) example in
+the Front/Right/Down (FRD) body coordinate system:
 
 ```text
-# t_us, gyr_frd_x [rad/s], gyr_frd_y [rad/s], gyr_frd_z [rad/s], acc_frd_x [m/s^2], acc_frd_y [m/s^2], acc_frd_z [m/s^2]
-0,-0.0016361766,-1.39143679e-08,-0.000272652038,-0.114920214,0.191539065,-9.84495283
-50003,-0.0016361766,-1.39143679e-08,-0.000272652038,-0.114920214,0.191539065,-9.84495283
-100005,-0.000272652038,-0.000272707696,0.000818123087,-0.0861961461,0.248990132,-9.7587816
+# t_us, gyr_frd_x[rad/s], gyr_frd_y[rad/s], gyr_frd_z[rad/s], acc_frd_x[m/s^2], acc_frd_y[m/s^2], acc_frd_z[m/s^2]
+0,      -0.0016,          0.0000,           -0.0003,          -0.1149,          0.1915,           -9.8450
+5000,   -0.0014,          0.0020,           -0.0001,          -0.1231,          0.2316,           -9.8221
+10000,  -0.0003,         -0.0003,            0.0008,          -0.0862,          0.2490,           -9.7588
 ```
 
 GNSS/magnetometer/barometer/speed `.csv` files follow the same pattern. Example files:
@@ -126,9 +120,9 @@ GNSS/magnetometer/barometer/speed `.csv` files follow the same pattern. Example 
 
 ### `config.yaml`
 
-A dataset directory with CSV files contains one `config.yaml` that
-tells the filter how to run: aiding mode, sensor noise, lever arms, which
-channels are enabled. Two examples to start from:
+A dataset directory with CSV files contains a configuration file
+(`config.yaml`) that tells the filter how to run, which modes are active,
+tuning settings and options. Two examples to start from:
 [doc/example_conf/config_basic.yaml](doc/example_conf/config_basic.yaml)
 (GNSS+IMU+baro+mag) and
 [doc/example_conf/config_local_inertial.yaml](doc/example_conf/config_local_inertial.yaml)
@@ -151,7 +145,6 @@ Example PDF plot output from `replay.py`:
 ![PDF Plots](doc/figures/example_plot_pdf.png)
 
 Google Earth `.kml` output is also possible with `--kml output.kml`.
-Info: The Google Earth web version does not support track animations (yet?).
 
 ![Google Earth KML/KMZ Output](doc/gif/google_earth.gif)
 
@@ -161,7 +154,7 @@ Info: The Google Earth web version does not support track animations (yet?).
 
 GNSS receivers report data with some latency
 (transmission, internal processing, filtering) but
-receiver and configuration dependent. `inspostgui.py` and `replay.py` measure
+this is receiver and configuration dependent. `inspostgui.py` and `replay.py` measure
 the real value for a specific configuration: IMU + barometric altitude has near-zero
 latency, cross-correlating its vertical velocity against the
 GNSS-reported vertical velocity around a real climb/descent results in a lag
@@ -176,11 +169,11 @@ python3 tools/replay.py datasets/pedestrian/07_outdoor_only/ --estimate-gnss-del
 
 ![Live data flow](doc/figures/block_diagram_live.svg)
 
-`insrcv` listens for UDP packets with sensor measurements. The packet
-format is documented in [tools/inslib_protocol.md](tools/inslib_protocol.md).
-Any process that sends this protocol format can feed it on UDP port `29800`
-(default). Output goes to PlotJuggler (UDP `:9870`, JSON) and optionally in
-MAVLink format (UDP `:14550`).
+`insrcv` listens for UDP packets with sensor measurements. This custom packet
+format (extending the UBX format) is documented in
+[tools/inslib_protocol.md](tools/inslib_protocol.md).  Any process that sends
+this protocol format can feed it on UDP port `29800` (default). Output goes to
+PlotJuggler (UDP `:9870`, JSON) and optionally in MAVLink format (UDP `:14550`).
 
 ```sh
 make insrcv
@@ -190,6 +183,7 @@ make insrcv
 ## Tutorials
 
 * [tutorial/c_tutorial.md](tutorial/c_tutorial.md): use the library from **C/C++**: a full example
+* [tutorial/c_attitude_tutorial.md](tutorial/c_attitude_tutorial.md): roll and pitch from gyroscope and accelerometer only (no GNSS, magnetometer or barometer), with the minimal list of source files to copy
 * [tutorial/python_tutorial.md](tutorial/python_tutorial.md): the filter from Python in a few lines, including installation
 * [doc/INSLIB_manual.pdf](doc/INSLIB_manual.pdf): documentation, including filter design and math background
 
@@ -197,9 +191,10 @@ make insrcv
 
 ## GNSS inputs
 
+* Standard single point positioning with pseudoranges (and optionally SBAS corrections)
 * Galileo High Accuracy Service (HAS) support from e.g. u-blox X20-series for `<10 cm` horizontal accuracy (1-sigma) without a correction service (requires compatible antenna)
 * u-blox SPARTN/PointPerfect Flex (commercial) correction stream supported for `3-6 cm` accuracy and convergence in seconds (source: [u-blox](https://www.u-blox.com/en/product/pointperfectflex))
-* RTK via NTRIP RTCM corrections for `1 cm` accuracy, from your own GNSS base station, a virtual base station, or a regional service such as SAPOS
+* RTK via NTRIP RTCM corrections for `~1 cm` accuracy, from your own GNSS base station, a virtual base station, or a regional service such as SAPOS
 
 ## Supported sensors
 
@@ -209,7 +204,7 @@ make insrcv
 * Magnetometers
 * Barometers
 * Local motion capture systems (mocap, like Lighthouse)
-* OBDII Odometry Reader
+* OBDII Odometry Reader (wheel speed)
 * Virtual zero velocity (ZUPT), zero rotation rate (ZARU) sensors
 
 ## Real world data sets
@@ -250,18 +245,16 @@ sh python/setup_venv.sh      # one-time (Windows: python\setup_venv.bat)
 ```
 
 `make check-all` (see `coding_style.md`) additionally wants `clang-format`,
-`cppcheck`, `clang-tidy`, `lcov` and `doxygen`. Their exact versions matter
-for `make format-check` in particular; on a non-Ubuntu-22.04 machine, run
-`scripts/fetch_ci_clang_format.sh` once to match CI bit-for-bit.
+`cppcheck`, `clang-tidy`, `lcov` and `doxygen`.
 
 ## Directory Structure
 
 ```text
 📂 inslib/
 ├── Makefile              # Build: make test, make insrcv, ...
-├── src/                  # Core library (.c/.h), no heap, no OS dependencies
+├── src/                  # Core library (.c/.h)
 │   └── nav_suite.h       # Main header: INS + AHRS + baro_alt wrapper
-├── KFCore/               # Submodule: linear algebra, UDU/Bierman-Thornton filter
+├── KFCore/               # Submodule: linear algebra, Kalman UDU filter
 ├── tests/                # Unit/integration tests
 ├── datasets/             # Real-world + simulated replay datasets
 ├── tools/                # Command line programs: insrcv, replay (C and Python), post-processing GUI, calibration, receiver setup, protocol
@@ -270,6 +263,11 @@ for `make format-check` in particular; on a non-Ubuntu-22.04 machine, run
 ├── doc/                  # Documentation, Doxygen, images
 └── tutorial/             # Minimal C + Python usage examples
 ```
+
+## Library Architecture Block Diagram
+
+![Block diagram](doc/figures/block_diagram.svg)
+
 
 ## Reference Hardware
 
@@ -285,7 +283,7 @@ you're interested in a collaboration with my university institute or in getting 
 
 ![Image of reference hardware](doc/figures/reference_board.jpg)
 
-Building your own sensor suite is also possible, an example conf (mid 2026 sensor landscape):
+Building your own sensor suite is also possible, an example conf (2026/2027 sensor landscape):
 
 | Sensor | Example part | Notes |
 |---|---|---|
@@ -336,40 +334,43 @@ filtering, etc.) has to line up properly. A list of common mistakes:
 * **IMU calibrated on a magnetic surface**: the [calibration
   GUI](#reference-board-calibration-gui) fits the magnetometer from the same
   session of static poses as the IMU, not a separate one.
-  A metal-legged table, or nearby gadgets/laptop biases the field it reads -
+  A metal-legged table, or a nearby laptop biases the field it reads -
   a genuinely non-magnetic and stable calibration environment is harder to find
   than it sounds. For a UAV this does not apply: calibrate the
   magnetometer already mounted in the airframe, at its final position.
-* **Accelerometer/gyroscope PSD and bias random walk not measured on the
-  target sensor and environment** (classic as well): either not measured at all
-  (random defaults), or measured in a non-representative setting (e.g.  an
+* **Accelerometer/gyroscope PSD and bias random walk not measured on the target
+  sensor and environment** (classic as well): either not measured at all
+  (random defaults), or measured in a non-representative setting (e.g. an cozy
   office room, without the real vibration/thermal environment) - both make the
   filter over- or under-confident in the IMU.
 * **GNSS reception too poor** INSLIB expects good GNSS data. Indoors or under
   heavy multipath, the library auto-init will reject the GNSS data. A
   high-quality GNSS receiver with a matching high-quality antenna is a must.
+  Smartphone GNSS antennas are typically not good enough.
 * **GNSS receiver not configured** There are countless ways to misconfigure
   a GNSS receiver. A working configuration for u-blox F9P and X20 receivers
   can be found [here (F9P)](tools/ublox_f9p_config.py) and [here (X20)](tools/ublox_x20p_config.py).
 * **Timestamps not synchronized or not monotonic** every sensor needs to be
   aligned to a single monotonic timebase (`t_us`). Clock issues break the
   library.
+* **GNSS latency not measured**: a guessed `gnss: delay_ms` biases position
+  during dynamic motion, see [GNSS Latency Estimation](#gnss-latency-estimation).
+  Even with a correct timestamp the GNSS solution is typically lagging
+  behind due to internal filtering.
 * **GNSS antenna lever arm not set**: the offset between IMU and GNSS antenna
   (`gnss: leverarm_frd`) has an impact on position and attitude,
   especially during dynamic turns.
 * **IMU and magnetometer axes not in the same body frame**: INSLIB expects
   one consistent FRD body frame for every sensor (see
   [coding_style.md](coding_style.md)), mismatched coordinate frames will produce nonsense outputs.
-* **GNSS latency not measured**: a guessed `gnss: delay_ms` biases position
-  during dynamic motion, see [GNSS Latency
-  Estimation](#gnss-latency-estimation).
 * **Unexpected height source with GNSS + barometer**: with both connected, the
   filter prefers the barometer for height by default (it keeps
   working through a GNSS outage). Set `baro_height_disable: 1` in
   `config.yaml` to force GNSS/local-position height instead.
-* **No anti-aliasing/low-pass filtering on a vibrating IMU**: rotor or
-  engine vibration aliases into the accelerometer/gyroscope band and breaks
-  the noise model and introduce ghost accelerations. Must be filtered out before the data reaches INSLIB.
+* **No anti-aliasing/low-pass filtering on a vibrating IMU**: rotor or engine
+  vibration aliases into the accelerometer/gyroscope band and breaks the noise
+  model and introduce ghost accelerations. Must be filtered out before the data
+  reaches INSLIB. The library cannot fix aliasing problems.
 * **Sensor data over-filtered**: heavy internal/firmware smoothing adds
   its own latency.
 * **IMU not calibrated over its operating temperature range**: bias/scale
@@ -388,7 +389,6 @@ filtering, etc.) has to line up properly. A list of common mistakes:
 * Code and comments written by Claude are reviewed by a human (no auto-commit)
 * `insrcv` is largely written by Claude
 * Unit tests, the build system and the Python GUI tools are basically written 100% by Claude
-* Every commit is reviewed by a human
 
 ## References
 

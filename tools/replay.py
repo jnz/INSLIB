@@ -363,8 +363,12 @@ DEFAULTS = {
     # for the ARS/AHRS, independent of gyro_bias_window_sec's parked-phase
     # seed - 0 -> Navigator.set_ahrs_gyr_bias_init_stddev() not called,
     # ahrs.c's own xy/z default stays in effect.
+    # rpy_pred_stddev_rad_sqrts [rad/sqrt(s)]: extra attitude process noise
+    # on top of the gyro noise (REQ-AHRS-027), the ARS/AHRS tuning knob next
+    # to the sensor figure, 0 -> none (the generic gyro default carries the
+    # margin, set it when imu: holds a good sensor's own figure).
     "ahrs": {"gyr_noise_psd": 0.0, "gyr_bias_rw": 0.0, "acc_noise_mps2": 0.0,
-             "gyr_bias_init_stddev_rps_deg": 0.0},
+             "gyr_bias_init_stddev_rps_deg": 0.0, "rpy_pred_stddev_rad_sqrts": 0.0},
     # score: this harness scores on leverarm_frd/warmup_sec only. The pass/fail
     # limits below are consumed by tools/replay.c, which is the gating
     # harness (make datasets), and lim_groves_pos_rms_factor by
@@ -706,6 +710,32 @@ def ref_point_offset_ned(nav, score_leverarm_frd):
     rpy = nav.rpy() or (0.0, 0.0, 0.0)
     R = _rotmat_from_rpy(rpy)
     return tuple(sum(R[r][k] * score_leverarm_frd[k] for k in range(3)) for r in range(3))
+
+
+# Two lever arms closer than this [m, per axis] count as the same point.
+LEVERARM_MATCH_TOL_M = 0.01
+
+
+def leverarm_relation(gnss_leverarm_frd, score_leverarm_frd):
+    """How gnss.leverarm_frd (where the fixes are taken) and
+    score.leverarm_frd (where the reference refers to) relate
+    (REQ-VER-039): "none" both zero, "same" equal within
+    LEVERARM_MATCH_TOL_M, "score_unset" only the GNSS arm set (a reference
+    that is the receiver's own solution then carries the whole arm),
+    "gnss_unset" only the scoring arm set, "differ" both set but apart
+    (right for a reference taken at another point than the antenna)."""
+    g_set = any(abs(v) > 0.0 for v in gnss_leverarm_frd)
+    s_set = any(abs(v) > 0.0 for v in score_leverarm_frd)
+    if not g_set and not s_set:
+        return "none"
+    if g_set and not s_set:
+        return "score_unset"
+    if s_set and not g_set:
+        return "gnss_unset"
+    if all(abs(a - b) <= LEVERARM_MATCH_TOL_M
+           for a, b in zip(gnss_leverarm_frd, score_leverarm_frd)):
+        return "same"
+    return "differ"
 
 
 def ref_to_local_ned(ref_now, origin_ecef, origin_lat, origin_lon):
@@ -1062,17 +1092,20 @@ def ahrs_growth_rate(ahrs_cfg, horizon_sec=GROWTH_HORIZON_SEC):
     position/velocity state to report (ars/ahrs carry only attitude + gyro
     bias).
 
-    Returns None if either ahrs: gyr_noise_psd or gyr_bias_rw is left at 0
-    in `ahrs_cfg` - see process_noise_growth_rate()'s docstring for why
-    this deliberately does not fall back to a hardcoded copy of ahrs.c's
-    own default."""
+    Returns None if ahrs: gyr_noise_psd or gyr_bias_rw is left at 0 in
+    `ahrs_cfg` (after effective_ahrs_cfg()) - see
+    process_noise_growth_rate()'s docstring for why this deliberately does
+    not fall back to a hardcoded copy of ahrs.c's own default.
+    rpy_pred_stddev_rad_sqrts has no default to guess: 0 is none."""
     gyr_noise = ahrs_cfg.get("gyr_noise_psd", 0.0)
     bias_rw = ahrs_cfg.get("gyr_bias_rw", 0.0)
+    rpy_pred = ahrs_cfg.get("rpy_pred_stddev_rad_sqrts", 0.0)
     if not (gyr_noise and bias_rw):
         return None
 
     T = horizon_sec
-    q1 = gyr_noise ** 2
+    # The extra attitude term adds to the gyro noise in variance (REQ-AHRS-027).
+    q1 = gyr_noise ** 2 + rpy_pred ** 2
     q2 = bias_rw ** 2
     return {
         "horizon_sec": T,
@@ -1119,14 +1152,30 @@ def baro_growth_rate_lines(baro_cfg):
     ]
 
 
+def effective_ahrs_cfg(spec):
+    """The ahrs: section as the ARS/AHRS actually get it: gyr_noise_psd and
+    gyr_bias_rw left at 0 are derived from imu: (sqrt(gyr_psd), gyr_bias_rw),
+    the same physical gyro, exactly as tools/replay.c does. Only when imu:
+    leaves them at 0 too does the value stay 0, i.e. ahrs.c's own default.
+    The accelerometer noise has no imu: counterpart (the ARS/AHRS levelling
+    noise is a tuning knob, not the sensor's), so it stays as configured."""
+    ahrs = dict(spec["ahrs"])
+    imu = spec["imu"]
+    if not float(ahrs.get("gyr_noise_psd", 0.0)) and float(imu.get("gyr_psd", 0.0)) > 0.0:
+        ahrs["gyr_noise_psd"] = math.sqrt(float(imu["gyr_psd"]))
+    if not float(ahrs.get("gyr_bias_rw", 0.0)) and float(imu.get("gyr_bias_rw", 0.0)) > 0.0:
+        ahrs["gyr_bias_rw"] = float(imu["gyr_bias_rw"])
+    return ahrs
+
+
 def ahrs_growth_rate_lines(ahrs_cfg):
     """ahrs_growth_rate(), formatted as plain-text lines."""
     g = ahrs_growth_rate(ahrs_cfg)
     if g is None:
         return [
-            "ars/ahrs process noise growth rate: N/A - set "
-            "ahrs.gyr_noise_psd / gyr_bias_rw explicitly in config.yaml "
-            "(currently 0 -> ahrs's own built-in default)",
+            "ars/ahrs process noise growth rate: N/A - set imu.gyr_psd / "
+            "gyr_bias_rw (or the ahrs.gyr_noise_psd / gyr_bias_rw override) "
+            "in config.yaml (currently 0 -> ahrs's own built-in default)",
         ]
     return [
         f"ars/ahrs process noise growth rate (avg over {g['horizon_sec']:.0f} s "
@@ -1624,15 +1673,23 @@ def _imu_prepass(imu_path, bucket_sec=5.0):
     stationary-epoch measure (see main()), which needs the platform to
     actually stand still at some point. Only accumulated when BOTH
     bracketing intervals are contiguous (no gap), so one sensor dropout
-    can't fabricate a huge spurious jerk sample."""
+    can't fabricate a huge spurious jerk sample.
+
+    The THIRD difference is kept alongside only to test that premise: for
+    white noise Var(d3)/Var(d2) = 20/6, an IMU that low-pass filters its
+    output well below Nyquist drives the ratio down, and then d2 sees only
+    a fraction of the noise (see noise_model_metrics)."""
     n = 0
     t0 = prev = None
     max_gap = max_gap_at = 0.0
     prev_g = prev_a = None
     prev2_g = prev2_a = None
-    prev_gap_ok = False
+    prev3_g = prev3_a = None
+    prev_gap_ok = prev2_gap_ok = False
     gyr_d2_stat = [Stat(), Stat(), Stat()]
     acc_d2_stat = [Stat(), Stat(), Stat()]
+    gyr_d3_stat = [Stat(), Stat(), Stat()]
+    acc_d3_stat = [Stat(), Stat(), Stat()]
     rate_counts = []
     for t, g, a in iter_imu(imu_path):
         if t0 is None:
@@ -1647,11 +1704,19 @@ def _imu_prepass(imu_path, bucket_sec=5.0):
                 for k in range(3):
                     gyr_d2_stat[k].add(g[k] - 2.0 * prev_g[k] + prev2_g[k])
                     acc_d2_stat[k].add(a[k] - 2.0 * prev_a[k] + prev2_a[k])
+                if prev2_gap_ok and prev3_g is not None:
+                    for k in range(3):
+                        gyr_d3_stat[k].add(g[k] - 3.0 * prev_g[k]
+                                           + 3.0 * prev2_g[k] - prev3_g[k])
+                        acc_d3_stat[k].add(a[k] - 3.0 * prev_a[k]
+                                           + 3.0 * prev2_a[k] - prev3_a[k])
+            prev2_gap_ok = prev_gap_ok
             prev_gap_ok = gap_ok
         bidx = int((t - t0) / US_PER_SEC / bucket_sec)
         while len(rate_counts) <= bidx:
             rate_counts.append(0)
         rate_counts[bidx] += 1
+        prev3_g, prev3_a = prev2_g, prev2_a
         prev2_g, prev2_a = prev_g, prev_a
         prev_g, prev_a = g, a
         prev = t
@@ -1661,7 +1726,8 @@ def _imu_prepass(imu_path, bucket_sec=5.0):
     rate_hz = [c / bucket_sec for c in rate_counts]
     rate_t = [(i + 0.5) * bucket_sec for i in range(len(rate_counts))]
     return (n, duration, avg_hz, max_gap, max_gap_at,
-           gyr_d2_stat, acc_d2_stat, t0, rate_t, rate_hz)
+           gyr_d2_stat, acc_d2_stat, gyr_d3_stat, acc_d3_stat,
+           t0, rate_t, rate_hz)
 
 
 def estimate_gnss_delay_ms(t_sec, baro_vel_d, gnss_vel_d, max_lag_sec=3.0):
@@ -1918,36 +1984,62 @@ def print_channel_standstill_accuracy(label, unit, phases, reported_stddev, out=
           "< => too pessimistic)")
 
 
-def noise_model_metrics(gyr_d2_stat, acc_d2_stat, imu_hz, noise):
+def noise_model_metrics(gyr_d2_stat, acc_d2_stat, gyr_d3_stat, acc_d3_stat,
+                        imu_hz, noise):
     """Measured (maneuver-robust, whole-trial second-difference - see
     _imu_prepass) IMU noise floor vs. the configured gyr_psd/acc_psd, plus
     the psd each would suggest. The pure computation behind main()'s printed
     noise-model section and insdoctor_findings()'s "noise" input, factored
     out so inspostgui.py can feed the same check without duplicating it.
-    None if imu_hz <= 0 (rate unknown)."""
+    None if imu_hz <= 0 (rate unknown).
+
+    The second difference only measures the white noise if the noise is
+    white up to Nyquist. An IMU that low-pass filters its output well below
+    that (an SCH16T at 13 Hz read at 100 Hz) hides most of it, and the
+    estimate comes out an order of magnitude or more too low. The third to
+    second difference variance ratio (20/6 for white noise) detects that,
+    *_bandlimited is then True and no psd is suggested at all.
+
+    A psd is suggested only for a gross error in the dangerous direction:
+    the sensor noisier than configured by more than NOISE_MODEL_WARN_FACTOR.
+    A configured model above the measurement is the normal, safe case (in
+    motion, vibration and model errors add to the sensor floor), so it is
+    never talked down."""
     if imu_hz <= 0:
         return None
     dt_nominal = 1.0 / imu_hz
 
+    def var_mean(stat):
+        return sum(s.std() ** 2 for s in stat) / 3.0
+
     def meas_floor(d2_stat):
-        return (math.sqrt(sum(s.std() ** 2 for s in d2_stat) / 3.0) / math.sqrt(6.0)
-                if d2_stat[0].n > 1 else None)
+        return math.sqrt(var_mean(d2_stat) / 6.0) if d2_stat[0].n > 1 else None
 
-    def suggest_psd(d2_stat):
-        if d2_stat[0].n < 2:
+    def diff_ratio(d2_stat, d3_stat):
+        if d2_stat[0].n < 2 or d3_stat[0].n < 2 or var_mean(d2_stat) <= 0.0:
             return None
-        var = sum(s.std() ** 2 for s in d2_stat) / 3.0 / 6.0
-        return var * dt_nominal
+        return var_mean(d3_stat) / var_mean(d2_stat)
 
-    gyr_expect = math.sqrt(noise["gyr_psd"] / dt_nominal)
-    acc_expect = math.sqrt(noise["acc_psd"] / dt_nominal)
-    gyr_meas, acc_meas = meas_floor(gyr_d2_stat), meas_floor(acc_d2_stat)
-    return {
-        "gyr_ratio": (gyr_meas / gyr_expect if gyr_meas and gyr_expect > 0 else None),
-        "acc_ratio": (acc_meas / acc_expect if acc_meas and acc_expect > 0 else None),
-        "gyr_psd_sugg": suggest_psd(gyr_d2_stat),
-        "acc_psd_sugg": suggest_psd(acc_d2_stat),
-    }
+    def suggest_psd(d2_stat, ratio, bandlimited):
+        if d2_stat[0].n < 2 or bandlimited or ratio is None:
+            return None
+        if ratio <= NOISE_MODEL_WARN_FACTOR:
+            return None
+        return var_mean(d2_stat) / 6.0 * dt_nominal
+
+    out = {}
+    for name, d2, d3 in (("gyr", gyr_d2_stat, gyr_d3_stat),
+                         ("acc", acc_d2_stat, acc_d3_stat)):
+        expect = math.sqrt(noise[f"{name}_psd"] / dt_nominal)
+        meas = meas_floor(d2)
+        ratio = meas / expect if meas and expect > 0 else None
+        d3d2 = diff_ratio(d2, d3)
+        bandlimited = d3d2 is not None and d3d2 < NOISE_BANDLIMIT_RATIO
+        out[f"{name}_ratio"] = ratio
+        out[f"{name}_d3d2"] = d3d2
+        out[f"{name}_bandlimited"] = bandlimited
+        out[f"{name}_psd_sugg"] = suggest_psd(d2, ratio, bandlimited)
+    return out
 
 
 # --- "Dr. INS" diagnostic findings ----------------------------------------
@@ -1972,9 +2064,14 @@ STDDEV_LIMITS = {"roll": 3.0, "pitch": 3.0, "yaw": 10.0, "pos": 20.0}  # deg/deg
 # decides whether to interrupt the reader. A noise model within an order of
 # magnitude is a normal, working setup - a datasheet figure, a generic MEMS
 # default, an Allan fit at a different temperature all land there - and
-# flagging it buries the findings that matter. The suggested values are
-# printed unconditionally either way, so nothing is lost by staying quiet.
-NOISE_MODEL_WARN_FACTOR = 100.0  # IMU psd: measured vs. configured
+# flagging it buries the findings that matter. The same factor gates the
+# printed psd suggestion, so the report never proposes a number the
+# findings call fine.
+NOISE_MODEL_WARN_FACTOR = 100.0  # IMU noise stddev: measured vs. configured
+# Var(d3)/Var(d2) of the IMU samples: 20/6 for white noise, well below for
+# an IMU output low-pass filtered inside the sensor (an SCH16T at 13 Hz read
+# at 100 Hz gives about 1.5). Below this the per-sample noise check is void.
+NOISE_BANDLIMIT_RATIO = 2.5
 GNSS_COV_WARN_FACTOR    = 10.0   # standstill spread vs. receiver-reported 1-sigma
 
 # A receiver whose Doppler velocity is genuinely too weak to aid with.
@@ -2071,20 +2168,26 @@ def insdoctor_findings(m):
     # --- IMU noise model vs. measured floor --------------------------------
     nm = m["noise"]
     if nm:
-        for label, ratio, term, sugg in (
-                ("gyro", nm["gyr_ratio"], "gyr_psd", nm["gyr_psd_sugg"]),
-                ("accel", nm["acc_ratio"], "acc_psd", nm["acc_psd_sugg"])):
+        for label, key, term in (("gyro", "gyr", "gyr_psd"), ("accel", "acc", "acc_psd")):
+            ratio, sugg = nm[f"{key}_ratio"], nm[f"{key}_psd_sugg"]
             if ratio is None:
                 continue
-            if ratio > NOISE_MODEL_WARN_FACTOR or ratio < 1.0 / NOISE_MODEL_WARN_FACTOR:
-                verb = ("too optimistic (sensor noisier than configured)" if ratio > 1
-                        else "too pessimistic (sensor quieter than configured)")
-                txt = f"{label} noise model {verb}: measured x{ratio:.2f} of configured"
+            if nm[f"{key}_bandlimited"]:
+                f.append((SEV_INFO, f"{label} noise model not checked: the IMU output is"
+                                    " low-pass filtered inside the sensor (d3/d2 variance"
+                                    f" ratio {nm[f'{key}_d3d2']:.1f}, white noise 3.3) - use"
+                                    " tools/allan_variance.py on a static recording"))
+            elif ratio > NOISE_MODEL_WARN_FACTOR:
+                txt = (f"{label} noise model too optimistic (sensor noisier than configured):"
+                       f" measured x{ratio:.0f} of configured")
                 if sugg is not None:
-                    txt += f" -> try {term}: {sugg:.2e}"
+                    txt += f" -> try {term}: {sugg:.1e}"
                 f.append((SEV_WARN, txt))
+            elif ratio < 1.0:
+                f.append((SEV_OK, f"{label} noise model conservative (measured x{ratio:.2f}"
+                                  " of configured, safe: motion adds to the sensor floor)"))
             else:
-                f.append((SEV_OK, f"{label} noise model consistent (measured x{ratio:.2f} of configured)"))
+                f.append((SEV_OK, f"{label} noise model OK (measured x{ratio:.2f} of configured)"))
 
     # --- GNSS accuracy vs. its own reported covariance (standstill) --------
     ga = m["gnss_acc"]
@@ -2234,15 +2337,20 @@ def insdoctor_findings(m):
         # above what the filter itself contributes.
         la = m.get("leverarm")
         if la:
-            fuse_arm = max(abs(v) for v in la["gnss"])
-            score_arm = max(abs(v) for v in la["score"])
-            if fuse_arm > 0.0 and score_arm == 0.0:
+            rel = leverarm_relation(la["gnss"], la["score"])
+            if rel == "score_unset":
                 f.append((SEV_WARN,
                           f"gnss.leverarm_frd is set ({la['gnss']}) but score.leverarm_frd "
                           "is not - the position error is scored between the IMU and the "
                           "reference point, so it carries the whole lever arm. Set "
                           "score.leverarm_frd to the same value when ref.csv is the "
                           "receiver's own solution"))
+            elif rel == "differ":
+                f.append((SEV_INFO,
+                          f"gnss.leverarm_frd ({la['gnss']}) and score.leverarm_frd "
+                          f"({la['score']}) differ - right when ref.csv refers to another "
+                          "point than the GNSS antenna, a typo when it is the receiver's "
+                          "own solution"))
 
         # --- barometric height source vs. the GNSS vertical it replaced ----
         # ins latches the height source once, at bootstrap (REQ-NAV-053): a
@@ -2272,7 +2380,7 @@ def insdoctor_findings(m):
         dwt = diag["n_downweighted"]
         if used > 0 and dwt / used > 0.15:
             f.append((SEV_INFO, f"{dwt} chi2-downweighted ins fusions "
-                                f"({100.0 * dwt / used:.0f}% of the GNSS fusion count; the "
+                                f"({100.0 * dwt / used:.0f}% of the GNSS fusion count, the "
                                 "counter also covers baro height, mag and ZUPT) - "
                                 "outlier-heavy input, check the outlier page for which "
                                 "sub-filter it is"))
@@ -2723,7 +2831,7 @@ def main():
                      configured_gnss_delay_ms=run.gnss_delay_ms,
                      growth_rate=process_noise_growth_rate(spec["imu"]),
                      baro_growth_rate=baro_alt_growth_rate(spec["baro"]),
-                     ahrs_growth_rate=ahrs_growth_rate(spec["ahrs"]))
+                     ahrs_growth_rate=ahrs_growth_rate(effective_ahrs_cfg(spec)))
 
     if args.kml:
         from ins_kml import write_kml

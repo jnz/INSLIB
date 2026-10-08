@@ -93,12 +93,21 @@ def load_inputs(spec, data_dir, gnss_outages=(), log=print):
     inp = Inputs()
     inp.imu_path = imu_path = rp.input_path(data_dir, spec, "imu")
     ref_path = rp.input_path(data_dir, spec, "ref")
-    if not (os.path.exists(imu_path) and os.path.exists(ref_path)):
+    if not os.path.exists(imu_path):
         raise ReplayError(f"dataset missing under {data_dir}")
 
-    ref = rp.load_ref(ref_path)
-    if not ref:
-        raise ReplayError(f"no reference epochs in {ref_path}")
+    # The reference is optional: without ref.csv nothing is scored and the
+    # reference traces stay empty. Only the modes that take their state from
+    # it (aiding/init: ref) cannot do without.
+    if os.path.exists(ref_path):
+        ref = rp.load_ref(ref_path)
+        if not ref:
+            raise ReplayError(f"no reference epochs in {ref_path}")
+    else:
+        if spec["aiding"] == "ref" or spec["init"] == "ref":
+            raise ReplayError(f"{ref_path} missing, but aiding: ref / "
+                              "init: ref take their state from it")
+        ref = []
     inp.ref = ref
 
     # Move every reference row onto its own time of validity (REQ-VER-030),
@@ -208,7 +217,17 @@ def load_inputs(spec, data_dir, gnss_outages=(), log=print):
     # (REQ-NAV-033). Handing it an older truth epoch bakes a permanent
     # -v*dt position offset into a moving start, which then reads as
     # filter inaccuracy.
-    inp.ref0 = next((r for r in ref if r["t_us"] >= first_imu_us), ref[0])
+    if ref:
+        inp.ref0 = next((r for r in ref if r["t_us"] >= first_imu_us), ref[0])
+    else:
+        # Neutral stand-in, only read by the aiding: none seed and by
+        # init: ref (refused above)
+        inp.ref0 = {"t_us": first_imu_us, "lat_rad": 0.0, "lon_rad": 0.0,
+                    "h_m": 0.0, "roll_rad": 0.0, "pitch_rad": 0.0,
+                    "yaw_rad": 0.0, "vel_ned": (0.0, 0.0, 0.0)}
+    # Where the dataset was recorded, for the magnetic reference field
+    site = ref[0] if ref else (fixes[0] if fixes else None)
+    inp.site_llh = ((site["lat_rad"], site["lon_rad"]) if site else None)
 
     gyr_bias = rp.estimate_gyro_bias(imu_path, spec["gyro_bias_window_sec"])
     inp.bias_note = "from initial window" if gyr_bias else "n/a"
@@ -260,11 +279,12 @@ def make_navigator(spec, inp, log=print):
     t0 = ref0 if (spec["init"] == "ref" or not inp.fixes) else inp.fixes[0]
     nav = Navigator(rp.build_config(spec, ref0, t0["t_us"], t0["lat_rad"],
                                     t0["lon_rad"], t0["h_m"], inp.gyr_bias))
-    # baro_alt / ARS/AHRS noise model (0 -> each filter's own default). Has
-    # to be set before the first baro sample / ins_suite_update() latches
-    # the respective template (nav_suite contract).
+    # baro_alt / ARS/AHRS noise model (0 -> each filter's own default, the
+    # ARS/AHRS gyro terms first fall back to imu:, see effective_ahrs_cfg).
+    # Has to be set before the first baro sample / ins_suite_update()
+    # latches the respective template (nav_suite contract).
     baro_cfg = spec["baro"]
-    ahrs_cfg = spec["ahrs"]
+    ahrs_cfg = rp.effective_ahrs_cfg(spec)
     nav.set_baro_acc_bias_drift(float(baro_cfg.get("acc_bias_rw", 0.0)))
     nav.set_baro_acc_noise(float(baro_cfg.get("acc_noise_mps2_sqrthz", 0.0)))
     nav.set_baro_acc_bias_init_stddev(float(baro_cfg.get("acc_bias_init_mps2", 0.0)))
@@ -278,6 +298,7 @@ def make_navigator(spec, inp, log=print):
     nav.set_ahrs_gyr_noise(float(ahrs_cfg.get("gyr_noise_psd", 0.0)))
     nav.set_ahrs_acc_noise(float(ahrs_cfg.get("acc_noise_mps2", 0.0)))
     nav.set_ahrs_gyr_bias_rw(float(ahrs_cfg.get("gyr_bias_rw", 0.0)))
+    nav.set_ahrs_rpy_pred_stddev(float(ahrs_cfg.get("rpy_pred_stddev_rad_sqrts", 0.0)))
     nav.set_ahrs_gyr_bias_init_stddev(
         math.radians(float(ahrs_cfg.get("gyr_bias_init_stddev_rps_deg", 0.0))))
     init_hint = spec["init_hint"]
@@ -297,9 +318,13 @@ def make_navigator(spec, inp, log=print):
     # propagated from ins (REQ-SUITE-009) cannot answer until ins has
     # initialized.
     mag_cfg = spec["mag"]
-    if inp.mags and float(mag_cfg["wmm_year"]) > 0:
+    if inp.mags and float(mag_cfg["wmm_year"]) > 0 and inp.site_llh is None:
+        log("  WARNING: no reference and no fix to locate the dataset, no"
+            " magnetic reference field is built and the magnetometer will"
+            " not be fused")
+    elif inp.mags and float(mag_cfg["wmm_year"]) > 0:
         # Both attitude sources agree on true north (WMM declination).
-        nav.set_magnetic_model(inp.ref[0]["lat_rad"], inp.ref[0]["lon_rad"],
+        nav.set_magnetic_model(inp.site_llh[0], inp.site_llh[1],
                                float(mag_cfg["wmm_year"]))
     elif inp.mags:
         # Same up-front warning as tools/replay.c. Without an epoch there is
@@ -343,6 +368,28 @@ class Pacer:
             time.sleep(min(sleep, 0.2))
 
 
+def ins_pos_in_replay_frame(nav, r):
+    """nav.position_local() in the replay's local frame, the one latched
+    once at r.origin_ecef that the reference and the fixes are drawn in.
+
+    ins sets a new origin of its own local frame when it restarts (after a
+    time jump, for example), its position_local() then starts again near
+    zero. Drawn as it is, the whole estimate after the restart would sit
+    shifted by the distance between the two origins (REQ-VER-041). The
+    shift is formed with ref_to_local_ned(), the same mapping the
+    reference gets. None while ins has no position."""
+    pos = nav.position_local()
+    if pos is None or r.origin_ecef is None:
+        return pos
+    o = nav.origin_ecef()
+    if o is None or max(abs(o[i] - r.origin_ecef[i]) for i in range(3)) < 1e-3:
+        return pos
+    lat, lon, h = ecef_to_llh(*o)
+    shift = rp.ref_to_local_ned({"lat_rad": lat, "lon_rad": lon, "h_m": h},
+                                r.origin_ecef, r.origin_lat, r.origin_lon)
+    return [pos[i] + shift[i] for i in range(3)]
+
+
 class Observer:
     """Per-epoch callback interface. on_epoch() runs once per IMU epoch
     after nav.update() and the replay's own bookkeeping, with the Replay
@@ -372,6 +419,7 @@ class Replay:
         self.observers = list(observers)
         self.eval_start, self.eval_end = eval_start, eval_end
         self.fixes, self.ref = inp.fixes, inp.ref
+        self.site_llh = inp.site_llh
         self.mags, self.baros = inp.mags, inp.baros
         self.speeds, self.headings, self.ranges = inp.speeds, inp.headings, inp.ranges
         self.aiding = spec["aiding"]
@@ -398,6 +446,7 @@ class Replay:
 
         (self.n_imu_total, self.imu_duration, self.imu_hz, self.imu_max_gap,
          self.imu_max_gap_at, self.gyr_d2_stat, self.acc_d2_stat,
+         self.gyr_d3_stat, self.acc_d3_stat,
          self.rate_t0, imu_rate_t, self.imu_rate_hz) = rp._imu_prepass(
              inp.imu_path, rate_bucket_sec)
         # Per-stream sampling rate over time for the sensor-rate page, all
@@ -414,7 +463,7 @@ class Replay:
             self.sensor_rate["baro"] = rp._bucketed_rate(
                 [b[0] for b in self.baros], self.rate_t0, rate_bucket_sec)
 
-        self.t_warmup_end = ((self.fixes[0] if self.fixes else self.ref[0])["t_us"]
+        self.t_warmup_end = ((self.fixes[0] if self.fixes else inp.ref0)["t_us"]
                              + int(spec["score"]["warmup_sec"] * US_PER_SEC))
         self.e_roll, self.e_pitch, self.e_yaw = rp.Stat(), rp.Stat(), rp.Stat()
         self.e_pos = rp.Stat()
@@ -662,8 +711,8 @@ class Replay:
             # establish a new one, and refreshing the cache then would move
             # the truth frame mid-plot, which is worse. Scoring is
             # unaffected either way, it runs on absolute ECEF
-            # (pos_error_ecef). Only plot overlays drawn in this cached
-            # frame would show the offset.
+            # (pos_error_ecef). The estimate is moved into this cached frame
+            # instead, by ins_pos_in_replay_frame() (REQ-VER-041).
             if self.origin_ecef is None:
                 origin = nav.origin_ecef()
                 if origin is not None:
@@ -889,7 +938,7 @@ class Replay:
             log(line)
         for line in rp.baro_growth_rate_lines(spec["baro"]):
             log(line)
-        for line in rp.ahrs_growth_rate_lines(spec["ahrs"]):
+        for line in rp.ahrs_growth_rate_lines(rp.effective_ahrs_cfg(spec)):
             log(line)
         # Overconfidence / covariance-collapse watchdog (REQ-NAV-040): the
         # filter reporting a physically implausible accuracy means its
@@ -987,50 +1036,52 @@ class Replay:
         noise = self.noise
         dt_nominal = 1.0 / self.imu_hz
 
-        def _noise_report(label, unit, d2_stat, expect, to_unit):
-            # Per-sample sensor noise floor vs. the configured model,
-            # measured in-motion: the whole-trial second difference (see
-            # _imu_prepass) cancels bias and smooth vehicle dynamics, keeps
-            # sensor noise + vibration, and works even when the platform
-            # never stops. Var(2nd diff) = 6*sigma^2 for white noise.
+        # Per-sample sensor noise floor vs. the configured model, measured
+        # by the whole-trial second difference (see _imu_prepass): it
+        # cancels bias and smooth vehicle dynamics, keeps sensor noise +
+        # vibration, and works even when the platform never stops.
+        # Var(2nd diff) = 6*sigma^2 for white noise.
+        nm = rp.noise_model_metrics(self.gyr_d2_stat, self.acc_d2_stat,
+                                    self.gyr_d3_stat, self.acc_d3_stat,
+                                    self.imu_hz, noise)
+        for label, key, unit, to_unit in (("gyro ", "gyr", "deg/s", math.degrees),
+                                          ("accel", "acc", "m/s^2", lambda x: x)):
+            d2_stat = getattr(self, f"{key}_d2_stat")
             if d2_stat[0].n <= 1:
-                return
+                continue
+            expect = math.sqrt(noise[f"{key}_psd"] / dt_nominal)
             meas = math.sqrt(sum(s.std() ** 2 for s in d2_stat) / 3.0) / math.sqrt(6.0)
             ratio = meas / expect if expect > 0 else math.nan
             log(f"  {label} noise vs. configured {to_unit(expect):.4f} {unit}:")
-            log(f"    in-motion (no dynamics): {to_unit(meas):8.4f} {unit}  "
+            log(f"    measured on this recording: {to_unit(meas):8.4f} {unit}  "
                 f"(ratio {ratio:.2f}, n={d2_stat[0].n})")
+            if nm[f"{key}_bandlimited"]:
+                log(f"    not comparable: the IMU low-pass filters its output (d3/d2"
+                    f" variance ratio {nm[f'{key}_d3d2']:.1f}, white noise 3.3),")
+                log("    so this per-sample value misses most of the noise")
 
-        _noise_report("gyro ", "deg/s", self.gyr_d2_stat,
-                      math.sqrt(noise["gyr_psd"] / dt_nominal), math.degrees)
-        _noise_report("accel", "m/s^2", self.acc_d2_stat,
-                      math.sqrt(noise["acc_psd"] / dt_nominal), lambda x: x)
-
-        # Turn the measurement into a concrete config action: which noise
-        # term to set, and to what. Based on the maneuver-robust second-
-        # difference estimate ON PURPOSE. The goal is the effective sensor
-        # noise floor under real conditions (white noise + vibration), not
-        # vehicle dynamics and not the datasheet or stationary value.
-        nm = rp.noise_model_metrics(self.gyr_d2_stat, self.acc_d2_stat,
-                                    self.imu_hz, noise)
-        if nm["gyr_psd_sugg"] is not None and nm["acc_psd_sugg"] is not None:
-            gs, as_ = nm["gyr_psd_sugg"], nm["acc_psd_sugg"]
-            log("  suggested imu noise model for real flight conditions "
-                "(paste into config.yaml `imu:`):")
-            log(f"    gyr_psd: {gs:.3e}   # (rad/s)^2/Hz  "
-                f"(now {noise['gyr_psd']:.3e}, x{gs / noise['gyr_psd']:.1f})")
-            log(f"    acc_psd: {as_:.3e}   # (m/s^2)^2/Hz  "
-                f"(now {noise['acc_psd']:.3e}, x{as_ / noise['acc_psd']:.1f})")
-            log("    (from the in-motion (no-dynamics) line above: sensor noise + "
-                "vibration,")
-            log("     not vehicle motion.")
-            # The bias random walk (imu.*_bias_rw) is a slow drift that can't
-            # be read off a moving trial, it needs Allan variance on a long
-            # static recording.
-            log("  bias random walk (imu.gyr_bias_rw / acc_bias_rw) is NOT "
-                "estimated here -")
-            log("  it needs a long STATIC recording, use "
-                "allan_variance.py for those.")
+        # A concrete config action only for a gross error in the dangerous
+        # direction (see noise_model_metrics): a configured model above the
+        # measurement is the normal case and is never talked down, and a
+        # low-pass filtered IMU gets no number at all.
+        sugg = [(f"{k}_psd", nm[f"{k}_psd_sugg"], unit) for k, unit in
+                (("gyr", "(rad/s)^2/Hz"), ("acc", "(m/s^2)^2/Hz"))
+                if nm[f"{k}_psd_sugg"] is not None]
+        if sugg:
+            log("  imu noise model far too optimistic, measured on this recording"
+                " (paste into config.yaml `imu:`):")
+            for term, val, unit in sugg:
+                log(f"    {term}: {val:.1e}   # {unit}  (now {noise[term]:.1e},"
+                    f" x{val / noise[term]:.0f})")
+        else:
+            log("  imu noise model: no change suggested (only a sensor noisier than"
+                f" configured by more than x{rp.NOISE_MODEL_WARN_FACTOR:.0f} gets one)")
+        # Neither the bias random walk (imu.*_bias_rw), a slow drift, nor the
+        # white noise of a low-pass filtered IMU can be read off this
+        # per-sample measure: both want Allan variance on a long static
+        # recording.
+        log("  for gyr_psd/acc_psd and gyr_bias_rw/acc_bias_rw from a long STATIC"
+            " recording use tools/allan_variance.py")
 
     def findings(self, rec=None):
         """Dr. INS findings over everything above (insdoctor_findings()).
@@ -1047,6 +1098,7 @@ class Replay:
             "gnss": (rp._stream_gap_stats([fx["t_us"] for fx in self.fixes])
                      if self.fixes else None),
             "noise": rp.noise_model_metrics(self.gyr_d2_stat, self.acc_d2_stat,
+                                            self.gyr_d3_stat, self.acc_d3_stat,
                                             self.imu_hz, self.noise),
             "gnss_acc": (rp.gnss_standstill_accuracy(self.gnss_static_phases)
                          if aiding == "gnss" else None),
@@ -1100,6 +1152,7 @@ class Replay:
             "mag_field_t": [],
             "mag_field_mag": [],
             "mag_field_mag_raw": [],
+            "mag_field_xyz": [],
             # WGS84 ellipsoid height of nav's own (fixed) local-NED origin,
             # so the baro_alt page can convert ref_pos/fix_pos_d back to
             # absolute ellipsoid height.
@@ -1107,17 +1160,21 @@ class Replay:
                                      else math.nan),
         }
         wmm_year = float(self.spec["mag"]["wmm_year"])
-        if mags and wmm_year > 0 and t0_us is not None:
+        if (mags and wmm_year > 0 and t0_us is not None
+                and self.site_llh is not None):
             from INSLIB import wmm_field_ned
-            b_ned = wmm_field_ned(math.degrees(self.ref[0]["lat_rad"]),
-                                  math.degrees(self.ref[0]["lon_rad"]), wmm_year)
+            b_ned = wmm_field_ned(math.degrees(self.site_llh[0]),
+                                  math.degrees(self.site_llh[1]), wmm_year)
             extra["wmm_field_uT"] = math.sqrt(sum(c * c for c in b_ned))
             extra["mag_field_t"] = [(m[0] - t0_us) / US_PER_SEC for m in mags]
-            extra["mag_field_mag"] = [
-                math.sqrt(sum(c * c for c in
-                              rp.mag_calibrate(m[1], self.mag_misalign,
-                                               self.mag_bias_cfg)))
+            # Calibrated vectors: the plot subtracts the 18-state bias
+            # estimate from them.
+            extra["mag_field_xyz"] = [
+                tuple(rp.mag_calibrate(m[1], self.mag_misalign,
+                                       self.mag_bias_cfg))
                 for m in mags]
+            extra["mag_field_mag"] = [math.sqrt(sum(c * c for c in v))
+                                      for v in extra["mag_field_xyz"]]
             # Only worth a second trace when a calibration is actually
             # configured, otherwise it would sit exactly on the first one.
             if self.mag_cal_active:
@@ -1196,6 +1253,11 @@ REC_KEYS = (
     # shift from the board to that point (0 without a lever arm) for the
     # board-point curves of the altitude pages.
     "pos_ref_pt", "ref_pt_up",
+    # REQ-VER-039: R_b_to_n * score.leverarm_frd and R_b_to_n *
+    # gnss.leverarm_frd [m, NED], rotated when the reference sample and the
+    # fix arrived and held with them, subtracted from ref_pos/fix_pos_d to
+    # move both onto the IMU point (inspostgui's lever arm compensation).
+    "ref_pt_ned", "gnss_la_ned",
     # ins's own velocity-aware auto-ZUPT/ZARU detector (shaded on the plot
     # pages so stops can be correlated with bias jumps).
     "zupt_active",
@@ -1227,8 +1289,19 @@ class PlotRecorder(Observer):
         self.rec = {k: [] for k in REC_KEYS}
         self._last_us = None
         self._started = False
+        self._ref_la_ned = None
+        self._fix_la_ned = None
 
     def on_epoch(self, r):
+        # REQ-VER-039: the rotated lever arms of the reference and the fix
+        # are latched at the epoch each sample arrives, with the attitude
+        # of that moment, and held with the sample. Rotated again on every
+        # recorded tick, a 1 Hz reference held for a second would draw an
+        # arc per second of turning.
+        if r.ref_now is not None:
+            self._ref_la_ned = list(rp.ref_point_offset_ned(r.nav, r.score_la))
+        if r.fix_now is not None:
+            self._fix_la_ned = list(rp.ref_point_offset_ned(r.nav, r.leverarm))
         if not self._started:
             self._started = True
             # A single ref.csv row (e.g. a placeholder ref.csv for a
@@ -1264,11 +1337,10 @@ class PlotRecorder(Observer):
         row["dw_baro_alt"] = float(dw_now["baro_alt"])
         row["dw_local_gnss"] = float(dw_now["local_gnss"])
 
-        # ins's own local NED frame, straight out of the filter, plotted
-        # against a ground truth converted with the origin latched once in
-        # the replay loop. So the two only agree as long as that origin
-        # stays put, see the origin comment in Replay.run().
-        pos = nav.position_local()
+        # ins's local NED position, moved into the frame latched once in
+        # the replay loop, which the ground truth is converted with (see
+        # the origin comment in Replay.run() and ins_pos_in_replay_frame()).
+        pos = ins_pos_in_replay_frame(nav, r)
         vel = nav.velocity_ned()
         rpy = nav.rpy_ins()
         sd = nav.stddev()
@@ -1302,6 +1374,10 @@ class PlotRecorder(Observer):
         la_n = rp.ref_point_offset_ned(nav, r.score_la)
         row["pos_ref_pt"] = [p + d for p, d in zip(row["pos"], la_n)]
         row["ref_pt_up"] = -la_n[2]
+        row["ref_pt_ned"] = (self._ref_la_ned[:] if self._ref_la_ned is not None
+                             else nan3[:])
+        row["gnss_la_ned"] = (self._fix_la_ned[:] if self._fix_la_ned is not None
+                              else nan3[:])
 
         # ARS/AHRS: their own roll/pitch (yaw omitted for the ARS,
         # free-running, not meaningful without a reference) and their own
@@ -1436,7 +1512,7 @@ class TrackRecorder(Observer):
             return
         self._last_us = t
         nav = r.nav
-        track_pos = nav.position_local()
+        track_pos = ins_pos_in_replay_frame(nav, r)
         track_la = rp.ref_point_offset_ned(nav, r.score_la)  # REQ-VER-037
         self.est.append((track_pos[0] + track_la[0], track_pos[1] + track_la[1])
                         if track_pos is not None else (math.nan, math.nan))

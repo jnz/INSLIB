@@ -53,6 +53,17 @@
 /** Gyro bias random walk [rad/s/sqrt(s)]. */
 #define INS_DEFAULT_GYR_BIAS_RW_RPS_SQRTS (2e-6f)
 
+/** IMU loss timeout [s]: once the last IMU sample is this old, ins, the
+ *  ARS/AHRS and baro_alt stop and restart (REQ-NAV-089, REQ-AHRS-029,
+ *  REQ-BARO-027). All of them run against the same physical IMU. */
+#define INS_DEFAULT_IMU_LOSS_TIMEOUT_SEC (0.2f)
+
+/** Widening of a bias 1-sigma carried across a restart (REQ-NAV-061,
+ *  REQ-AHRS-029, REQ-BARO-027), before the clamp to the cold-start prior.
+ *  Covers a sensor that rebooted and came back with a different turn-on
+ *  bias. */
+#define INS_DEFAULT_BIAS_CARRY_STDDEV_INFLATION (3.0f)
+
 /** Stillness gate for ins.c's auto-init leveling window: the magnitude of the
  *  gyro must stay below this for the window to count as quasi-static. The
  *  auto-ZUPT/ZARU magnitude bound below currently aliases this value, but the

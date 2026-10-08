@@ -37,20 +37,18 @@ GROWTH_HORIZON = replay.GROWTH_HORIZON_SEC
 # A representative, non-tiny noise model (same order of magnitude as a real
 # MEMS IMU dataset) so the growth over _T_SEC sits well above any initial-
 # condition/discretization noise floor. pos/vel/rpy_pred_stddev_*_sqrts are
-# set explicitly (matching Config's own dataclass defaults, which is what
-# _free_coast's Config(...) call below actually sends the real filter,
-# since it doesn't override them either) -- process_noise_growth_rate()
-# deliberately returns None rather than guess these when left at 0, so the
-# comparison here needs them spelled out, same as any real config.yaml
-# would.
+# set explicitly, here and in _free_coast's Config(...) call below:
+# process_noise_growth_rate() deliberately returns None rather than guess
+# these when left at 0 (the C default), so the comparison needs them spelled
+# out, same as any real config.yaml would.
 _NOISE = {
     "acc_psd": 3.846815369e-06,       # (m/s^2)^2/Hz
     "gyr_psd": 3.384637998e-11,       # (rad/s)^2/Hz
     "acc_bias_rw": 3.16227766e-04,    # m/s^2/sqrt(s)
     "gyr_bias_rw": 1.414213562e-06,   # rad/s/sqrt(s)
-    "pos_pred_stddev_m_sqrts": 0.01,          # m/sqrt(s), Config's default
-    "vel_pred_stddev_mps_sqrts": 0.05,        # m/s/sqrt(s), Config's default
-    "rpy_pred_stddev_rad_sqrts": math.radians(0.01),  # rad/sqrt(s), ditto
+    "pos_pred_stddev_m_sqrts": 0.01,          # m/sqrt(s)
+    "vel_pred_stddev_mps_sqrts": 0.05,        # m/s/sqrt(s)
+    "rpy_pred_stddev_rad_sqrts": math.radians(0.01),  # rad/sqrt(s)
 }
 
 # Explicit baro_alt/ahrs noise model for the Navigator (suite) tests below --
@@ -65,7 +63,8 @@ _NOISE = {
 # recovers agreement at any signal size -- this is a precision-floor
 # artifact, not evidence of anything wrong).
 _BARO_CFG = {"acc_noise_mps2_sqrthz": 0.3, "acc_bias_rw": 5e-4}
-_AHRS_CFG = {"gyr_noise_psd": 3e-3, "gyr_bias_rw": 3e-5}
+_AHRS_CFG = {"gyr_noise_psd": 3e-3, "gyr_bias_rw": 3e-5,
+             "rpy_pred_stddev_rad_sqrts": 2e-3}
 
 
 def _free_coast(noise, T_sec=_T_SEC, dt=_DT):
@@ -77,15 +76,17 @@ def _free_coast(noise, T_sec=_T_SEC, dt=_DT):
     feed would otherwise trip ins's own stillness detector (REQ-NAV, see
     ins_auto_zupt_detect) and silently apply a zero-velocity update, capping
     the very growth this test means to observe. pos/vel/rpy_pred_stddev_*
-    are intentionally NOT passed here -- Config's own dataclass defaults
-    (0.01/0.05/0.01deg) already match noise's explicit values above, so
-    this stays the same real-filter behavior either way."""
+    come from `noise` too: the closed form is evaluated with those values,
+    so the filter has to run with them rather than with its C defaults."""
     cfg = Config(
         lat_rad=_LAT, lon_rad=_LON, h_m=_H, auto_init=False,
         rpy_init_rad=(0.0, 0.0, 0.0),
         pos_init_stddev_m=1e-6, vel_init_stddev_mps=1e-6,
         rpy_init_stddev_rad=(1e-6, 1e-6, 1e-6),
         acc_bias_init_stddev_mps2=1e-9, gyr_bias_init_stddev_rps=1e-12,
+        pos_pred_stddev_m_sqrts=noise["pos_pred_stddev_m_sqrts"],
+        vel_pred_stddev_mps_sqrts=noise["vel_pred_stddev_mps_sqrts"],
+        rpy_pred_stddev_rad_sqrts=noise["rpy_pred_stddev_rad_sqrts"],
         acc_bias_pred_stddev_mps2_sqrts=noise["acc_bias_rw"],
         gyr_bias_pred_stddev_rps_sqrts=noise["gyr_bias_rw"],
         allow_unlimited_deadreckoning=True,
@@ -150,6 +151,7 @@ def _suite_free_coast_samples(baro_cfg, ahrs_cfg, times_sec, dt=_DT):
         nav.set_baro_acc_noise(baro_cfg["acc_noise_mps2_sqrthz"])
         nav.set_ahrs_gyr_noise(ahrs_cfg["gyr_noise_psd"])
         nav.set_ahrs_gyr_bias_rw(ahrs_cfg["gyr_bias_rw"])
+        nav.set_ahrs_rpy_pred_stddev(ahrs_cfg["rpy_pred_stddev_rad_sqrts"])
         # ahrs's own initial gyro-bias uncertainty (1/1/5 deg/s xy/z by
         # default) is an INITIAL CONDITION, not process noise, but it
         # propagates into yaw through the attitude/bias Phi coupling and

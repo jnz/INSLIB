@@ -312,15 +312,12 @@ precedence over the leveling result.
 The filter shall tolerate timestamp anomalies of a *running* filter:
 epochs older than the last prediction shall be handled up to the
 history depth and dropped beyond it (a *sustained* run of such drops is
-a restarted time source, handled by REQ-NAV-070); forward jumps beyond the maximum
-prediction time shall force a defined reset -- unless
-allow_unlimited_deadreckoning is enabled, in which case the filter
-shall instead coast: the jump epoch is skipped (no strapdown, no
-predict, no fusion) but the filter re-baselines its internal
-time-jump reference to that epoch's timestamp, so that normal-rate
-epochs immediately following the gap are recognized and processed
-again rather than the filter remaining permanently stuck re-detecting
-the same stale jump; all cases shall be counted in the diagnostics.
+a restarted time source, handled by REQ-NAV-070); a forward jump beyond
+the maximum prediction time shall force a defined reset, handled as an
+IMU loss (REQ-NAV-089) with its bias carry, whether or not
+allow_unlimited_deadreckoning is set: a jump that long is a gap in the
+IMU stream as well, and coasting through it would integrate over
+motion nobody measured. All cases shall be counted in the diagnostics.
 Unless opt.auto_reacquire_disable is set, and provided auto_init, a forced
 time-jump reset shall additionally re-arm into the collecting state
 via the same autonomous-reacquisition mechanism as a health-check
@@ -584,7 +581,7 @@ defeatable for an uncalibrated magnetometer.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ins_core.c:scenario_mag_bias_estimation
+- **Verification:** Test: tests/test_ins_core.c:scenario_mag_bias_estimation; Test: tests/test_ins_core.c:scenario_mag_bias_circle_drive
 
 ins shall optionally (off by default, enabled per instance at init)
 extend its error state by a 3-state body-frame magnetometer hard-iron
@@ -1669,22 +1666,27 @@ that is correct for arbitrary finite inputs (ins_angle_diff).
 
 - **Status:** verified
 - **Parent:** REQ-NAV-052
-- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_quality_exit_bias_carry
+- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_quality_exit_bias_carry; Test: tests/test_ins_core.c:scenario_imu_loss_rearms_with_carry
 
-The re-arm of REQ-NAV-052, and only that re-arm, shall carry the
-accelerometer and gyroscope bias estimates plus their current 1-sigma into
-the next bootstrap, which shall seed the nominal biases from the carried
-values instead of the configured init.acc_bias_init_mps2 /
-init.gyr_bias_init_rps. The seeded 1-sigma shall be the 1-sigma at the exit
+The re-arm of REQ-NAV-052 and the re-arm after an IMU loss (REQ-NAV-089,
+including the forward time-jump reset of REQ-NAV-016), and only those,
+shall carry the
+accelerometer and gyroscope bias estimates, in 18-state mode also the
+magnetometer hard-iron bias, plus their current 1-sigma into the next
+bootstrap, which shall seed the nominal biases from the carried values
+instead of the configured init.acc_bias_init_mps2 / init.gyr_bias_init_rps
+(and the zero hard-iron start). The seeded 1-sigma shall be the 1-sigma at the exit
 epoch widened by a fixed inflation factor and then clamped to at most the
 corresponding cold-start prior (init.acc_bias_init_stddev_mps2,
-init.gyr_bias_init_stddev_rps): a carry shall never be seeded more
-confidently than a cold start.
+init.gyr_bias_init_stddev_rps, init.mag_bias_init_stddev_ut): a carry
+shall never be seeded more confidently than a cold start. The leveling
+window of the bootstrap shall be corrected with the carried biases.
 
-The other two mid-run "is_initialized = false" events shall not carry a
-bias: a health-check shutdown (REQ-NAV-042) has just declared the state
-untrustworthy, and a forced time-jump reset (REQ-NAV-016) says nothing
-about the sensors. The shared re-arm shall therefore clear any pending
+A health-check shutdown (REQ-NAV-042) shall not carry a bias: it has just
+declared the state untrustworthy. Neither shall a restarted time source
+(REQ-NAV-070). An IMU loss on the other hand says nothing against the
+biases: they cannot have moved in a gap of a fraction of a second, and
+the inflation covers an IMU that rebooted in the gap. The shared re-arm shall therefore clear any pending
 carry, so neither event can inherit one, and the carry shall be cleared
 again once consumed.
 
@@ -2950,3 +2952,41 @@ outage, which is the same argument REQ-NAV-066 makes for the
 re-acquisition path. Drift of the barometric datum against the
 ellipsoid is not ins's to correct: nav_suite's offset filter observes
 and reports it (REQ-SUITE-008).
+
+## REQ-NAV-089 — IMU loss stops and re-arms the filter
+
+- **Status:** verified
+- **Parent:** REQ-NAV-016
+- **Verification:** Test: tests/test_ins_core.c:scenario_imu_loss_rearms_with_carry; Test: tests/test_ins_core.c:scenario_time_jump_unlimited_dr_recovery; Test: tests/test_ahrs.c:scenario_imu_outage_700ms
+
+A running filter shall check on every epoch, whether or not it carries
+an IMU sample, the time since the last accepted IMU sample (valid
+accelerometer and gyroscope). Once that time reaches
+opt.imu_loss_timeout_sec (0 selects the default of 0.2 s, shared with
+the ARS/AHRS and baro_alt), the IMU is lost. On that same epoch, before
+any strapdown, prediction or fusion, the filter shall:
+
+- latch the bias carry of REQ-NAV-061 and the n-frame origin carry of
+  REQ-NAV-062,
+- mark itself uninitialized and count the event (ins_diag_t.n_imu_loss),
+- unless opt.auto_reacquire_disable is set, and provided auto_init,
+  re-arm into the collecting state (REQ-NAV-042 mechanism).
+
+The re-bootstrap then follows the normal auto-init path: stream
+coherence (REQ-NAV-033), leveling under motion (REQ-NAV-047) and the
+attitude hint (REQ-NAV-048). No part of the state other than the carried
+biases and origin, and no uncertainty from before the loss, shall be
+reused. This applies regardless of allow_unlimited_deadreckoning and of
+max_prediction_time_sec. Without a usable position fix the filter stays
+in the collecting state, a GNSS outage on top of an IMU loss leaves
+nothing to re-anchor on.
+
+Rationale: barometer, GNSS or magnetometer epochs that keep arriving
+while the IMU stalls keep the covariance prediction running, so the gap
+does not show up as a time jump, yet the rotation and acceleration of
+the gap are lost. Fusing those epochs against an attitude that is
+already off, or bridging the gap with an assumed turn rate, only hides
+the loss behind a covariance nothing supports. Checking on every epoch
+stops the filter as soon as the loss is certain instead of when the IMU
+returns, so no stale solution is published and no measurement is fused
+against it in the meantime.

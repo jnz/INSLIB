@@ -738,6 +738,28 @@ def _rms(values):
     return math.sqrt(sum(v * v for v in values) / len(values))
 
 
+def _mag_field_minus_bias(rec):
+    """|B| of the calibrated samples with the 18-state hard-iron estimate
+    (as it was at each sample) removed, or None without that estimate."""
+    xyz = rec.get("mag_field_xyz")
+    tf = rec.get("mag_field_t")
+    bias = rec.get("mag_bias")
+    tr = rec.get("t")
+    if not xyz or not tf or not bias or not tr or len(xyz) != len(tf):
+        return None
+    ok = [i for i, row in enumerate(bias) if row and row[0] == row[0]]
+    if not ok:
+        return None
+    import numpy as np
+    t_ok = np.asarray([tr[i] for i in ok], dtype=float)
+    b = np.column_stack([
+        np.interp(np.asarray(tf, dtype=float), t_ok,
+                  np.asarray([bias[i][k] for i in ok], dtype=float))
+        for k in range(3)])
+    d = np.asarray(xyz, dtype=float) - b
+    return [float(v) for v in np.linalg.norm(d, axis=1)]
+
+
 def _wmm_page(rec, name):
     """Calibrated magnetic field magnitude |B|(t) [µT] against the WMM total
     field F (horizontal reference), plus the deviation |B|-F below. The
@@ -757,6 +779,7 @@ def _wmm_page(rec, name):
     raw = rec.get("mag_field_mag_raw") or None
     if raw is not None and len(raw) != len(mag):
         raw = None
+    est = _mag_field_minus_bias(rec)
     import matplotlib.pyplot as plt
 
     fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
@@ -769,6 +792,8 @@ def _wmm_page(rec, name):
         raw_v = None
     else:
         mag_v, raw_v, mag_t = _thin(mag, raw, tf)
+    if est is not None:
+        est_v, est_t = _thin(est, tf)
 
     if raw_v is not None:
         ax0.plot(mag_t, raw_v, color=MAG_RAW_COLOR, linewidth=1.0,
@@ -776,6 +801,9 @@ def _wmm_page(rec, name):
     cal_word = "calibrated" if raw is not None else "measured"
     ax0.plot(mag_t, mag_v, color=EST_COLOR, linewidth=1.0,
              label=f"{cal_word} |B|")
+    if est is not None:
+        ax0.plot(est_t, est_v, color="tab:green", linewidth=1.0,
+                 label="|B| minus estimated bias (18-state)")
     ax0.axhline(F, color=REF_COLOR, linestyle="--", linewidth=1.5,
                 label=f"WMM |B| = {F:.1f} µT")
     ax0.set_ylabel("field magnitude [µT]")
@@ -793,6 +821,11 @@ def _wmm_page(rec, name):
                  label=f"uncalibrated, RMS {_rms(dev_raw):.2f} µT")
     ax1.plot(dev_t, dev_v, color=EST_COLOR, linewidth=1.0,
              label=f"{cal_word}, RMS {_rms(dev):.2f} µT")
+    if est is not None:
+        dev_est = [v - F for v in est]
+        de_v, de_t = _thin(dev_est, tf)
+        ax1.plot(de_t, de_v, color="tab:green", linewidth=1.0,
+                 label=f"minus estimated bias, RMS {_rms(dev_est):.2f} µT")
     ax1.axhline(0.0, color="black", linewidth=0.5)
     ax1.set_ylabel("|B| - WMM [µT]")
     ax1.set_xlabel("time [s]")
@@ -901,7 +934,10 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
                      f"{math.degrees(gb_s[1]):.4f} {math.degrees(gb_s[2]):.4f})")
         mb = _last_valid_row(rec.get("mag_bias", []))
         if mb:
-            lines.append(f"  mag bias  {mb[0]:.3f} {mb[1]:.3f} {mb[2]:.3f} µT")
+            mb_s = _last_valid_row(rec.get("mag_bias_sigma", []))
+            sig = (f" (1-σ {mb_s[0]:.3f} {mb_s[1]:.3f} {mb_s[2]:.3f})"
+                   if mb_s else "")
+            lines.append(f"  mag bias  {mb[0]:.3f} {mb[1]:.3f} {mb[2]:.3f} µT{sig}")
 
     # Most recent fused GNSS fix's OWN reported 1-σ (receiver
     # covariance), side-by-side with the filter's final 1-σ above.
@@ -976,10 +1012,10 @@ def _summary_page(rec, name, growth_rate=None, baro_growth_rate=None,
 def _subfilter_page(rec, t, name, prefix, label):
     """ARS/AHRS page: own roll/pitch (and, for the magnetometer-aided
     AHRS, yaw) + 1-σ band vs. full3d vs. ground truth, plus own gyro
-    bias + 1-σ band vs. full3d's own bias estimate. Yaw is shown only
-    for the AHRS,
-    whose magnetometer gives an absolute heading; the gyro-only ARS yaw is
-    free-running (arbitrary offset) so it stays off. Returns None if this
+    bias + 1-σ band vs. full3d's own bias estimate. The AHRS yaw is
+    absolute (magnetometer); the gyro-only ARS yaw is free gyro
+    compassing with an arbitrary start offset, so it is shown shifted onto
+    the reference at the first common sample. Returns None if this
     sub-filter was never active."""
     rpy = rec[f"{prefix}_rpy_deg"]
     if not any(row[0] == row[0] for row in rpy):
@@ -999,29 +1035,45 @@ def _subfilter_page(rec, t, name, prefix, label):
 
     # roll/pitch always; yaw only for the magnetometer-aided AHRS (its
     # heading is absolute) -- the gyro-only ARS yaw is free-running.
-    show_yaw = prefix == "ahrs"
-    panels = [(0, "roll [deg]"), (1, "pitch [deg]")]
-    if show_yaw:
-        panels.append((2, "yaw [deg]"))
+    # The ARS yaw is a free gyro-compassing heading with an arbitrary start
+    # offset: shifted onto the reference at the first common sample (like the
+    # heading page) so only the relative drift remains visible.
+    free_yaw = prefix == "ars"
+    panels = [(0, "roll [deg]"), (1, "pitch [deg]"),
+              (2, "free gyro heading [deg]\n(synced at start)" if free_yaw
+               else "yaw [deg]")]
     rpy_sigma = rec[f"{prefix}_rpy_sigma_deg"]
     for i, lbl in panels:
         ax = axes[0][i]
         col = _unwrap_deg(_col(rpy, i)) if i == 2 else _col(rpy, i)
-        _band(ax, t, col, _col(rpy_sigma, i), label, EST_COLOR)
-        f3d = rec["rpy_deg"]
-        full3d, tf = _thin(_unwrap_deg(_col(f3d, i)) if i == 2 else _col(f3d, i), t)
-        ax.plot(tf, full3d, "--", color="0.4", linewidth=1.2, label="full3d")
+        f3d_col = _unwrap_deg(_col(rec["rpy_deg"], i)) if i == 2 else _col(rec["rpy_deg"], i)
+        ref_raw = None
         if has_ref:
-            rc = rec["ref_rpy_deg"]
-            ref_col, tr = _thin(_unwrap_deg(_col(rc, i)) if i == 2 else _col(rc, i), t)
+            ref_raw = (_unwrap_deg(_col(rec["ref_rpy_deg"], i)) if i == 2
+                       else _col(rec["ref_rpy_deg"], i))
+            if i == 2:
+                # A reference without real attitude (position-only truth
+                # padded with a constant yaw) is no heading reference:
+                # syncing to it would offset the ARS from full3d by the
+                # unknown true heading. Fall back to full3d for the sync.
+                vals = [v for v in ref_raw if v == v]
+                if not vals or max(vals) - min(vals) < 1.0:
+                    ref_raw = None
+        if i == 2 and free_yaw:
+            sync = _sync_offset(ref_raw if ref_raw is not None else f3d_col, col)
+            if sync is not None:
+                col = [c + sync[0] if c == c else math.nan for c in col]
+        _band(ax, t, col, _col(rpy_sigma, i), label, EST_COLOR)
+        full3d, tf = _thin(f3d_col, t)
+        ax.plot(tf, full3d, "--", color="0.4", linewidth=1.2, label="full3d")
+        if ref_raw is not None:
+            ref_col, tr = _thin(ref_raw, t)
             ax.plot(tr, ref_col, ":", color=REF_COLOR, linewidth=1.5,
                    label="ground truth")
         ax.set_ylabel(lbl)
         ax.set_xlabel("time [s]")
         if i == 0:
             ax.legend(loc="best", fontsize=8)
-    if not show_yaw:
-        axes[0][2].axis("off")
 
     bias_key = f"{prefix}_gyr_bias"
     sigma_key = f"{prefix}_gyr_bias_sigma"

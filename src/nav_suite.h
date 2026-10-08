@@ -193,6 +193,12 @@ typedef struct
        known value instead of the arbitrary 0 (REQ-SUITE-002). */
     bool ars_yaw_from_init; /**< true -> ARS yaw seeded from a known heading, not 0 */
 
+    /* Manual init (opt.auto_init == false): the start attitude is prescribed,
+       so the first ARS/AHRS start takes it instead of leveling
+       (REQ-SUITE-002). Cleared once used, and by an IMU loss. */
+    bool ars_att_from_init;  /**< next ARS start uses the prescribed attitude */
+    bool ahrs_att_from_init; /**< next AHRS start uses the prescribed attitude */
+
     /** Heading carry-over across an ins re-initialization (REQ-SUITE-022): the
      *  last 3D heading INS held while converged, paired with the ARS yaw of
      *  that same epoch. Refreshed every epoch INS is ready, so after a shutdown
@@ -227,9 +233,22 @@ typedef struct
        the plausible pressure samples seen in a short window at bootstrap, so
        one glitched startup reading cannot skew the vertical datum. The
        accumulator resets whenever baro_alt is not initialized and idle. */
-    double             baro_boot_p_sum; /**< sum of collected pressures [Pa] */
-    uint32_t           baro_boot_count; /**< samples in the sum (0 -> idle) */
-    baro_alt_time_us_t baro_boot_t0;    /**< timestamp of the first collected sample */
+    double             baro_boot_p_sum;  /**< sum of collected pressures [Pa] */
+    uint32_t           baro_boot_count;  /**< samples in the sum (0 -> idle) */
+    baro_alt_time_us_t baro_boot_t0;     /**< timestamp of the first collected sample */
+    bool               baro_datum_known; /**< baro_alt has run: a re-bootstrap keeps its datum
+                                              (baro_alt.h0_baro_m, REQ-SUITE-027) */
+
+    /* IMU loss (REQ-SUITE-027): the suite sees the epochs without IMU that the
+       ARS/AHRS and baro_alt never get, so it stops them itself. */
+    ins_time_us_t t_last_imu;    /**< last IMU epoch */
+    bool          have_last_imu; /**< t_last_imu is set */
+    uint32_t      n_imu_loss;    /**< IMU losses that stopped the filters */
+
+    ins_level_window_t level_win; /**< leveling window for the ARS/AHRS
+                                       bootstrap (REQ-SUITE-028) */
+    uint32_t n_att_boot_moving;   /**< ARS/AHRS bootstraps that were not
+                                       quasi-static (REQ-SUITE-028) */
 
     /* Handoff from nav_suite_predict_step() to nav_suite_correct_step() for one
        epoch (REQ-SUITE-021): only the caller's original, unmodified measurement

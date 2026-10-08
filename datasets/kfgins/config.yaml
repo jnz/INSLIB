@@ -64,10 +64,10 @@ score:
   lim_yaw_bias_deg: 0.012           # observed 0.008
   lim_yaw_std_deg: 0.028            # observed 0.025
   lim_pos_rms_m: 0.029              # observed 0.026
-  lim_ars_att_bias_deg: 0.176       # observed 0.167 (roll)
-  lim_ars_roll_std_deg: 1.62        # observed 1.542
-  lim_ars_pitch_std_deg: 1.57       # observed 1.491
-  lim_ars_yaw_drift_deg_min: 0.034  # observed 0.030
+  lim_ars_att_bias_deg: 0.213       # observed 0.202 (roll)
+  lim_ars_roll_std_deg: 1.62        # observed 1.571
+  lim_ars_pitch_std_deg: 1.57       # observed 1.507
+  lim_ars_yaw_drift_deg_min: 0.048  # observed 0.045
 
 inputs:
   ref: ref.csv

@@ -925,7 +925,8 @@ suite's current attitude, not the IMU position:
   (nav_suite_get_rpy, level while the suite holds no attitude), because
   the accessor also answers while ins is coasting or not ready,
 - the estimate drawn on the --plot state history (position), North-East
-  and altitude pages of tools/replay.py and tools/inspostgui.py.
+  and altitude pages of tools/replay.py and tools/inspostgui.py (the
+  ins_plots pages, the GUI's own replay views follow REQ-VER-039).
 
 A zero lever arm shall change nothing.
 
@@ -969,3 +970,88 @@ range keys in its Config.
 Rationale: the rows keep their own time and age, since a range refers to
 the midpoint of its burst, not to the epoch that happens to fuse it.
 
+
+## REQ-VER-039 — Lever arm compensated reference and fixes in inspostgui
+
+- **Status:** verified
+- **Parent:** REQ-VER-037
+- **Verification:** Test: python/tests/test_score_leverarm.py:test_leverarm_relation_classifies_gnss_vs_score; Test: python/tests/test_score_leverarm.py:test_gui_records_rotated_lever_arms_for_ref_and_fix; Demonstration: with gnss: leverarm_frd and score: leverarm_frd set to the same antenna point, the Replay tab of tools/inspostgui.py draws the reference line and the GNSS fixes on the estimate's trail while "Lever arm compensated" is checked and offset by the lever arm while it is not, in the 3D view, the altitude profile and the Plots tab's North-East map and altitude profile
+
+tools/inspostgui.py shall offer a "Lever arm compensated" checkbox
+(remembered across sessions) for its own replay views: the 3D view and the
+altitude profile of the Replay tab, and the North-East map and altitude
+profile of the Plots tab. Checked, the reference shall be drawn at the IMU
+point, its position minus R_b_to_n * score.leverarm_frd, and every GNSS fix
+minus R_b_to_n * gnss.leverarm_frd, both rotated with the suite's best
+available attitude (as in REQ-VER-037) of the epoch the reference sample
+or the fix arrived and held with it until the next one, so a reference
+slower than the plot rate is not bent into an arc per sample while the
+vehicle turns. Unchecked, both
+shall be drawn where they were taken. Switching shall redraw what is
+already on screen. The position error and the score are not affected.
+
+Next to the checkbox the GUI shall classify the lever arms of the config on
+screen, before any run: both zero, equal within 1 cm per axis, only the
+GNSS arm set (a warning: a reference that is the receiver's own solution
+then carries the whole lever arm as error), only the scoring arm set, or
+both set but different (a warning: correct for a reference taken at
+another point, a typo otherwise). The insdoctor findings of tools/replay.py
+and tools/inspostgui.py shall report the last case as info, next to the
+existing warning for the GNSS arm set without a scoring arm.
+
+Rationale: the estimate is the IMU's position while the fixes are taken at
+the antenna and the reference at its own point, so with a lever arm of a
+metre the three lines in the 3D view never meet even when the solution is
+right. A mismatch between the two lever arms is the usual cause of a
+constant position error floor.
+
+## REQ-VER-040 — Replay without a reference file
+
+- **Status:** verified
+- **Verification:** Test: python/tests/test_replay_core.py:test_replay_without_reference_csv
+
+tools/replay.py and tools/inspostgui.py shall run a dataset that has no
+ref.csv. Nothing is scored then (zero scored epochs, the reference traces
+stay empty) and the GUI shall not report the missing file as a config
+error. aiding: ref and init: ref take their state from the reference and
+shall be refused with a message naming the missing file.
+
+Rationale: a recording from the field has no ground truth, and the filter
+output is still worth looking at.
+
+## REQ-VER-041 — Estimate drawn in one local frame across an ins restart
+
+- **Status:** verified
+- **Parent:** REQ-VER-002
+- **Verification:** Test: python/tests/test_replay_core.py:test_estimate_stays_in_the_replay_frame_after_an_origin_reset; Demonstration: a field recording with a 0.7 s gap in its data, after which ins restarts with a new local origin 33 m from the first, drawn by tools/inspostgui.py with the reference on top: the estimate stays on the reference after the restart
+
+tools/replay.py and tools/inspostgui.py shall draw the estimate's local
+position in the local frame the replay latched once (its origin_ecef),
+the frame the reference and the GNSS fixes are converted into: when ins
+reports another origin than that one, its position_local() shall be moved
+by the offset of its origin in the latched frame, formed with the
+mapping the reference gets (ref_to_local_ned). This covers the state
+history, the North-East track and the GUI's live position.
+
+Rationale: ins sets a new origin when it restarts, after a time jump for
+example (REQ-NAV-016), and position_local() starts again near zero. The
+replay keeps its frame on purpose, a frame moving mid-plot would be
+worse, so the estimate drawn as it came out of the filter sat shifted
+by the distance between the two origins for the rest of the run, while
+the error figures, formed in ECEF, showed it on the reference.
+
+## REQ-VER-042 — Tutorial code builds and runs
+
+- **Status:** verified
+- **Parent:** REQ-VER-001
+- **Verification:** Test: python/tests/test_tutorials.py:test_c_tutorial_first_program; Test: python/tests/test_tutorials.py:test_c_tutorial_lighthouse_snippet; Test: python/tests/test_tutorials.py:test_attitude_tutorial_program; Test: python/tests/test_tutorials.py:test_python_tutorial_first_script; Test: python/tests/test_tutorials.py:test_python_tutorial_lighthouse_script; Test: python/tests/test_tutorials.py:test_python_snippets_use_existing_names; Test: python/tests/test_tutorials.py:test_c_names_in_tutorials_exist
+
+The programs and scripts printed in tutorial/*.md shall build with the
+command line the tutorial gives (without warnings), run to completion and
+print what the tutorial shows as their output. The Python snippets shall
+use only names the binding offers, and the functions and options the
+text names shall exist in src/. `make test` runs this check.
+
+Rationale: a tutorial is the first code a new user runs. A change to the
+start-up gates, a renamed function or a new source file the build line
+does not list breaks it without any other test noticing.

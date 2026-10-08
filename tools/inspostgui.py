@@ -94,7 +94,7 @@ CONFIG_SECTIONS = [
         (("inputs", "imu"), "IMU CSV", STR, None,
          "File name relative to the config's directory. Blank → imu.csv"),
         (("inputs", "ref"), "Reference CSV", STR, None,
-         "blank → ref.csv"),
+         "blank → ref.csv. Optional: without it nothing is scored"),
         (("inputs", "gnss"), "GNSS CSV", STR, None,
          "blank → gnss.csv, e.g. gnss_f9p.csv to A/B a receiver"),
         (("inputs", "mag"), "Magnetometer CSV", STR, None,
@@ -155,7 +155,11 @@ CONFIG_SECTIONS = [
          "position, yaw). Larger → stricter, smaller → more tolerant. 0 → "
          "default"),
         (("gyro_bias_window_sec",), "Gyro-bias window [s]", FLOAT, None,
-         "Averaging window for the gyro bias while parked at the start."),
+         "Average the gyro over the first seconds of the recording and start "
+         "the filters from that as gyro bias, with a tighter initial "
+         "uncertainty. Only if the platform stands still for the whole "
+         "window, any motion in it ends up in the bias. ZARU stays active. "
+         "Replay only, the library has no such option. 0 → off"),
         (("auto_init_window_sec",),
          "Auto-init leveling window [s]",
          FLOAT, None,
@@ -186,7 +190,7 @@ CONFIG_SECTIONS = [
         (("imu", "acc_bias_rw"), "acc_bias_rw [m/s²/√s]", FLOAT, None,
          "Accelerometer bias random walk"),
     ]),
-    ("Process noise margin (optional, 0 = ins.c default)", [
+    ("INS process noise margin (ins only, optional, 0 = ins.c default)", [
         (("imu", "pos_pred_stddev_m_sqrts"),
          "pos_pred_stddev [m/√s]",
          FLOAT, None,
@@ -198,8 +202,11 @@ CONFIG_SECTIONS = [
          "Extra velocity process noise. 0 → default. Often dominates the "
          "error growth when the IMU noise is set tightly, see \"process noise "
          "growth rate\" in the summary."),
-        (("imu", "rpy_pred_stddev_rad_sqrts"), "rpy_pred_stddev [rad/√s]",
-         FLOAT, None, "0 → default"),
+        (("imu", "rpy_pred_stddev_rad_sqrts"),
+         "rpy_pred_stddev [rad/√s]",
+         FLOAT, None,
+         "Extra attitude process noise of the INS only. ARS/AHRS have their "
+         "own value under \"ARS/AHRS noise model\" below. 0 → default"),
     ]),
     ("Auto-ZUPT/ZARU - one set for ins, ARS/AHRS and baro_alt "
      "(optional, 0 = default)", [
@@ -564,9 +571,15 @@ CONFIG_SECTIONS = [
     ]),
     ("ARS/AHRS noise model (optional, 0 = ahrs.c default)", [
         (("ahrs", "gyr_noise_psd"), "gyr_noise_psd [rad/s/√Hz]", FLOAT, None,
-         "Shared by ARS and AHRS (same physical gyro). 0 → default"),
+         "Shared by ARS and AHRS (same physical gyro). 0 → √(imu.gyr_psd)"),
         (("ahrs", "gyr_bias_rw"), "gyr_bias_rw [rad/s²/√Hz]", FLOAT, None,
-         "Shared by ARS and AHRS. 0 → default"),
+         "Shared by ARS and AHRS. 0 → imu.gyr_bias_rw"),
+        (("ahrs", "rpy_pred_stddev_rad_sqrts"), "rpy_pred_stddev [rad/√s]",
+         FLOAT, None,
+         "Extra attitude process noise of ARS and AHRS only, independent of "
+         "the INS value under \"INS process noise margin\". Tuning knob for "
+         "model errors (scale factor, misalignment, mounting), needed when "
+         "imu: holds a good sensor's own figure. 0 → none"),
         (("ahrs", "acc_noise_mps2"), "acc_noise [m/s²]", FLOAT, None,
          "Shared by ARS and AHRS (same accelerometer, used for leveling). 0 "
          "→ default"),
@@ -676,11 +689,9 @@ def validate_spec(spec, data_dir):
                               or fi["lon_deg"] is None):
         errors.append("free_inertial_start needs lat_deg and lon_deg: the "
                       "whole point is the origin you supply")
-    for stream in ("imu", "ref"):
-        path = replay.input_path(data_dir, spec, stream)
-        if not os.path.exists(path):
-            errors.append(f"{os.path.basename(path)} missing in {data_dir}")
-    need = {"gnss": spec["aiding"] == "gnss",
+    need = {"imu": True,
+            "ref": spec["aiding"] == "ref" or spec["init"] == "ref",
+            "gnss": spec["aiding"] == "gnss",
             "mag": bool(int(spec["mag"]["enable"])),
             "baro": bool(int(spec["baro"]["enable"])),
             "heading": bool(int(spec["heading"]["enable"])),
@@ -786,11 +797,16 @@ class ReplayWorker(QtCore.QThread):
         self._recorder = replay_core.PlotRecorder(rec_hz, lock=self.lock)
         self.rec = self._recorder.rec
         # Every fix of the aiding stream in the local NED frame, one entry
-        # per epoch (rec only samples the last one at rec_hz).
+        # per epoch (rec only samples the last one at rec_hz), and next to
+        # it R_b_to_n * gnss.leverarm_frd at that epoch, which moves the fix
+        # from the antenna onto the IMU point (REQ-VER-039).
         self.fix_ned = []
+        self.fix_la_ned = []
         # ins's local NED origin once known (ECEF), for the UI to move the
         # previous run's ghost trail into this run's frame.
         self.origin_ecef = None
+        # Anchors the filter was given ranges to so far: id -> local NED.
+        self.anchor_ned = {}
         self.live = {}
         self._stop = threading.Event()
         self._pause = threading.Event()
@@ -891,7 +907,7 @@ class ReplayWorker(QtCore.QThread):
             "findings": insdoctor,
             "growth_rate": replay.process_noise_growth_rate(spec["imu"]),
             "baro_growth_rate": replay.baro_alt_growth_rate(spec["baro"]),
-            "ahrs_growth_rate": replay.ahrs_growth_rate(spec["ahrs"]),
+            "ahrs_growth_rate": replay.ahrs_growth_rate(replay.effective_ahrs_cfg(spec)),
             "name": spec["name"] or os.path.basename(
                 os.path.normpath(data_dir)),
             "warmup_sec": float(spec["score"]["warmup_sec"]),
@@ -914,9 +930,11 @@ class ReplayWorker(QtCore.QThread):
             "scored_epochs": r.e_pos.n,
         }
 
-    def _update_live(self, nav, t, t0_us, duration, acc, gyr):
+    def _update_live(self, nav, t, t0_us, duration, acc, gyr, run=None):
         rpy = nav.rpy()  # best available: ins, else AHRS, else ARS
-        pos = nav.position_local()
+        # In the replay's frame, where the trail and the reference are.
+        pos = (replay_core.ins_pos_in_replay_frame(nav, run) if run is not None
+               else nav.position_local())
         vel = nav.velocity_ned()
         sd = nav.stddev()
         ecef = nav.position_ecef()
@@ -971,6 +989,7 @@ class _LiveTap(replay_core.Observer):
         self.w = worker
         self._last_live_us = None
         self._live_period_us = US_PER_SEC / 30.0
+        self._i_range = 0
 
     def on_epoch(self, r):
         w = self.w
@@ -979,12 +998,28 @@ class _LiveTap(replay_core.Observer):
         if r.fix_now is not None and r.origin_ecef is not None:
             p_fix = replay.ref_to_local_ned(r.fix_now, r.origin_ecef,
                                             r.origin_lat, r.origin_lon)
+            la_n = replay.ref_point_offset_ned(r.nav, r.leverarm)
             with w.lock:
                 w.fix_ned.append(p_fix)
+                w.fix_la_ned.append(la_n)
+        ranges = r.ranges
+        if ranges and r.origin_ecef is not None:
+            # Rows up to now, so an anchor appears with its first range.
+            while (self._i_range < len(ranges)
+                   and ranges[self._i_range][0] <= r.t):
+                _, aid, ecef, _, _ = ranges[self._i_range]
+                self._i_range += 1
+                if aid not in w.anchor_ned:
+                    lat, lon, alt = ecef_to_llh(*ecef)
+                    p = replay.ref_to_local_ned(
+                        {"lat_rad": lat, "lon_rad": lon, "h_m": alt},
+                        r.origin_ecef, r.origin_lat, r.origin_lon)
+                    with w.lock:
+                        w.anchor_ned[aid] = p
         if (self._last_live_us is None
                 or (r.t - self._last_live_us) >= self._live_period_us):
             self._last_live_us = r.t
-            w._update_live(r.nav, r.t, r.t0_us, r.imu_duration, r.a, r.g)
+            w._update_live(r.nav, r.t, r.t0_us, r.imu_duration, r.a, r.g, r)
 
 
 # ============================================================================
@@ -1181,6 +1216,17 @@ class Position3DView(gl.GLViewWidget):
         self.addItem(self.zupt_item)
         self._zupt_wanted = False
 
+        # Ranging anchors: a dot and the anchor id each.
+        self.anchor_ids = []
+        self.anchor_points = []
+        self.anchor_item = gl.GLScatterPlotItem(
+            pos=np.zeros((1, 3), dtype=np.float32), size=11, pxMode=True,
+            glOptions=GL_BLEND)
+        self.anchor_item.setVisible(False)
+        self.addItem(self.anchor_item)
+        self.anchor_labels = []
+        self._anchor_wanted = True
+
         self.position_item = gl.GLScatterPlotItem(
             pos=np.array([[0, 0, 0]]), size=10, glOptions=GL_BLEND)
         self.addItem(self.position_item)
@@ -1209,6 +1255,9 @@ class Position3DView(gl.GLViewWidget):
         self.ghost_item.setData(color=theme.rgba("ghost", 0.8))
         self.fix_item.setData(color=theme.rgba("fix", 0.9))
         self.zupt_item.setData(color=theme.rgba("zupt", 0.9))
+        self.anchor_item.setData(color=theme.rgba("anchor", 1.0))
+        for lab in self.anchor_labels:
+            lab.setData(color=pg.mkColor(theme.T["anchor"]))
         self.position_item.setData(color=np.array([theme.rgba("position")]))
         if self.ellipsoid_item is not None:
             self.ellipsoid_item.setColor(theme.rgba("ellipsoid", 0.16))
@@ -1302,6 +1351,41 @@ class Position3DView(gl.GLViewWidget):
                                             dtype=np.float32))
         self.zupt_item.setVisible(self._zupt_wanted)
 
+    def set_anchors(self, anchors):
+        """anchors: {id: NED}. Redraws only when an anchor is new."""
+        if len(anchors) == len(self.anchor_ids):
+            return False
+        for lab in self.anchor_labels:
+            self.removeItem(lab)
+        self.anchor_labels = []
+        self.anchor_ids = sorted(anchors)
+        self.anchor_points = [(anchors[i][0], -anchors[i][1], -anchors[i][2])
+                              for i in self.anchor_ids]
+        if self.anchor_points:
+            self.anchor_item.setData(
+                pos=np.array(self.anchor_points, dtype=np.float32))
+        for aid, p in zip(self.anchor_ids, self.anchor_points):
+            lab = gl.GLTextItem(pos=np.array(p, dtype=np.float32),
+                                text=f" {aid}",
+                                color=pg.mkColor(theme.T["anchor"]))
+            self.addItem(lab)
+            self.anchor_labels.append(lab)
+        self._apply_anchor_visible()
+        return True
+
+    def _apply_anchor_visible(self):
+        on = self._anchor_wanted and bool(self.anchor_points)
+        self.anchor_item.setVisible(on)
+        for lab in self.anchor_labels:
+            lab.setVisible(on)
+
+    def set_anchor_visible(self, on):
+        self._anchor_wanted = on
+        self._apply_anchor_visible()
+
+    def clear_anchors(self):
+        return self.set_anchors({})
+
     def set_zupt_visible(self, on):
         self._zupt_wanted = on
         # Stays hidden while empty: the placeholder point sits at the origin.
@@ -1309,6 +1393,14 @@ class Position3DView(gl.GLViewWidget):
 
     def set_ref_visible(self, on):
         self.ref_item.setVisible(on)
+
+    def clear_ref_fix(self):
+        """Drop the reference line and the fix dots, to draw them again at
+        another point of the vehicle (lever arm compensation switched)."""
+        self.ref_points.clear()
+        self.fix_points.clear()
+        self.fix_item.setVisible(False)
+        self.ref_item.setData(pos=np.zeros((2, 3), dtype=np.float32))
 
     def speed_scale(self):
         """Speed [m/s] at the red end of the trail colour ramp."""
@@ -1404,7 +1496,8 @@ class Position3DView(gl.GLViewWidget):
         self.setCameraPosition(pos=pg.Vector(x, y, z), distance=40)
 
     def fit_trail(self):
-        pts = self.trail_points or self.ref_points or self.fix_points
+        pts = (self.trail_points or self.ref_points or self.fix_points
+               or self.anchor_points)
         if not pts:
             return
         arr = np.array(pts, dtype=np.float32)
@@ -1513,6 +1606,7 @@ class TrailLegend(QtWidgets.QWidget):
         "ghost": ("Previous run", "line", "ghost"),
         "fix": ("GNSS fix", "dot", "fix"),
         "zupt": ("ZUPT/ZARU", "dot", "zupt"),
+        "anchor": ("Anchor", "dot", "anchor"),
     }
     RAMP_W = 110
 
@@ -1584,6 +1678,14 @@ class TrailLegend(QtWidgets.QWidget):
 # Config editor
 # ============================================================================
 
+class _NoWheelComboBox(QtWidgets.QComboBox):
+    """Combo box that never reacts to the mouse wheel, so scrolling through
+    the config form cannot silently change a choice under the cursor."""
+
+    def wheelEvent(self, event):
+        event.ignore()  # lets the enclosing scroll area handle it
+
+
 class ConfigEditor(QtWidgets.QScrollArea):
     """Schema-driven form over config.yaml. Keys outside the schema (e.g.
     the foreign origin:/crazyflie: sections, truth:) are preserved
@@ -1631,7 +1733,7 @@ class ConfigEditor(QtWidgets.QScrollArea):
         if kind == BOOL:
             return QtWidgets.QCheckBox()
         if kind == CHOICE:
-            cb = QtWidgets.QComboBox()
+            cb = _NoWheelComboBox()
             cb.addItems(list(extra))
             return cb
         e = QtWidgets.QLineEdit()
@@ -1720,9 +1822,12 @@ class ConfigEditor(QtWidgets.QScrollArea):
 # Post-run plots
 # ============================================================================
 
-def populate_plots(glw, rec, warmup_end_sec):
+def populate_plots(glw, rec, warmup_end_sec, leverarm_comp=False):
     """Fill a GraphicsLayoutWidget with the post-run evaluation plots, in
-    the current theme's colours (a theme switch calls it again)."""
+    the current theme's colours (a theme switch calls it again).
+    leverarm_comp moves the reference and the GNSS fixes of the map and
+    the altitude profile onto the IMU point the estimate refers to
+    (REQ-VER-039), otherwise they are drawn where they were taken."""
     glw.clear()
     glw.setBackground(theme.T["bg"])
     PEN_N, PEN_E, PEN_D = (theme.pen("trace", 1.5, index=i) for i in range(3))
@@ -1744,6 +1849,10 @@ def populate_plots(glw, rec, warmup_end_sec):
     rpy_sig = arr("rpy_sigma_deg")
     pos = arr("pos")
     ref_pos = arr("ref_pos")
+    fix_d = arr("fix_pos_d")
+    if leverarm_comp:
+        ref_pos = ref_pos - arr("ref_pt_ned")
+        fix_d = fix_d - arr("gnss_la_ned")[:, 2]
     gyr_bias = arr("gyr_bias")
     acc_bias = arr("acc_bias")
     gyr_bias_sig = arr("gyr_bias_sigma")
@@ -1802,7 +1911,6 @@ def populate_plots(glw, rec, warmup_end_sec):
     baro_h = arr("baro_h_d")
     if np.isfinite(baro_h).any():
         alt.plot(t, -baro_h, pen=PEN_E, connect="finite", name="baro_alt")
-    fix_d = arr("fix_pos_d")
     if np.isfinite(fix_d).any():
         alt.plot(t, -fix_d, pen=theme.pen("extra", 1.0),
                  connect="finite", name="gnss")
@@ -1897,6 +2005,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results = None
         self._drained = 0
         self._fix_drained = 0
+        # First rec sample / fix still on screen after "Clear".
+        self._shown_from = 0
+        self._fix_shown_from = 0
         self._alt_t, self._alt_est, self._alt_ref = [], [], []
         self._alt_has_finite = False
         self._trail_gap = False
@@ -2079,6 +2190,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                  "ARS/AHRS ZARU). A standstill shows as a "
                                  "cluster. Needs the 3D solution, the trail "
                                  "is the ins position.")
+        self.chk_anchor = QtWidgets.QCheckBox("Anchors")
+        self.chk_anchor.setToolTip("The ranging anchors (ranges.csv) as dots "
+                                   "with their id, shown from the first "
+                                   "range to the anchor on.")
         # The previous run is off until switched on: a grey trail nobody
         # asked for reads as part of the current result. It has its own
         # settings key, so a remembered "on" from before the default
@@ -2090,6 +2205,8 @@ class MainWindow(QtWidgets.QMainWindow):
                  self.pos_view.set_fix_visible),
                 (self.chk_zupt, "show_zupt", False,
                  self.pos_view.set_zupt_visible),
+                (self.chk_anchor, "show_anchors", True,
+                 self.pos_view.set_anchor_visible),
                 (self.chk_ghost, "show_previous_run", False,
                  self._set_ghost_visible)):
             on = self.settings.value(key, default, type=bool)
@@ -2101,7 +2218,32 @@ class MainWindow(QtWidgets.QMainWindow):
             chk.toggled.connect(self._update_legend)
             bottom.addWidget(chk)
         self._update_legend()
+        self.chk_leverarm = QtWidgets.QCheckBox("Lever arm compensated")
+        self.chk_leverarm.setToolTip(
+            "Draw the reference and the GNSS fixes at the IMU point, where "
+            "the estimate is: the reference shifted back by "
+            "score.leverarm_frd, each fix by gnss.leverarm_frd, rotated "
+            "with the filter's attitude. Off: both where they were taken. "
+            "The position error and the score always compensate.")
+        self.chk_leverarm.setChecked(
+            self.settings.value("leverarm_comp", True, type=bool))
+        self.chk_leverarm.toggled.connect(
+            lambda c: self.settings.setValue("leverarm_comp", c))
+        self.chk_leverarm.toggled.connect(self._on_leverarm_comp_toggled)
+        bottom.addWidget(self.chk_leverarm)
+        # GNSS vs. scoring lever arm of the config on screen, see
+        # _update_leverarm_check.
+        self.lbl_leverarm = QtWidgets.QLabel("")
+        theme.themed(self._style_leverarm_check)
+        bottom.addWidget(self.lbl_leverarm)
         bottom.addStretch()
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.setToolTip("Clear the trail, the reference, the GNSS fixes "
+                             "and the ZUPT/ZARU dots of the 3D view and the "
+                             "altitude profile. A running replay keeps "
+                             "drawing from here on.")
+        clear_btn.clicked.connect(self._on_clear_trail)
+        bottom.addWidget(clear_btn)
         fit_btn = QtWidgets.QPushButton("Fit trail")
         fit_btn.clicked.connect(self.pos_view.fit_trail)
         bottom.addWidget(fit_btn)
@@ -2340,8 +2482,10 @@ class MainWindow(QtWidgets.QMainWindow):
         shown = [key for key, chk in (("ref", self.chk_ref),
                                       ("ghost", self.chk_ghost),
                                       ("fix", self.chk_fix),
-                                      ("zupt", self.chk_zupt))
-                 if chk.isChecked()]
+                                      ("zupt", self.chk_zupt),
+                                      ("anchor", self.chk_anchor))
+                 if chk.isChecked()
+                 and (key != "anchor" or self.pos_view.anchor_points)]
         self.legend.set_overlays(shown)
 
     def _style_findings(self):
@@ -2420,6 +2564,7 @@ class MainWindow(QtWidgets.QMainWindow):
         unsaved-changes marker."""
         if not self.cfg_path:
             return
+        self._update_leverarm_check()
         dirty = self.editor.is_dirty()
         exists = os.path.exists(self.cfg_path)
         self.cfg_label.setText(
@@ -2430,6 +2575,95 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(
             f"inspostgui — {self._title_name} "
             f"[{os.path.basename(self.cfg_path)}]{' *' if dirty else ''}")
+
+    def _update_leverarm_check(self):
+        """Next to the compensation checkbox: does the scoring lever arm
+        match the GNSS one (REQ-VER-039)? Same verdict as the insdoctor
+        finding, but from the config on screen, before any run."""
+        raw, errors = self.editor.collect()
+        if errors:
+            self.lbl_leverarm.setText("")
+            self.lbl_leverarm.setToolTip("")
+            return
+        spec = merge_spec(raw)
+        g = list(spec["gnss"]["leverarm_frd"])
+        sc = list(spec["score"]["leverarm_frd"])
+        text, tip, warn = {
+            "none": ("", "", False),
+            "same": ("lever arms: GNSS = scoring", "", False),
+            "score_unset": (
+                "⚠ scoring lever arm not set",
+                f"gnss.leverarm_frd is {g} but score.leverarm_frd is zero: "
+                "the reference is taken as the IMU point. Set it to the GNSS "
+                "lever arm when ref.csv is the receiver's own solution, "
+                "otherwise the whole lever arm counts as position error.",
+                True),
+            "gnss_unset": (
+                "scoring lever arm only",
+                f"score.leverarm_frd is {sc}, gnss.leverarm_frd is zero: "
+                "the fixes are fused as if taken at the IMU.", False),
+            "differ": (
+                "⚠ lever arms: GNSS ≠ scoring",
+                f"gnss.leverarm_frd {g} vs. score.leverarm_frd {sc}. Right "
+                "when ref.csv refers to another point than the GNSS antenna, "
+                "a typo when it is the receiver's own solution.", True),
+        }[replay.leverarm_relation(g, sc)]
+        self.lbl_leverarm.setText(text)
+        self.lbl_leverarm.setToolTip(tip)
+        self._leverarm_warn = warn
+        self._style_leverarm_check()
+
+    def _style_leverarm_check(self):
+        self.lbl_leverarm.setStyleSheet(
+            f"color: {theme.T['warm']};"
+            if getattr(self, "_leverarm_warn", False) else theme.dim())
+
+    def _on_leverarm_comp_toggled(self, *_):
+        """Redraw the reference and the fixes of the 3D view and the
+        altitude profile, and the post-run plots, at the newly chosen
+        point."""
+        w = self.worker
+        self.pos_view.clear_ref_fix()
+        if w is not None:
+            with w.lock:
+                ref = w.rec["ref_pos"][self._shown_from:self._drained]
+                ref_la = w.rec["ref_pt_ned"][self._shown_from:self._drained]
+                fix = w.fix_ned[self._fix_shown_from:self._fix_drained]
+                fix_la = w.fix_la_ned[self._fix_shown_from:self._fix_drained]
+            shown = [self._ref_shown(r, d) for r, d in zip(ref, ref_la)]
+            self.pos_view.append_ref([p for p in shown if p[0] == p[0]])
+            self.pos_view.append_fix([self._ref_shown(p, d)
+                                      for p, d in zip(fix, fix_la)])
+            self._alt_ref = [-p[2] if p[2] == p[2] else math.nan
+                             for p in shown]
+            if self._alt_has_finite:
+                self.alt_curve_ref.setData(self._alt_t, self._alt_ref,
+                                           connect="finite")
+        if self.results:
+            populate_plots(self.plots_widget, self.results["rec"],
+                           self.results.get("warmup_end_sec", 0.0),
+                           self.chk_leverarm.isChecked())
+
+    def _on_clear_trail(self):
+        """Empty the 3D view (ghost aside) and the altitude profile, a
+        running replay keeps drawing from the next sample on."""
+        self.pos_view.reset_trail()
+        self.legend.set_scale(self.pos_view.speed_scale())
+        self._shown_from = self._drained
+        self._fix_shown_from = self._fix_drained
+        self._alt_t, self._alt_est, self._alt_ref = [], [], []
+        self._alt_has_finite = False
+        self._trail_gap = False
+        self.alt_curve_est.clear()
+        self.alt_curve_ref.clear()
+
+    def _ref_shown(self, p, la_n):
+        """A reference or fix position (NED) where the 3D view draws it:
+        moved by its rotated lever arm la_n onto the IMU point while the
+        compensation is on, as taken otherwise."""
+        if not self.chk_leverarm.isChecked():
+            return p
+        return [a - b for a, b in zip(p, la_n)]
 
     def _confirm_discard(self, question):
         """True if it is fine to drop the config form's state: nothing
@@ -2573,12 +2807,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results = None
         self._drained = 0
         self._fix_drained = 0
+        # First rec sample / fix still on screen after "Clear".
+        self._shown_from = 0
+        self._fix_shown_from = 0
         self._alt_t, self._alt_est, self._alt_ref = [], [], []
         self._alt_has_finite = False
         self._trail_gap = False
         self._smooth_quat = None
         self._smooth_t = None
         self.pos_view.reset_trail()
+        self.pos_view.clear_anchors()
         self.legend.set_scale(self.pos_view.speed_scale())
         self.plots_widget.clear()
         self.summary_text.setPlainText("")
@@ -2662,7 +2900,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_ended()
         self.summary_text.setPlainText(results["text"])
         populate_plots(self.plots_widget, results["rec"],
-                       results.get("warmup_end_sec", 0.0))
+                       results.get("warmup_end_sec", 0.0),
+                       self.chk_leverarm.isChecked())
         self.map_view.set_tracks(
             [(row[1], row[2]) for row in results["kml_est"]],
             [(row[0], row[1]) for row in results["kml_ref"]],
@@ -2792,7 +3031,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # rebuilding them is simpler than chasing every curve.
         if self.results:
             populate_plots(self.plots_widget, self.results["rec"],
-                           self.results.get("warmup_end_sec", 0.0))
+                           self.results.get("warmup_end_sec", 0.0),
+                           self.chk_leverarm.isChecked())
 
     # --- live UI ----------------------------------------------------------
     def _update_ui(self):
@@ -2804,17 +3044,24 @@ class MainWindow(QtWidgets.QMainWindow):
             new_t = w.rec["t"][self._drained:n]
             new_pos = w.rec["pos"][self._drained:n]
             new_vel = w.rec["vel"][self._drained:n]
-            new_ref = w.rec["ref_pos"][self._drained:n]
-            new_fix = w.fix_ned[self._fix_drained:]
+            new_ref = [self._ref_shown(r, d) for r, d in zip(
+                w.rec["ref_pos"][self._drained:n],
+                w.rec["ref_pt_ned"][self._drained:n])]
+            new_fix = [self._ref_shown(p, d) for p, d in zip(
+                w.fix_ned[self._fix_drained:],
+                w.fix_la_ned[self._fix_drained:])]
             new_zupt = [bool(a or b or c) for a, b, c in zip(
                 w.rec["zupt_active"][self._drained:n],
                 w.rec["ars_zaru_applied"][self._drained:n],
                 w.rec["ahrs_zaru_applied"][self._drained:n])]
             live = dict(w.live)
             origin_now = w.origin_ecef
+            anchors = dict(w.anchor_ned)
         self._drained = n
         self._fix_drained += len(new_fix)
         self.pos_view.append_fix(new_fix)
+        if self.pos_view.set_anchors(anchors):
+            self._update_legend()
         if not self._ghost_placed and origin_now is not None:
             self._place_ghost(origin_now)
 

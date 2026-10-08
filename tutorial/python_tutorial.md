@@ -189,19 +189,24 @@ nav = Navigator(Config(auto_init=True,
                        h_m=520.0))
 
 dt = 0.01
-for k in range(1, 601):
+for k in range(1, 1201):                   # 12 s: entry dwell + warm-up
     nav.imu(int(k * dt * 1e6), dt, acc=(0.0, 0.0, -9.81), gyr=(0.0, 0.0, 0.0))
     if k % 10 == 0:                        # a 10 Hz indoor tracker
         nav.local_pos((1.5, 0.0, 0.0), var_ned=(1e-4, 1e-4, 1e-4))  # 1 cm
     nav.update()
     sol = nav.solution()
 
-print(sol.mode, sol.ready, tuple(round(x, 3) for x in sol.pos_local))
-# -> FULL True (1.5, -0.0, -0.0)
+print(sol.mode, sol.ready, tuple(round(x, 3) + 0.0 for x in sol.pos_local))
+# -> FULL True (0.0, 0.0, 0.0)
 ```
 
-The position you pass must already be in the filter's NED frame (origin =
-the `Config` lat/lon/h). Aligning your tracker's frame to it is up to you.
+`Navigator` takes the first tracker sample as the origin of its local
+frame: the tracker never moved here, so the position stays at zero (move
+it and `sol.pos_local` follows, relative to that first sample). The
+`Config` lat/lon/h is what that origin is placed at. The bare `Ins` has no
+such datum handling: it expects the position in its NED frame (origin =
+the `Config` lat/lon/h) and reports it unchanged, here `(1.5, 0.0, 0.0)`.
+Aligning your tracker's axes with NED is up to you in both cases.
 
 ## Referencing yaw to true north (magnetometer)
 

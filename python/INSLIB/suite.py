@@ -241,6 +241,15 @@ class Navigator(_Base):
         contract as set_ahrs_gyr_noise()."""
         self._c("set_ahrs_gyr_bias_rw")(self._h, float(density_rps2_sqrthz))
 
+    def set_ahrs_rpy_pred_stddev(self, stddev_rad_sqrts):
+        """Set the ARS's/AHRS's SHARED extra attitude process noise
+        [rad/sqrt(s)] (<=0 -> none), added on top of the gyro noise for
+        model errors the sensor figure does not cover, the same split as
+        ins's rpy_pred_stddev_rad_sqrts. Needed once the gyro noise is a
+        good sensor's own figure, the generic default carries the margin
+        itself; same timing contract as set_ahrs_gyr_noise()."""
+        self._c("set_ahrs_rpy_pred_stddev")(self._h, float(stddev_rad_sqrts))
+
     def set_init_att_hint(self, roll_rad=0.0, pitch_rad=0.0,
                           stddev_roll_pitch_rad=0.0, yaw_rad=0.0,
                           stddev_yaw_rad=0.0):

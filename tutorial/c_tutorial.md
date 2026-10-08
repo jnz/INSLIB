@@ -29,14 +29,14 @@ The core filter (`INS`) is a **15-state error-state Kalman filter (ESKF)**.
 | 9–11   | accelerometer bias | body |
 | 12–14  | gyroscope bias | body |
 
-You do not touch those internals. You feed measurements in and read a
+No need to touch the internals. You feed measurements in and read a
 position/velocity/attitude solution out.
 
-## Design in one breath
+## Design
 
 * **No heap, no OS.** The whole filter is one caller-owned `struct`
   (`ins_t`). You zero it, initialise it, and feed it. It never calls
-  `malloc`. That is what makes it a drop-in library for microcontrollers.
+  `malloc`. That is basically a drop-in library for microcontrollers.
 * **Conventions.** Body frame is **FRD** (x forward, y right, z down),
   navigation frame is **NED**. Quaternions are Hamilton with `q[0] = w`.
   Timestamps are `int64` microseconds. Angles are radians.
@@ -44,9 +44,9 @@ position/velocity/attitude solution out.
   treats `0` as "pick a sensible default", so a zeroed options struct
   already gives you a working (but not optimal) filter.
 
-## Your first program
+## First program
 
-Here is a complete program. It creates a filter, feeds it three seconds of
+Here is a complete program. It creates a filter, feeds it ten seconds of
 a (stationary, level) IMU at 100 Hz with a once-per-second GNSS fix, and
 prints the resulting position and attitude.
 
@@ -98,11 +98,11 @@ int main(void)
         return 1;
     }
 
-    /* 4. Feed measurements. 100 Hz IMU for 6 s, a 1 Hz GNSS fix on top.
+    /* 4. Feed measurements. 100 Hz IMU for 10 s, a 1 Hz GNSS fix on top.
      *    At rest and level the accelerometer measures specific force
      *    f = -g: in body FRD (z down) that is +g pointing "up" == -z. */
     const float dt = 0.01f; /* 100 Hz */
-    for (int k = 1; k <= 600; ++k) {
+    for (int k = 1; k <= 1000; ++k) {
         ins_time_us_t t_us = (ins_time_us_t)(1.0 * 1e6 * k * dt);
 
         ins_measurements_t m = {0};
@@ -120,7 +120,8 @@ int main(void)
         m.gyr.data[2]  = 0.0f;
 
         /* GNSS once per second: position + a diagonal NED covariance
-         * (here 2 m horizontal, 4 m vertical 1-sigma -> variance in m^2).
+         * (here 1.5 m horizontal, 2.5 m vertical 1-sigma -> variance in m^2,
+         * inside the 3D entry gate, see "Warm-up" below).
          * The fix goes in as the receiver reports it, latitude, longitude
          * and height, which is the form the filter fuses in. A source that
          * is natively ECEF converts once with ins_ecef_to_latlonh(). */
@@ -129,9 +130,9 @@ int main(void)
             m.gnss_pos.llh[0]     = lat;
             m.gnss_pos.llh[1]     = lon;
             m.gnss_pos.llh[2]     = h;
-            m.gnss_pos.Qll_ned[0] = 2.0f * 2.0f; /* var N */
-            m.gnss_pos.Qll_ned[4] = 2.0f * 2.0f; /* var E */
-            m.gnss_pos.Qll_ned[8] = 4.0f * 4.0f; /* var D */
+            m.gnss_pos.Qll_ned[0] = 1.5f * 1.5f; /* var N */
+            m.gnss_pos.Qll_ned[4] = 1.5f * 1.5f; /* var E */
+            m.gnss_pos.Qll_ned[8] = 2.5f * 2.5f; /* var D */
         }
 
         ins_update(&ins, &m);
@@ -149,9 +150,9 @@ int main(void)
     ins_get_rpy(&ins, &roll, &pitch, &yaw);
 
     printf("position : lat %.6f deg  lon %.6f deg  h %.1f m\n",
-           llh[0] / D2R, llh[1] / D2R, llh[2]);
+           RAD2DEG(llh[0]), RAD2DEG(llh[1]), llh[2]);
     printf("attitude : roll %.2f  pitch %.2f  yaw %.2f deg\n",
-           roll / D2R, pitch / D2R, yaw / D2R);
+           RAD2DEG(roll), RAD2DEG(pitch), RAD2DEG(yaw));
     return 0;
 }
 ```
@@ -165,7 +166,7 @@ alongside your project. From the repository root:
 cc -std=c11 -D_GNU_SOURCE \
    -Isrc -IKFCore/c -IKFCore/c/navigation_tools \
    hello_ins.c \
-   src/ins.c src/geodetic_toolbox.c src/magnetic_model.c \
+   src/ins.c src/log.c src/geodetic_toolbox.c src/magnetic_model.c \
    KFCore/c/linalg.c KFCore/c/kalman_udu.c KFCore/c/miniblas.c \
    -lm -o hello_ins
 ./hello_ins
@@ -175,11 +176,16 @@ Expected output:
 
 ```
 position : lat 48.137200 deg  lon 11.575600 deg  h 520.0 m
-attitude : roll -0.01  pitch 0.00  yaw 0.02 deg
+attitude : roll 0.00  pitch 0.00  yaw 0.00 deg
 ```
 
 The position matches the fix and the attitude comes out level, the filter
-levelled itself from the accelerometer during warm-up.
+levelled itself from the accelerometer during warm-up.^[A real gyro never
+measures exactly zero, the Earth's rotation alone is 15 deg/h.]
+The log also prints a few warnings (`initial heading unknown`, `gyro sample
+identical ...`, `yaw not aided ...`). They are expected here: the example has
+no magnetometer or GNSS velocity, so the heading is unobservable, and the
+synthetic IMU is noise-free. The `yaw` value is not meaningful.
 
 > `-D_GNU_SOURCE` is only needed so the standard headers expose `M_PI` to
 > the library sources, it is not an INSLIB requirement of your own code.

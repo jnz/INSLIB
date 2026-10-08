@@ -133,8 +133,8 @@ n_invalid_input), continuing normally with the next valid data.
 - **Verification:** Test: tests/test_ahrs.c:scenario_time_anomaly
 
 A backwards timestamp step shall re-anchor the internal clocks and
-skip the epoch; a forward gap larger than 0.2 s shall skip the
-attitude integration for that epoch (sensor-outage semantics).
+skip the epoch; a forward gap of imu_loss_timeout_sec or more shall be
+handled as an IMU loss (REQ-AHRS-029).
 
 ## REQ-AHRS-012 — Initialization heuristics
 
@@ -440,3 +440,89 @@ from ahrs_predict_step() to ahrs_correct_step() (not re-derived, since
 the timing decision is not recoverable once t_last_gyr/t_last_cov_predict
 have moved on) -- ahrs_correct_step() shall be a no-op if the matching
 ahrs_predict_step() dropped the epoch or was never called.
+
+## REQ-AHRS-026 — Magnetometer-free build
+
+- **Status:** verified
+- **Parent:** REQ-SYS-002
+- **Verification:** Test: tests/test_ahrs_nomag.c:scenario_nomag_roll_pitch; Test: tests/test_ahrs_nomag.c:scenario_nomag_rejects_ahrs_mode
+
+Compiling ahrs.c with AHRS_NO_MAG defined shall leave out all magnetometer
+code, so that the filter builds and links without magnetic_model.c and
+wmm_lut.h. In such a build the ARS mode shall behave exactly as in the
+regular build, ahrs_init() shall reject AHRS_MODE_AHRS with -1, and
+ahrs_set_position() and ahrs_mag_heading() shall not be declared. The
+ahrs_t and ahrs_config_t layouts shall not depend on the define, so the
+result stays layout compatible with the regular build.
+
+Rationale: a user who only wants roll and pitch from an IMU should not have
+to carry the World Magnetic Model tables (the largest data object of the
+library) and the dependencies behind them. nav_suite needs the magnetometer
+code and is always built without this define.
+
+## REQ-AHRS-027 — Extra attitude process noise
+
+- **Status:** verified
+- **Parent:** REQ-SYS-002
+- **Verification:** Test: tests/test_ahrs.c:scenario_rpy_pred_extra_noise
+
+ahrs_config_t.rpy_pred_stddev_rad_sqrts [rad/sqrt(s)] shall add an attitude
+process noise on top of the gyro noise: per covariance prediction the
+attitude noise variance shall be (gyr_noise_psd^2 +
+rpy_pred_stddev_rad_sqrts^2) * dt. Left at (or explicitly set to) <= 0 it
+shall add nothing, leaving the filter exactly as without the term.
+
+Rationale: gyr_noise_psd is meant to be the sensor's own figure (datasheet,
+Allan variance), and nav_suite users set it from the same IMU description as
+ins. Measured on a good MEMS gyro it is one to two orders of magnitude below
+the generic default the filter was tuned with, and the sensor noise alone
+leaves out the model errors that dominate in practice (scale factor and
+misalignment under rotation, a non-rigid mount). Without a separate term the
+filter would become overconfident in attitude the moment a real sensor figure
+is entered. The extra term is the tuning knob, the same split ins makes with
+its own rpy_pred_stddev_rad_sqrts (REQ-NAV-049). Unlike there, the default
+is none: the generic gyro noise default the ARS/AHRS falls back to already
+carries the margin of a typical MEMS IMU, and the filter was tuned on it
+alone (roughly 0.1 to 0.2 deg 1-sigma roll/pitch). Only a caller who enters
+a good sensor's own figure needs the term.
+
+## REQ-AHRS-028 — Attitude uncertainty across a time gap
+
+- **Status:** deleted
+- **Parent:** REQ-AHRS-011
+- **Verification:** Open
+
+Superseded by REQ-AHRS-029. Widening the attitude variance by an assumed
+turn rate during the gap is replaced by stopping the filter: no assumed
+rate bounds what the platform really did in the gap.
+
+## REQ-AHRS-029 — IMU loss stops the filter
+
+- **Status:** verified
+- **Parent:** REQ-AHRS-011
+- **Verification:** Test: tests/test_ahrs.c:scenario_imu_loss_stops_filter; Test: tests/test_ahrs.c:scenario_time_anomaly
+
+A sample that arrives imu_loss_timeout_sec or more after the previous
+accepted sample ends an IMU loss. The filter shall neither integrate nor
+fuse that sample and shall mark itself uninitialized. Before it does, it
+shall latch a gyro bias carry: the
+current gyro bias estimate and its 1-sigma widened by a fixed inflation
+factor, clamped to at most the configured cold-start prior
+(gyr_bias_init_stddev_rps). The carry shall be readable through an
+accessor until the next ahrs_init(), which a standalone caller calls to
+restart the filter and may seed gyr_bias_init_rps and
+gyr_bias_init_stddev_rps from it. A caller that detects the loss itself,
+on epochs the filter never gets, stops it the same way through
+ahrs_stop_imu_loss(). ahrs_config_t.imu_loss_timeout_sec: 0 selects the
+default of 0.2 s, shared with ins (REQ-NAV-089) and baro_alt
+(REQ-BARO-027).
+
+Rationale: the samples missing in the gap carry the rotation of that
+time, and nothing bounds it. Any covariance the filter could claim
+afterwards rests on an assumed turn rate that the platform need not have
+kept to, and every measurement fused against the stale attitude makes it
+worse while looking consistent. Attitude and its uncertainty are
+therefore re-derived from scratch. The gyro bias cannot have moved in a
+fraction of a second and costs the longest to converge, so it is the one
+quantity worth keeping. The inflation covers a sensor that rebooted in
+the gap and came back with a different turn-on bias.

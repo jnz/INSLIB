@@ -81,6 +81,21 @@ def test_allan_recovers_bias_rw():
     # A clean synthetic static record must not trip the motion warnings.
     assert not any("not be static" in w for w in r["warnings"]), r["warnings"]
 
+    # Bias instability: the Allan minimum / 0.664. Without a flicker term the
+    # minimum sits where white noise and random walk cross, so it can be
+    # checked against the two injected terms: never below either asymptote
+    # at the reported tau, and inside the trustworthy averaging times.
+    for name in ("gyr", "acc"):
+        for b, tau_b in zip(r["bi"][name], r["bi_tau"][name]):
+            floor = max(_N_ARW / math.sqrt(tau_b), _K_RRW * math.sqrt(tau_b / 3.0))
+            assert 0.5 * floor < b * av.BIAS_INSTABILITY_FACTOR < 2.0 * floor, \
+                f"{name} bias instability {b:.2e} at tau={tau_b:.0f} s"
+            assert tau_b <= r["tau_fit_max"]
+
+    # The console report stays ASCII (a Windows console may not encode the
+    # unicode units the PDF uses).
+    av.format_report(r).encode("ascii")
+
 
 if __name__ == "__main__":
     test_allan_recovers_bias_rw()

@@ -669,7 +669,7 @@ static void scenario_nav_suite(void)
 
         ins_measurements_t m2;
         int                i2;
-        for (i2 = 0; i2 < 10; ++i2)
+        for (i2 = 0; i2 < 20; ++i2) /* past the leveling window (REQ-SUITE-028) */
         {
             t += US_PER_SEC / 100;
             memset(&m2, 0, sizeof(m2));
@@ -925,6 +925,97 @@ static void scenario_suite_quality_exit_rebootstrap(void)
  * roll/pitch from gravity, which must still be ARS's own value, not the
  * static hint (this test leaves the hint's roll/pitch unset, so a wrong
  * roll/pitch would mean the fallback fired where it should not have). */
+/* Prescribed start (REQ-SUITE-002): under a manual init the ARS starts on the
+ * first IMU epoch from the prescribed roll/pitch, not from leveling, and the
+ * magnetometer AHRS, once its first sample arrives, from what the ARS holds.
+ * The specific force says "level" while the prescribed attitude is tilted,
+ * so a leveled start is told apart. After an IMU loss the prescribed state no
+ * longer holds and the restart levels. */
+static void scenario_suite_prescribed_start(void)
+{
+    printf("\n-- scenario: prescribed start of the ARS/AHRS (REQ-SUITE-002) --\n");
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ahrs_time_us_t t     = 1000000;
+    init.time            = t;
+    init.llh[0]          = 48.783 * M_PI / 180.0;
+    init.llh[1]          = 9.181 * M_PI / 180.0;
+    init.llh[2]          = 300.0;
+    init.rpy_init_rad[0] = DEG2RAD(5.0f);
+    init.rpy_init_rad[1] = DEG2RAD(-3.0f);
+    init.rpy_init_rad[2] = DEG2RAD(40.0f);
+    init.magnetic_n[0]   = 20.0f;
+    init.magnetic_n[2]   = 44.0f;
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.auto_init                     = false;
+    opt.allow_unlimited_deadreckoning = true; /* starts on IMU alone */
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init (manual)");
+
+    float f_level[3], mag_b[3];
+    body_meas_from_rpy(0.0f, 0.0f, DEG2RAD(40.0f), f_level, init.magnetic_n, mag_b);
+
+    ins_measurements_t m;
+    float              r, p, y, sd_r, sd_p, sd_y;
+    memset(&m, 0, sizeof(m));
+    t += US_PER_SEC / 100;
+    m.timestamp        = t;
+    m.strapdown_dt_sec = 0.01f;
+    m.acc.is_valid     = true;
+    m.gyr.is_valid     = true;
+    memcpy(m.acc.data, f_level, sizeof(f_level));
+    nav_suite_update(&s, &m);
+    CHECK_TRUE(ahrs_get_rpy(&s.ars, &r, &p, &y), "ars started on the first IMU epoch");
+    CHECK_NEAR(RAD2DEG(r), 5.0, 1e-3, "ars roll = prescribed, not leveled [deg]");
+    CHECK_NEAR(RAD2DEG(p), -3.0, 1e-3, "ars pitch = prescribed, not leveled [deg]");
+    CHECK_NEAR(RAD2DEG(y), 40.0, 1e-3, "ars yaw = prescribed [deg]");
+    CHECK_TRUE(!ahrs_get_rpy(&s.ahrs, &r, &p, &y), "mag-ahrs still waits for the magnetometer");
+
+    float ars_r, ars_p, ars_y, ars_sd_r, ars_sd_p, ars_sd_y;
+    CHECK_TRUE(ahrs_get_rpy(&s.ars, &ars_r, &ars_p, &ars_y) &&
+                   ahrs_get_rpy_stddev(&s.ars, &ars_sd_r, &ars_sd_p, &ars_sd_y),
+               "ars state before the first mag sample");
+    t += US_PER_SEC / 100;
+    m.timestamp    = t;
+    m.mag.is_valid = true;
+    memcpy(m.mag.data, mag_b, sizeof(mag_b));
+    m.mag.Qll_diag[0] = m.mag.Qll_diag[1] = m.mag.Qll_diag[2] = 1.0f;
+    /* What the ARS holds when the AHRS starts: it runs first this epoch. */
+    nav_suite_update(&s, &m);
+    CHECK_TRUE(ahrs_get_rpy(&s.ars, &ars_r, &ars_p, &ars_y) &&
+                   ahrs_get_rpy_stddev(&s.ars, &ars_sd_r, &ars_sd_p, &ars_sd_y),
+               "ars state at the AHRS start");
+    CHECK_TRUE(ahrs_get_rpy(&s.ahrs, &r, &p, &y) &&
+                   ahrs_get_rpy_stddev(&s.ahrs, &sd_r, &sd_p, &sd_y),
+               "mag-ahrs started on its first magnetometer sample");
+    CHECK_NEAR(RAD2DEG(r), RAD2DEG(ars_r), 0.2, "ahrs roll taken from the ars [deg]");
+    CHECK_NEAR(RAD2DEG(p), RAD2DEG(ars_p), 0.2, "ahrs pitch taken from the ars [deg]");
+
+    /* IMU loss: the restart levels (the specific force says level). */
+    t += (ahrs_time_us_t)(0.3 * US_PER_SEC);
+    int i;
+    for (i = 0; i < 30; ++i)
+    {
+        memset(&m, 0, sizeof(m));
+        m.timestamp        = t;
+        m.strapdown_dt_sec = 0.01f;
+        m.acc.is_valid     = true;
+        m.gyr.is_valid     = true;
+        memcpy(m.acc.data, f_level, sizeof(f_level));
+        nav_suite_update(&s, &m);
+        t += US_PER_SEC / 100;
+    }
+    CHECK_TRUE(s.n_imu_loss == 1, "one IMU loss");
+    CHECK_TRUE(ahrs_get_rpy(&s.ars, &r, &p, &y), "ars restarted");
+    CHECK_NEAR(RAD2DEG(r), 0.0, 0.5, "restart roll leveled, not prescribed [deg]");
+    CHECK_NEAR(RAD2DEG(p), 0.0, 0.5, "restart pitch leveled, not prescribed [deg]");
+}
+
 static void scenario_suite_init_att_hint(void)
 {
     printf("\n-- scenario: static initial attitude hint into ins auto-init "
@@ -1818,15 +1909,12 @@ static void scenario_time_anomaly(void)
     /* The backwards step re-anchored t_last_gyr; continue from there. */
     ahrs_time_us_t t2 = t - US_PER_SEC / 2;
 
-    /* Forward gap of 1 s (> 0.2 s) with omega_z = 1 rad/s: integrating
-       across the gap would yaw by ~57 deg, so the integration must be
-       skipped for that epoch instead. */
-    CHECK_TRUE(ahrs_get_rpy(&a, &roll0, &pitch0, &yaw0), "rpy valid");
+    /* Forward gap of 1 s with omega_z = 1 rad/s: an IMU loss, the filter
+       stops instead of integrating across it (REQ-AHRS-029). */
     t2 += US_PER_SEC;
     ahrs_update(&a, t2, gyr_big, f_b, (const float*)0, false);
-    CHECK_TRUE(ahrs_get_rpy(&a, &roll, &pitch, &yaw), "still healthy after forward gap");
-    CHECK_TRUE(fabsf(ins_angle_diff(yaw, yaw0)) < DEG2RAD(1.0f),
-               "forward gap: attitude integration skipped");
+    CHECK_TRUE(!ahrs_get_rpy(&a, &roll, &pitch, &yaw), "forward gap: filter stopped");
+    CHECK_TRUE(ahrs_init(&a, &cfg, t2) == 0, "restart");
 
     /* Normal operation continues after the anomalies. */
     for (i = 0; i < 200; ++i)
@@ -1839,6 +1927,65 @@ static void scenario_time_anomaly(void)
     CHECK_NEAR(RAD2DEG(pitch), 20.0, 0.5, "pitch tracks truth [deg]");
     CHECK_TRUE(a.n_invalid_input == 0, "no inputs flagged invalid");
     CHECK_TRUE(a.n_fuse_fail == 0, "no fusion failures");
+}
+
+/* ---------------------------------------------------------------------------
+ * IMU loss stops the filter (REQ-AHRS-029). A converged ARS with a gyro bias
+ * on x: a 0.15 s gap is jitter, a 0.25 s gap stops the filter, which keeps its
+ * gyro bias for the restart.
+ * ---------------------------------------------------------------------------
+ */
+static void scenario_imu_loss_stops_filter(void)
+{
+    printf("\n-- scenario: IMU loss stops the filter --\n");
+
+    const float gyr_b[3] = {DEG2RAD(0.2f), 0.0f, 0.0f};
+    float       f_b[3];
+    body_meas_from_rpy(0.0f, 0.0f, 0.0f, f_b, (const float*)0, (float*)0);
+
+    ahrs_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode                   = AHRS_MODE_ARS;
+    cfg.rpy_init_stddev_rad[0] = DEG2RAD(3.0f);
+    cfg.rpy_init_stddev_rad[1] = DEG2RAD(3.0f);
+    cfg.rpy_init_stddev_rad[2] = DEG2RAD(3.0f);
+    static ahrs_t  a;
+    ahrs_time_us_t t = 1000000;
+    CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "ahrs_init succeeds");
+    CHECK_NEAR(a.cfg.imu_loss_timeout_sec, 0.2, 1e-6, "0 selects the 0.2 s default");
+
+    int i;
+    for (i = 0; i < 3000; ++i)
+    {
+        t += US_PER_SEC / 100;
+        ahrs_update(&a, t, gyr_b, f_b, (const float*)0, false);
+    }
+    float gb0[3], gb[3], gb_sd[3], r, p, y;
+    CHECK_TRUE(ahrs_get_bias_gyr(&a, gb0), "gyro bias available");
+    CHECK_NEAR(RAD2DEG(gb0[0]), 0.2, 0.05, "gyro bias x converged [deg/s]");
+
+    t += (ahrs_time_us_t)(0.15 * US_PER_SEC);
+    ahrs_update(&a, t, gyr_b, f_b, (const float*)0, false);
+    CHECK_TRUE(ahrs_get_rpy(&a, &r, &p, &y), "0.15 s gap: still running");
+    CHECK_TRUE(!ahrs_get_bias_carry(&a, gb, gb_sd), "0.15 s gap: no carry");
+
+    t += (ahrs_time_us_t)(0.25 * US_PER_SEC);
+    ahrs_update(&a, t, gyr_b, f_b, (const float*)0, false);
+    CHECK_TRUE(!ahrs_get_rpy(&a, &r, &p, &y), "0.25 s gap: filter stopped");
+    CHECK_TRUE(ahrs_get_bias_carry(&a, gb, gb_sd), "0.25 s gap: gyro bias carried");
+    for (i = 0; i < 3; ++i)
+    {
+        CHECK_NEAR(gb[i], gb0[i], 1e-7, "carried gyro bias = estimate before the gap");
+        CHECK_TRUE(gb_sd[i] > 0.0f && gb_sd[i] <= a.cfg.gyr_bias_init_stddev_rps[i],
+                   "carried 1-sigma clamped to the cold-start prior");
+    }
+
+    memcpy(cfg.gyr_bias_init_rps, gb, sizeof(gb));
+    memcpy(cfg.gyr_bias_init_stddev_rps, gb_sd, sizeof(gb_sd));
+    CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "restart seeded from the carry");
+    CHECK_TRUE(!ahrs_get_bias_carry(&a, gb, gb_sd), "carry consumed by ahrs_init");
+    CHECK_TRUE(ahrs_get_bias_gyr(&a, gb), "gyro bias after the restart");
+    CHECK_NEAR(gb[0], gb0[0], 1e-7, "restart starts from the carried gyro bias");
 }
 
 /* ---------------------------------------------------------------------------
@@ -3628,6 +3775,81 @@ static void scenario_covariance_throttled(void)
     CHECK_TRUE(n_ovr < n_def, "lower configured rate -> fewer predictions");
 }
 
+/* Roll 1-sigma after T_sec of pure covariance prediction (no correction) on
+   a level, non-rotating ARS. Bias init stddev and bias random walk are kept
+   negligible, so the growth is the attitude process noise alone. */
+static float roll_stddev_after_predict(float gyr_noise, float rpy_pred, float T_sec,
+                                       float* resolved_rpy_pred)
+{
+    ahrs_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode                   = AHRS_MODE_ARS;
+    cfg.rpy_init_stddev_rad[0] = 1e-4f;
+    cfg.rpy_init_stddev_rad[1] = 1e-4f;
+    {
+        int k;
+        for (k = 0; k < 3; ++k) cfg.gyr_bias_init_stddev_rps[k] = 1e-9f;
+    }
+    cfg.gyr_bias_rw               = 1e-12f;
+    cfg.gyr_noise_psd             = gyr_noise;
+    cfg.rpy_pred_stddev_rad_sqrts = rpy_pred;
+
+    ahrs_t         a;
+    ahrs_time_us_t t = 0;
+    if (ahrs_init(&a, &cfg, t) != 0)
+    {
+        CHECK_TRUE(0, "ahrs_init succeeds");
+        return -1.0f;
+    }
+    if (resolved_rpy_pred) *resolved_rpy_pred = a.cfg.rpy_pred_stddev_rad_sqrts;
+
+    const float gyr[3] = {0.0f, 0.0f, 0.0f};
+    const float acc[3] = {0.0f, 0.0f, -GRAVITY};
+    const int   n      = (int)(T_sec * 100.0f);
+    int         i;
+    for (i = 0; i < n; ++i)
+    {
+        t += 10000;
+        ahrs_predict_step(&a, t, gyr, acc, (const float*)0, false, (float*)0);
+    }
+    float sr = 0.0f, sp = 0.0f, sy = 0.0f;
+    CHECK_TRUE(ahrs_get_rpy_stddev(&a, &sr, &sp, &sy), "stddev available");
+    return sr;
+}
+
+/* REQ-AHRS-027: the extra attitude process noise adds to the gyro noise in
+   variance, and 0 resolves to the generic gyro noise density default. */
+static void scenario_rpy_pred_extra_noise(void)
+{
+    printf("\n-- scenario: extra attitude process noise (REQ-AHRS-027) --\n");
+    const float T = 60.0f;
+    const float N = 1e-5f; /* a good gyro's own noise density */
+    const float E = 3e-4f; /* the extra tuning term */
+
+    /* (a) gyro noise N plus extra E == gyro noise sqrt(N^2 + E^2) alone. */
+    float s_split = roll_stddev_after_predict(N, E, T, (float*)0);
+    float s_sum   = roll_stddev_after_predict(sqrtf(N * N + E * E), 1e-12f, T, (float*)0);
+    printf("  roll after %.0f s: split %.5f deg, combined %.5f deg\n", (double)T,
+           (double)RAD2DEG(s_split), (double)RAD2DEG(s_sum));
+    CHECK_NEAR(s_split, s_sum, 0.01 * s_sum, "extra term adds in variance");
+
+    /* (b) and it is the closed form: var = init^2 + (N^2 + E^2) * T. */
+    float expect = sqrtf(1e-8f + (N * N + E * E) * T);
+    CHECK_NEAR(s_split, expect, 0.05 * expect, "growth matches (N^2 + E^2) * T");
+
+    /* (c) 0 (and negative) -> no extra term: the growth is the gyro noise
+           alone, the filter behaves exactly as without the field. */
+    float resolved = -1.0f;
+    float s_def    = roll_stddev_after_predict(N, 0.0f, T, &resolved);
+    float s_neg    = roll_stddev_after_predict(N, -1.0f, T, (float*)0);
+    float s_gyro   = sqrtf(1e-8f + N * N * T);
+    printf("  default extra term %.5f deg/sqrt(s), roll %.5f deg (gyro noise alone %.5f deg)\n",
+           (double)RAD2DEG(resolved), (double)RAD2DEG(s_def), (double)RAD2DEG(s_gyro));
+    CHECK_NEAR(resolved, 0.0, 1e-12, "0 -> no extra term");
+    CHECK_NEAR(s_def, s_gyro, 0.05 * s_gyro, "default growth is the gyro noise alone");
+    CHECK_NEAR(s_neg, s_def, 1e-9, "negative behaves like 0");
+}
+
 /* Same idea as count_cov_predicts, but with the IMU epoch spacing under test
    rather than fixed at 100 Hz: the cadence boundary is what matters here. */
 static int count_cov_predicts_at(float cfg_dt_sec, ahrs_time_us_t step_us, int epochs)
@@ -4307,6 +4529,500 @@ static void scenario_ahrs_config_passthrough(void)
     CHECK_TRUE(a_neg.cfg.gyr_bias_rw > 0.0f, "negative gyr_bias_rw clamped then defaulted");
 }
 
+/* ---------------------------------------------------------------------------
+ * IMU outage of 700 ms while the platform keeps turning, end to end through
+ * nav_suite (REQ-SUITE-026). Synthetic: a platform at a fixed place, rocking
+ * gently, with constant sensor biases. The IMU stream stops for 700 ms while
+ * barometer and GNSS keep arriving, and the platform tilts and turns by tens
+ * of degrees in that time. Every attitude consumer must come out of the gap
+ * neither blindly confident (error far beyond its own 1-sigma) nor needlessly
+ * discarded (restart, lost bias estimate), and the vertical channel must not
+ * pay for the attitude error with a height or velocity error or a learned
+ * accelerometer bias. A third run with a 150 ms gap, below the loss timeout,
+ * must restart nothing at all.
+ * ---------------------------------------------------------------------------
+ */
+#define GAPSCN_T_GAP0_S (30.0)
+#define GAPSCN_BASE_ALT (300.0f)
+
+/* The gap of the current run: its length, and whether the platform turns
+   inside it. */
+static ins_time_us_t gapscn_gap_us = 700000;
+static bool          gapscn_turn   = true;
+
+/* True attitude: gentle rocking plus a slow yaw drift, and from the gap on a
+   permanent additional tilt/turn that is carried out (smoothly) INSIDE the gap. */
+static void gapscn_true_rpy(double t_sec, float rpy[3])
+{
+    const double g0 = GAPSCN_T_GAP0_S;
+    const double g1 = GAPSCN_T_GAP0_S + (double)gapscn_gap_us * 1e-6;
+    double       s  = 0.0;
+    if (!gapscn_turn) { s = 0.0; }
+    else if (t_sec >= g1) { s = 1.0; }
+    else if (t_sec > g0) { s = 0.5 - 0.5 * cos(M_PI * (t_sec - g0) / (g1 - g0)); }
+    rpy[0] = (float)(DEG2RAD(6.0) * sin(2.0 * M_PI * 0.4 * t_sec) + s * DEG2RAD(15.0));
+    rpy[1] = (float)(DEG2RAD(4.0) * sin(2.0 * M_PI * 0.3 * t_sec + 1.0) - s * DEG2RAD(8.0));
+    rpy[2] = (float)(DEG2RAD(30.0) + DEG2RAD(1.0) * t_sec + s * DEG2RAD(25.0));
+}
+
+static void gapscn_true_R(double t_sec, float R[9])
+{
+    float rpy[3], q[4];
+    gapscn_true_rpy(t_sec, rpy);
+    ins_quat_from_rpy(rpy[0], rpy[1], rpy[2], q);
+    ins_quat_to_rotmat(q, R);
+}
+
+/* Body rate from the true attitude history: skew part of R(t-h)' R(t+h). */
+static void gapscn_true_omega_b(double t_sec, float w[3])
+{
+    const double h = 1e-3;
+    float        R1[9], R2[9], W[9];
+    int          r, c, k;
+    gapscn_true_R(t_sec - h, R1);
+    gapscn_true_R(t_sec + h, R2);
+    for (r = 0; r < 3; ++r)
+    {
+        for (c = 0; c < 3; ++c)
+        {
+            float sum = 0.0f;
+            for (k = 0; k < 3; ++k) { sum += MAT_ELEM(R1, k, r, 3, 3) * MAT_ELEM(R2, k, c, 3, 3); }
+            MAT_ELEM(W, r, c, 3, 3) = sum;
+        }
+    }
+    w[0] = (MAT_ELEM(W, 2, 1, 3, 3) - MAT_ELEM(W, 1, 2, 3, 3)) / (float)(4.0 * h);
+    w[1] = (MAT_ELEM(W, 0, 2, 3, 3) - MAT_ELEM(W, 2, 0, 3, 3)) / (float)(4.0 * h);
+    w[2] = (MAT_ELEM(W, 1, 0, 3, 3) - MAT_ELEM(W, 0, 1, 3, 3)) / (float)(4.0 * h);
+}
+
+/* Tilt error: angle between the true and the estimated "down" direction [deg].
+   The ARS has no heading reference, so this is the quantity it is judged on. */
+static double gapscn_tilt_err_deg(double t_sec, const float est_rpy[3])
+{
+    float q_e[4], R_t[9], R_e[9];
+    int   i;
+    gapscn_true_R(t_sec, R_t);
+    ins_quat_from_rpy(est_rpy[0], est_rpy[1], est_rpy[2], q_e);
+    ins_quat_to_rotmat(q_e, R_e);
+    double dot = 0.0;
+    for (i = 0; i < 3; ++i)
+    {
+        dot += (double)MAT_ELEM(R_t, 2, i, 3, 3) * MAT_ELEM(R_e, 2, i, 3, 3);
+    }
+    return RAD2DEG(acos(dot > 1.0 ? 1.0 : (dot < -1.0 ? -1.0 : dot)));
+}
+
+/* Heading error [deg], wrapped to +-180. */
+static double gapscn_yaw_err_deg(double t_sec, const float est_rpy[3])
+{
+    float rpy[3];
+    gapscn_true_rpy(t_sec, rpy);
+    double d = RAD2DEG((double)est_rpy[2] - (double)rpy[2]);
+    while (d > 180.0) d -= 360.0;
+    while (d < -180.0) d += 360.0;
+    return d;
+}
+
+static void gapscn_fill_imu(ins_measurements_t* m, double t_sec, const float mag_n[3],
+                            const float acc_bias[3], const float gyr_bias[3])
+{
+    float R[9], w[3];
+    int   i;
+    gapscn_true_R(t_sec, R);
+    gapscn_true_omega_b(t_sec, w);
+    m->acc.is_valid = true;
+    m->gyr.is_valid = true;
+    m->mag.is_valid = true;
+    for (i = 0; i < 3; ++i)
+    {
+        m->acc.data[i] = -GRAVITY * MAT_ELEM(R, 2, i, 3, 3) + acc_bias[i] + gauss(0.04f);
+        m->gyr.data[i] = w[i] + gyr_bias[i] + gauss(DEG2RAD(0.05f));
+        m->mag.data[i] = MAT_ELEM(R, 0, i, 3, 3) * mag_n[0] + MAT_ELEM(R, 1, i, 3, 3) * mag_n[1] +
+                         MAT_ELEM(R, 2, i, 3, 3) * mag_n[2] + gauss(0.3f);
+    }
+}
+
+static void gapscn_fill_baro(ins_measurements_t* m)
+{
+    m->baro.is_valid    = true;
+    m->baro.pressure_pa = pressure_at_altitude(GAPSCN_BASE_ALT + gauss(0.3f));
+}
+
+static void gapscn_fill_gnss(ins_measurements_t* m, const ins_init_t* init)
+{
+    m->gnss_pos.llh[0]     = init->llh[0];
+    m->gnss_pos.llh[1]     = init->llh[1];
+    m->gnss_pos.llh[2]     = init->llh[2];
+    m->gnss_pos.Qll_ned[0] = m->gnss_pos.Qll_ned[4] = 1.0f;
+    m->gnss_pos.Qll_ned[8]                          = 4.0f;
+    m->gnss_pos.is_valid                            = true;
+    m->gnss_vel.Qll_ned[0] = m->gnss_vel.Qll_ned[4] = m->gnss_vel.Qll_ned[8] = 0.01f;
+    m->gnss_vel.is_valid                                                     = true;
+}
+
+static void gapscn_report(const nav_suite_t* s, double ts, const char* label)
+{
+    float sd_r, sd_p, sd_y, h = 0.0f, v = 0.0f, ab = 0.0f;
+    float e_ars = -1.0f, e_ahrs = -1.0f, e_ins = -1.0f, y_ahrs = 0.0f, y_ins = 0.0f;
+    float ra[3], rm[3], ri[3];
+    if (ahrs_get_rpy(&s->ars, &ra[0], &ra[1], &ra[2]))
+    {
+        e_ars = (float)gapscn_tilt_err_deg(ts, ra);
+    }
+    if (ahrs_get_rpy(&s->ahrs, &rm[0], &rm[1], &rm[2]))
+    {
+        e_ahrs = (float)gapscn_tilt_err_deg(ts, rm);
+        y_ahrs = (float)gapscn_yaw_err_deg(ts, rm);
+    }
+    if (ins_get_rpy(&s->ins, &ri[0], &ri[1], &ri[2]))
+    {
+        e_ins = (float)gapscn_tilt_err_deg(ts, ri);
+        y_ins = (float)gapscn_yaw_err_deg(ts, ri);
+    }
+    const nav_suite_mode_t mode = nav_suite_get_mode(s);
+    ahrs_get_rpy_stddev(&s->ars, &sd_r, &sd_p, &sd_y);
+    float isd_r = 0.0f, isd_p = 0.0f, isd_y = 0.0f;
+    (void)ins_get_rpy_stddev(&s->ins, &isd_r, &isd_p, &isd_y);
+    (void)nav_suite_get_baro_alt(s, &h, &v);
+    (void)baro_alt_get_acc_bias(&s->baro_alt, &ab);
+    printf("    %-8s tilt err ars %5.2f (sd %4.2f) ahrs %5.2f ins %5.2f (sd %5.2f) | yaw err "
+           "ahrs %6.2f ins %6.2f (sd %5.2f) | h %5.2f v %5.2f ab %5.3f | dw %u rst %u/%u ins %d "
+           "mode %d\n",
+           label, (double)e_ars, (double)RAD2DEG(sd_r), (double)e_ahrs, (double)e_ins,
+           (double)RAD2DEG(isd_r > isd_p ? isd_r : isd_p), (double)y_ahrs, (double)y_ins,
+           (double)RAD2DEG(isd_y), (double)h, (double)v, (double)ab,
+           (unsigned)s->baro_alt.n_downweighted, (unsigned)s->ars.n_restart,
+           (unsigned)s->baro_alt.n_restart, (int)s->ins.is_initialized, (int)mode);
+}
+
+/* One 100 Hz IMU epoch of the synthetic platform (+ magnetometer, barometer at
+   25 Hz, GNSS at 5 Hz). strapdown_dt_sec spans back to the previous IMU epoch,
+   as the replay tool does. */
+static void gapscn_imu_epoch(nav_suite_t* s, ins_time_us_t* t, ins_time_us_t* t_prev,
+                             ins_time_us_t t0, const ins_init_t* init, const float mag_n[3],
+                             const float acc_bias[3], const float gyr_bias[3])
+{
+    ins_measurements_t m;
+    *t += US_PER_SEC / 100;
+    memset(&m, 0, sizeof(m));
+    m.timestamp        = *t;
+    m.strapdown_dt_sec = (*t_prev > 0) ? (float)(*t - *t_prev) * 1e-6f : 0.0f;
+    gapscn_fill_imu(&m, (double)(*t - t0) * 1e-6, mag_n, acc_bias, gyr_bias);
+    if ((*t - t0) % (US_PER_SEC / 25) == 0) { gapscn_fill_baro(&m); }
+    if ((*t - t0) % (US_PER_SEC / 5) == 0) { gapscn_fill_gnss(&m, init); }
+    nav_suite_update(s, &m);
+    *t_prev = *t;
+}
+
+/* Worst error-to-claimed-1-sigma ratio of the tilt, and whether it is
+   consistent. A floor on the sigma keeps a tiny claimed value from turning
+   estimation noise into a verdict. */
+static double gapscn_tilt_ratio(double err_deg, float sd_r, float sd_p)
+{
+    double sd = RAD2DEG((double)(sd_r > sd_p ? sd_r : sd_p));
+    if (sd < 0.3) { sd = 0.3; }
+    return err_deg / sd;
+}
+
+typedef struct
+{
+    bool     stale_in_gap; /* any attitude/height published inside the gap */
+    bool     stale_after;  /* any published on the first epoch after it */
+    double   ratio_ars, ratio_ahrs, ratio_ins, ratio_ins_yaw; /* worst err / 1-sigma, 3 s */
+    double   sd_first_ars, sd_first_ins; /* claimed tilt 1-sigma once restarted [deg] */
+    double   max_dab, max_dh, max_v;     /* vertical channel excursions once restarted */
+    double   err_ars, err_ahrs, err_ins; /* tilt error 3 s after the gap [deg] */
+    double   yaw_ahrs;                   /* heading error of the AHRS 8 s after the gap */
+    double   sd_late_ars, sd_late_ins;   /* claimed tilt 1-sigma 10 s after the gap [deg] */
+    double   dgyr_ars;                   /* change of the ARS gyro bias x/y [deg/s] */
+    double   dacc_ins;                   /* change of the ins accelerometer bias [m/s^2] */
+    bool     ins_ready_1s, ins_ready_late;
+    bool     all_running;  /* no filter stopped at any epoch in or after the gap */
+    double   max_tilt_err; /* worst tilt error of ARS/AHRS/ins after the gap [deg] */
+    unsigned n_suite_loss, n_ins_loss, n_downweighted;
+} gapscn_result_t;
+
+static bool gapscn_all_running(const nav_suite_t* s)
+{
+    return s->ars.is_initialized && s->ahrs.is_initialized && s->ins.is_initialized &&
+           s->baro_alt.is_initialized;
+}
+
+/* Nothing from before the gap may still be published (REQ-SUITE-026). */
+static bool gapscn_publishes(const nav_suite_t* s)
+{
+    float r, p, y, h;
+    return nav_suite_get_mode(s) != NAV_SUITE_MODE_NONE || nav_suite_get_rpy(s, &r, &p, &y) ||
+           nav_suite_get_baro_alt(s, &h, (float*)0);
+}
+
+static double gapscn_max(double a, double b) { return a > b ? a : b; }
+
+/* One run. aiding_in_gap: barometer (25 Hz) and GNSS (5 Hz) epochs keep
+   arriving during the IMU outage (their own clocks, no IMU in them) instead of
+   the whole stream going quiet. */
+static void gapscn_run(bool aiding_in_gap, gapscn_result_t* res)
+{
+    const float mag_n[3]    = {20.0f, 0.0f, 44.0f};
+    const float acc_bias[3] = {0.05f, -0.04f, 0.08f};
+    const float gyr_bias[3] = {DEG2RAD(0.2f), DEG2RAD(-0.1f), DEG2RAD(0.15f)};
+
+    memset(res, 0, sizeof(*res));
+    res->all_running = true;
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ins_time_us_t t0                     = 1000000;
+    init.time                            = t0;
+    init.llh[0]                          = 48.783 * M_PI / 180.0;
+    init.llh[1]                          = 9.181 * M_PI / 180.0;
+    init.llh[2]                          = 300.0;
+    init.pos_init_stddev_m               = 10.0f;
+    init.vel_init_stddev_mps             = 1.0f;
+    init.rpy_init_stddev_rad[0]          = DEG2RAD(5.0f);
+    init.rpy_init_stddev_rad[1]          = DEG2RAD(5.0f);
+    init.acc_bias_init_stddev_mps2       = 0.1f;
+    init.gyr_bias_init_stddev_rps        = DEG2RAD(0.2f);
+    init.pos_pred_stddev_m_sqrts         = 0.01f;
+    init.vel_pred_stddev_mps_sqrts       = 0.05f;
+    init.rpy_pred_stddev_rad_sqrts       = DEG2RAD(0.01f);
+    init.acc_bias_pred_stddev_mps2_sqrts = 1e-4f;
+    init.gyr_bias_pred_stddev_rps_sqrts  = 1e-6f;
+    init.zero_vel_stddev_mps             = 0.01f;
+    init.zero_rot_stddev_rps             = DEG2RAD(0.001f);
+    memcpy(init.magnetic_n, mag_n, sizeof(mag_n));
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.kalman_update_dt_sec               = 0.01f;
+    opt.max_prediction_time_sec            = 0.5f;
+    opt.gnss_max_horizontal_pos_stddev_m   = 10.0f;
+    opt.gnss_max_vertical_pos_stddev_m     = 20.0f;
+    opt.gnss_max_horizontal_vel_stddev_mps = 1.0f;
+    opt.gnss_max_vertical_vel_stddev_mps   = 2.0f;
+    opt.magnetometer_min_delay_ms          = 200;
+    opt.auto_init                          = true;
+    opt.gnss_init_dwell_disable            = true;
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+    /* The platform keeps rocking, so the stillness detectors must stay out. */
+    nav_suite_set_auto_zupt_zaru_disable(&s, true);
+
+    ins_measurements_t m;
+    ins_time_us_t      t      = t0;
+    ins_time_us_t      t_prev = 0; /* previous IMU epoch */
+
+    /* Settle. */
+    while ((double)(t - t0) * 1e-6 < GAPSCN_T_GAP0_S - 0.005)
+    {
+        gapscn_imu_epoch(&s, &t, &t_prev, t0, &init, mag_n, acc_bias, gyr_bias);
+    }
+
+    float h_before = 0.0f, v_tmp, ab_before = 0.0f, gyr_bias_before[3], ins_ab_before[3];
+    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL, "suite in FULL before the outage");
+    CHECK_TRUE(nav_suite_get_baro_alt(&s, &h_before, &v_tmp), "baro_alt running before the outage");
+    CHECK_TRUE(baro_alt_get_acc_bias(&s.baro_alt, &ab_before), "baro_alt acc bias available");
+    CHECK_TRUE(ahrs_get_bias_gyr(&s.ars, gyr_bias_before), "ars gyro bias available");
+    memcpy(ins_ab_before, s.ins.state.acc_bias, sizeof(ins_ab_before));
+    gapscn_report(&s, (double)(t - t0) * 1e-6, "before");
+
+    /* The outage. */
+    const ins_time_us_t t_gap_start = t;
+    const ins_time_us_t t_gap_end   = t + gapscn_gap_us;
+    if (aiding_in_gap)
+    {
+        while (t + US_PER_SEC / 25 <= t_gap_end + 1)
+        {
+            t += US_PER_SEC / 25;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            gapscn_fill_baro(&m);
+            if ((t - t0) % (US_PER_SEC / 5) == 0) { gapscn_fill_gnss(&m, &init); }
+            nav_suite_update(&s, &m);
+            if (t - t_gap_start >= 200000 && gapscn_publishes(&s)) { res->stale_in_gap = true; }
+            if (!gapscn_all_running(&s)) { res->all_running = false; }
+        }
+    }
+    t = t_gap_end - US_PER_SEC / 100; /* the IMU resumes at t_gap_end */
+
+    /* After the gap. */
+    bool ars_seen = false, ins_seen = false;
+    int  i;
+    for (i = 0; i < 1500; ++i)
+    {
+        gapscn_imu_epoch(&s, &t, &t_prev, t0, &init, mag_n, acc_bias, gyr_bias);
+        const double ts = (double)(t - t0) * 1e-6;
+        float        ra[3], rm[3], ri[3], sd_r, sd_p, sd_y, h, v, ab;
+        if (i == 0 && gapscn_publishes(&s)) { res->stale_after = true; }
+        if (!gapscn_all_running(&s)) { res->all_running = false; }
+
+        if (ahrs_get_rpy(&s.ars, &ra[0], &ra[1], &ra[2]) &&
+            ahrs_get_rpy_stddev(&s.ars, &sd_r, &sd_p, &sd_y))
+        {
+            const double e    = gapscn_tilt_err_deg(ts, ra);
+            res->max_tilt_err = gapscn_max(res->max_tilt_err, e);
+            if (i < 300)
+            {
+                res->ratio_ars = gapscn_max(res->ratio_ars, gapscn_tilt_ratio(e, sd_r, sd_p));
+            }
+            if (!ars_seen) { res->sd_first_ars = RAD2DEG((double)(sd_r > sd_p ? sd_r : sd_p)); }
+            ars_seen = true;
+            if (i == 299) { res->err_ars = e; }
+            if (i == 999) { res->sd_late_ars = RAD2DEG((double)(sd_r > sd_p ? sd_r : sd_p)); }
+        }
+        if (ahrs_get_rpy(&s.ahrs, &rm[0], &rm[1], &rm[2]) &&
+            ahrs_get_rpy_stddev(&s.ahrs, &sd_r, &sd_p, &sd_y))
+        {
+            const double e    = gapscn_tilt_err_deg(ts, rm);
+            res->max_tilt_err = gapscn_max(res->max_tilt_err, e);
+            if (i < 300)
+            {
+                res->ratio_ahrs = gapscn_max(res->ratio_ahrs, gapscn_tilt_ratio(e, sd_r, sd_p));
+            }
+            if (i == 299) { res->err_ahrs = e; }
+            if (i == 799) { res->yaw_ahrs = fabs(gapscn_yaw_err_deg(ts, rm)); }
+        }
+        if (ins_get_rpy(&s.ins, &ri[0], &ri[1], &ri[2]) &&
+            ins_get_rpy_stddev(&s.ins, &sd_r, &sd_p, &sd_y))
+        {
+            const double e    = gapscn_tilt_err_deg(ts, ri);
+            res->max_tilt_err = gapscn_max(res->max_tilt_err, e);
+            if (i < 300)
+            {
+                res->ratio_ins = gapscn_max(res->ratio_ins, gapscn_tilt_ratio(e, sd_r, sd_p));
+                res->ratio_ins_yaw =
+                    gapscn_max(res->ratio_ins_yaw,
+                               fabs(gapscn_yaw_err_deg(ts, ri)) / fmax(RAD2DEG((double)sd_y), 0.3));
+            }
+            if (!ins_seen) { res->sd_first_ins = RAD2DEG((double)(sd_r > sd_p ? sd_r : sd_p)); }
+            ins_seen = true;
+            if (i == 299) { res->err_ins = e; }
+            if (i == 999) { res->sd_late_ins = RAD2DEG((double)(sd_r > sd_p ? sd_r : sd_p)); }
+        }
+        if (i == 99) { res->ins_ready_1s = s.ins.is_initialized; }
+        if (i == 999) { res->ins_ready_late = s.ins.is_initialized; }
+
+        if (nav_suite_get_baro_alt(&s, &h, &v) && baro_alt_get_acc_bias(&s.baro_alt, &ab))
+        {
+            res->max_dab = gapscn_max(res->max_dab, fabs((double)ab - (double)ab_before));
+            res->max_dh  = gapscn_max(res->max_dh, fabs((double)h - (double)h_before));
+            res->max_v   = gapscn_max(res->max_v, fabs((double)v));
+        }
+        if (i == 0 || i == 9 || i == 49 || i == 99 || i == 299 || i == 999 || i == 1499)
+        {
+            char lbl[32];
+            snprintf(lbl, sizeof(lbl), "+%5.2f s", (double)(i + 1) * 0.01);
+            gapscn_report(&s, ts, lbl);
+        }
+    }
+    float gb_after[3];
+    if (ahrs_get_bias_gyr(&s.ars, gb_after))
+    {
+        /* x and y only: the ARS has no heading reference, its z bias is not observable. */
+        const double dx = fabs(RAD2DEG((double)gb_after[0] - (double)gyr_bias_before[0]));
+        const double dy = fabs(RAD2DEG((double)gb_after[1] - (double)gyr_bias_before[1]));
+        res->dgyr_ars   = gapscn_max(dx, dy);
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        res->dacc_ins = gapscn_max(
+            res->dacc_ins, fabs((double)s.ins.state.acc_bias[i] - (double)ins_ab_before[i]));
+    }
+    res->n_suite_loss   = s.n_imu_loss;
+    res->n_ins_loss     = s.ins.diag.n_imu_loss;
+    res->n_downweighted = s.baro_alt.n_downweighted;
+}
+
+static void scenario_imu_outage_700ms(void)
+{
+    int k;
+    gapscn_gap_us = 700000;
+    gapscn_turn   = true;
+    for (k = 0; k < 2; ++k)
+    {
+        const bool aiding = (k == 0);
+        printf("\n-- scenario: 700 ms IMU outage while the platform turns, %s (REQ-SUITE-026) "
+               "--\n",
+               aiding ? "baro/GNSS keep arriving" : "whole stream silent");
+        static gapscn_result_t r;
+        memset(&r, 0, sizeof(r));
+        gapscn_run(aiding, &r);
+        printf("    ratio err/sigma (first 3 s): ars %.2f ahrs %.2f ins %.2f ins yaw %.2f\n",
+               r.ratio_ars, r.ratio_ahrs, r.ratio_ins, r.ratio_ins_yaw);
+        printf("    first sigma after the restart: ars %.1f ins %.1f deg\n", r.sd_first_ars,
+               r.sd_first_ins);
+        printf("    bias change: ars gyro x/y %.3f deg/s, ins acc %.3f m/s2\n", r.dgyr_ars,
+               r.dacc_ins);
+        printf("    vertical: max d(acc_bias) %.3f m/s2, max dh %.2f m, max |v| %.2f m/s, "
+               "downweighted %u\n",
+               r.max_dab, r.max_dh, r.max_v, r.n_downweighted);
+
+        /* No stale output: the suite reports nothing from the moment the loss
+           is certain until the filters restarted. */
+        if (aiding) { CHECK_TRUE(!r.stale_in_gap, "nothing published inside the gap"); }
+        CHECK_TRUE(!r.stale_after, "nothing stale published on the first epoch after the gap");
+        /* Each filter stopped exactly once, ins included. */
+        CHECK_TRUE(r.n_suite_loss == 1, "suite: one IMU loss");
+        CHECK_TRUE(r.n_ins_loss == 1, "ins: one IMU loss");
+        /* Restarted, and consistent from the first epoch on. */
+        CHECK_TRUE(r.ratio_ars <= 3.0, "ars: tilt error consistent with its 1-sigma");
+        CHECK_TRUE(r.ratio_ahrs <= 3.0, "ahrs: tilt error consistent with its 1-sigma");
+        CHECK_TRUE(r.ratio_ins <= 3.0, "ins: tilt error consistent with its 1-sigma");
+        CHECK_TRUE(r.ratio_ins_yaw <= 3.0, "ins: heading error consistent with its 1-sigma");
+        CHECK_TRUE(r.sd_first_ars < 25.0, "ars: restart 1-sigma well below 'unknown'");
+        CHECK_TRUE(r.sd_first_ins < 25.0, "ins: restart 1-sigma well below 'unknown'");
+        CHECK_TRUE(r.ins_ready_1s, "ins solving again within 1 s of the gap");
+        CHECK_TRUE(r.err_ars < 1.5, "ars: tilt recovered 3 s after the gap");
+        CHECK_TRUE(r.err_ahrs < 1.5, "ahrs: tilt recovered 3 s after the gap");
+        CHECK_TRUE(r.err_ins < 1.5, "ins: tilt recovered 3 s after the gap");
+        CHECK_TRUE(r.yaw_ahrs < 3.0, "ahrs: heading recovered 8 s after the gap");
+        CHECK_TRUE(r.ins_ready_late, "ins ready 10 s after the gap");
+        CHECK_TRUE(r.sd_late_ars < 1.5, "ars: confident again 10 s after the gap");
+        CHECK_TRUE(r.sd_late_ins < 1.5, "ins: confident again 10 s after the gap");
+        /* The biases came back. */
+        CHECK_TRUE(r.dgyr_ars < 0.05, "ars: gyro bias carried across the restart");
+        CHECK_TRUE(r.dacc_ins < 0.03, "ins: accelerometer bias carried across the restart");
+        /* The vertical channel restarted on its datum and learned nothing. */
+        CHECK_TRUE(r.max_dab < 0.05, "baro_alt: accelerometer bias carried, nothing learned");
+        CHECK_TRUE(r.max_dh < 0.7, "baro_alt: no height jump at the restart");
+        CHECK_TRUE(r.max_v < 0.3, "baro_alt: vertical velocity stays near zero");
+        CHECK_TRUE(r.n_downweighted == 0, "baro_alt: chi2 detector rejects no baro sample");
+    }
+
+    /* 150 ms without IMU while baro/GNSS keep arriving: below the 0.2 s loss
+       timeout this is ordinary jitter. The platform keeps rocking but does
+       not make the big turn, nothing restarts, the solution never drops. */
+    printf("\n-- scenario: 150 ms IMU gap, below the loss timeout (REQ-SUITE-026) --\n");
+    gapscn_gap_us = 150000;
+    gapscn_turn   = false;
+    {
+        static gapscn_result_t r;
+        memset(&r, 0, sizeof(r));
+        gapscn_run(true, &r);
+        printf("    worst tilt error %.2f deg, ratio err/sigma ars %.2f ahrs %.2f ins %.2f\n",
+               r.max_tilt_err, r.ratio_ars, r.ratio_ahrs, r.ratio_ins);
+        printf("    vertical: max d(acc_bias) %.3f m/s2, max dh %.2f m, max |v| %.2f m/s\n",
+               r.max_dab, r.max_dh, r.max_v);
+        CHECK_TRUE(r.n_suite_loss == 0, "suite: no IMU loss");
+        CHECK_TRUE(r.n_ins_loss == 0, "ins: no IMU loss");
+        CHECK_TRUE(r.all_running, "no filter stopped, not even for one epoch");
+        CHECK_TRUE(r.stale_after == true, "solution published right after the gap");
+        CHECK_TRUE(r.max_tilt_err < 1.5, "tilt stays accurate across the gap");
+        CHECK_TRUE(r.ratio_ars <= 3.0, "ars: tilt error consistent with its 1-sigma");
+        CHECK_TRUE(r.ratio_ahrs <= 3.0, "ahrs: tilt error consistent with its 1-sigma");
+        CHECK_TRUE(r.ratio_ins <= 3.0, "ins: tilt error consistent with its 1-sigma");
+        CHECK_TRUE(r.dgyr_ars < 0.05, "ars: gyro bias untouched");
+        CHECK_TRUE(r.dacc_ins < 0.03, "ins: accelerometer bias untouched");
+        CHECK_TRUE(r.max_dab < 0.05, "baro_alt: accelerometer bias untouched");
+        CHECK_TRUE(r.max_dh < 0.7, "baro_alt: no height jump");
+        CHECK_TRUE(r.n_downweighted == 0, "baro_alt: chi2 detector rejects no baro sample");
+    }
+    gapscn_gap_us = 700000;
+    gapscn_turn   = true;
+}
+
 int main(void)
 {
     scenario_pyahrs_example();
@@ -4325,6 +5041,8 @@ int main(void)
     scenario_nan_inputs();
     scenario_tunnel();
     scenario_time_anomaly();
+    scenario_imu_loss_stops_filter();
+    scenario_suite_prescribed_start();
     scenario_mag_edge_cases();
     scenario_zaru();
     scenario_auto_zaru_fallback();
@@ -4342,6 +5060,7 @@ int main(void)
     scenario_suite_sensor_calibration();
     scenario_ahrs_overconfidence();
     scenario_covariance_throttled();
+    scenario_rpy_pred_extra_noise();
     scenario_kalman_cadence_tolerance();
     scenario_acc_gravity_gate();
     scenario_ahrs_bias_diagnostics();
@@ -4350,6 +5069,7 @@ int main(void)
     scenario_predict_correct_equivalence();
     scenario_suite_predict_correct_equivalence();
     scenario_ahrs_config_passthrough();
+    scenario_imu_outage_700ms();
     printf("\n==== %d failures ====\n", fails);
     return fails == 0 ? 0 : 1;
 }

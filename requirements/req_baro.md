@@ -142,9 +142,8 @@ the next valid data.
 - **Verification:** Test: tests/test_baro.c:scenario_baro_time_anomaly
 
 A backwards timestamp step shall re-anchor the internal clock and
-skip the epoch; a forward gap larger than 0.2 s shall skip the state
-propagation for that epoch (sensor-outage semantics) while barometer
-fusion continues.
+skip the epoch; a forward gap of imu_loss_timeout_sec or more shall be
+handled as an accelerometer loss (REQ-BARO-027).
 
 ## REQ-BARO-009 — Datum-aligned initialization
 
@@ -469,3 +468,31 @@ baro_alt_predict_step() to baro_alt_correct_step() (not re-derived,
 since the plausibility decision is not recoverable once t_last has
 moved on) -- baro_alt_correct_step() shall be a no-op if the matching
 baro_alt_predict_step() dropped the epoch or was never called.
+
+## REQ-BARO-027 — Accelerometer loss stops the filter
+
+- **Status:** verified
+- **Parent:** REQ-BARO-008
+- **Verification:** Test: tests/test_baro.c:scenario_baro_time_anomaly; Test: tests/test_ahrs.c:scenario_imu_outage_700ms
+
+An epoch that arrives baro_alt_config_t.imu_loss_timeout_sec or more
+after the previous accepted accelerometer epoch ends an accelerometer
+loss (0 selects the default of 0.2 s, shared with ins and the ARS/AHRS).
+The filter shall neither propagate nor fuse that epoch and shall mark
+itself uninitialized. Before it does, it shall latch an accelerometer bias
+carry: the current estimate of a_b
+and its 1-sigma widened by a fixed inflation factor, clamped to at most
+cfg.acc_bias_init_stddev_mps2. The carry shall be readable through an
+accessor until the next baro_alt_init(). baro_alt_config_t shall take an
+initial accelerometer bias (acc_bias_init_mps2) so a caller can seed the
+restart from the carry, next to the datum-preserving h_init of
+REQ-BARO-009. A caller that detects the loss itself stops the filter the
+same way through baro_alt_stop_imu_loss().
+
+Rationale: the vertical channel propagates with the attitude-projected
+specific force. After an IMU loss that attitude is re-derived from
+scratch, and the height and vertical velocity propagated before the gap
+no longer connect to the motion after it. The barometer still pins the
+height, but a filter that simply skips the gap and goes on fusing it
+learns whatever does not fit as a_b. The bias itself has not moved in the
+gap and is the slowest state to converge, so it is carried.

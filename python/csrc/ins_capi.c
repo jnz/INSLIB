@@ -883,6 +883,17 @@ void ins_suite_set_ahrs_gyr_bias_rw(void* h, float density_rps2_sqrthz)
         c->suite.ahrs_cfg.gyr_bias_rw = density_rps2_sqrthz;
     }
 }
+/* ARS/AHRS SHARED extra attitude process noise [rad/sqrt(s)] (<=0 -> none);
+   same timing contract as ins_suite_set_ahrs_gyr_noise(). */
+void ins_suite_set_ahrs_rpy_pred_stddev(void* h, float stddev_rad_sqrts)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c && stddev_rad_sqrts > 0.0f)
+    {
+        c->suite.ars_cfg.rpy_pred_stddev_rad_sqrts  = stddev_rad_sqrts;
+        c->suite.ahrs_cfg.rpy_pred_stddev_rad_sqrts = stddev_rad_sqrts;
+    }
+}
 /* ARS/AHRS SHARED initial gyro-bias uncertainty [rad/s], all 3 axes (<=0 ->
    ahrs default, 1/1/5 deg/s xy/z) -- this is an INITIAL CONDITION, not a
    process-noise rate, but it matters a great deal for how fast yaw

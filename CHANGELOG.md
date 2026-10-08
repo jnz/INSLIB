@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased]
+
+## [1.2.1] - 2026-10-08 - Bug fixes
+
+### Added
+
+- `allan_variance.py`: bias instability added, PDF output redesigned.
+- `inspostgui`: "Lever arm compensated" checkbox, draws the reference and the
+  GNSS fixes at the IMU point in the view ports.
+- `replay.py`/`inspostgui`: `ref.csv` is now optional.
+- `replay.py` PDF: the WMM page also shows |B| minus the 18-state hard-iron
+  bias estimate.
+- ARS/AHRS: `ahrs_config_t.rpy_pred_stddev_rad_sqrts` (config.yaml
+  `ahrs: rpy_pred_stddev_rad_sqrts`), an extra attitude process noise on top
+  of the gyro noise, the same is already in INS.
+  Off by default, so a typical IMU behaves as before.
+- `inspostgui`: ranging anchors are shown in the 3D view (dots with their id).
+
+### Changed
+
+- Python `Config` no longer has defaults of its own: every tuning field is 0,
+  i.e. the C library's default.
+- `nav_suite`: the ARS/AHRS bootstrap levels over the ins auto-init window
+  instead of a single sample and widens roll/pitch if the platform moves.
+
+### Fixed
+
+- `replay.py`/`inspostgui`: the ARS/AHRS gyro noise and bias random walk now
+  fall back to `imu: gyr_psd`/`gyr_bias_rw` when `ahrs:` leaves them at 0, as
+  `replay.c` already did.
+- IMU loss: a gap of 0.2 s or more in the IMU stream (`imu_loss_timeout_sec`)
+  now stops INS, ARS, AHRS and baro_alt.
+- INS: the magnetometer hard-iron bias (if estimated) is carried across a
+  re-arm like the IMU biases.
+- `inspostgui`: the mouse wheel no longer changes combo boxes in the config tab
+  while scrolling the form.
+
 ## [1.2.0] - 2026-10-04 - GUI Tool
 
 ### Added

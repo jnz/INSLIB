@@ -12,7 +12,7 @@
  * so a correction is applied as a left (n-frame side) quaternion multiplication
  * q <- q(-datt) * q (ins_quat_small_angle_correction) and biases are corrected
  * as bias <- bias - dbias. Residuals are z = measured - predicted, which under
- * this convention gives:
+ * this convention is:
  *
  *   accelerometer: z = f_b + R' * g_n           =  R' * [g_n]_x * datt
  *   magnetic yaw:  z = wrap(yaw_mag - yaw_nom)  = -dyaw
@@ -22,6 +22,19 @@
  * (kalman_udu.h), the same backend as ins. The robust update scales the
  * measurement covariance instead of dropping an outlier row (Chang 2014), so a
  * persistent-offset reference cannot deadlock.
+ * Chang 2014: G. Chang, Robust Kalman filtering based on Mahalanobis distance as
+ * outlier judging criterion, Journal of Geodesy 88(4), pp. 391-401, 2014.
+ *
+ * Primary source for the error-state attitude formulation and the strapdown
+ * and Kalman filter fundamentals:
+ * J. Wendel, Integrierte Navigationssysteme: Sensordatenfusion, GPS und
+ * Inertiale Navigation, 2nd ed., Oldenbourg, 2011 (cited as Wendel, 2nd ed.).
+ *
+ * The reduced state vector (attitude and gyro bias only) is derived in
+ * J. Zwiener, Robuste Zustandsschaetzung zur Navigation und Regelung autonomer und
+ * bemannter Multikopter mit verteilten Sensoren, TU Darmstadt, 2019 (cited as
+ * Zwiener 2019, chapter titles in quotes).
+ * See "Reduzierte Zustandsschaetzung", "Lageschaetzung".
  */
 
 #include <math.h>
@@ -30,7 +43,9 @@
 
 #include "ahrs.h"
 #include "geodetic_toolbox.h"
+#ifndef AHRS_NO_MAG
 #include "magnetic_model.h"
+#endif
 #include "sensor_defaults.h"
 #include "linalg.h"
 #include "kalman_udu.h"
@@ -69,7 +84,6 @@
 #define AHRS_DEFAULT_COVAR_UPDATE_SEC (1.0f / 20.0f)
 
 /* Don't integrate the attitude over longer time periods. */
-#define AHRS_MAX_DT_SEC (0.2f)
 
 /* Config defaults. Gyro terms are shared with ins.c (sensor_defaults.h,
  * "low-cost consumer MEMS IMU" defaults): ins and the AHRS filters run against
@@ -140,6 +154,7 @@ static inline float qsquare(float x) { return x * x; }
  * ============================================================================
  */
 
+/* @satisfies REQ-AHRS-027 */
 static void ahrs_resolve_config(const ahrs_config_t* in, ahrs_config_t* out)
 {
     *out = *in;
@@ -160,6 +175,11 @@ static void ahrs_resolve_config(const ahrs_config_t* in, ahrs_config_t* out)
        clean, per coding_style.md. */
     if (out->gyr_bias_rw < 0.0f) out->gyr_bias_rw = 0.0f;
     if (out->gyr_bias_rw <= 0.0f) out->gyr_bias_rw = AHRS_DEFAULT_GYR_BIAS_RW;
+    /* No default extra attitude noise: the generic gyro noise default above
+       already carries the margin a typical MEMS IMU needs (the filter was
+       tuned on it alone). The term is for a caller who enters a good
+       sensor's own, much smaller figure in gyr_noise_psd. */
+    if (out->rpy_pred_stddev_rad_sqrts < 0.0f) out->rpy_pred_stddev_rad_sqrts = 0.0f;
     if (out->acc_noise_mps2 <= 0.0f) out->acc_noise_mps2 = AHRS_DEFAULT_ACC_NOISE_MPS2;
     if (out->acc_freq_hz <= 0.0f) out->acc_freq_hz = AHRS_DEFAULT_ACC_FREQ_HZ;
     if (out->gravity_diff_penalty < 0.0f)
@@ -200,6 +220,10 @@ static void ahrs_resolve_config(const ahrs_config_t* in, ahrs_config_t* out)
                 (i == 2) ? AHRS_DEFAULT_RESTART_STDDEV_Z : AHRS_DEFAULT_RESTART_STDDEV_XY;
     }
     if (out->restart_warmup_sec <= 0.0f) out->restart_warmup_sec = AHRS_DEFAULT_RESTART_WARMUP_SEC;
+    if (!(out->imu_loss_timeout_sec > 0.0f))
+    {
+        out->imu_loss_timeout_sec = INS_DEFAULT_IMU_LOSS_TIMEOUT_SEC;
+    }
 }
 
 /* Dump every effective (post 0 -> default resolution) ahrs_config_t parameter
@@ -218,11 +242,12 @@ static void ahrs_log_effective_config(const ahrs_t* a)
              (cfg->mode == AHRS_MODE_AHRS) ? "AHRS" : "ARS", a->n,
              cfg->chi2_disable ? "disabled" : "enabled");
     LOG_INFO("ahrs: gyro bias init stddev=[%.2f %.2f %.2f] deg/s, noise psd %.4f deg/s/sqrt(Hz), "
-             "bias random walk %.2e (rad/s^2)/sqrt(Hz)",
+             "bias random walk %.2e (rad/s^2)/sqrt(Hz), extra attitude noise %.4f deg/sqrt(s)",
              (double)(RAD2DEG(cfg->gyr_bias_init_stddev_rps[0])),
              (double)(RAD2DEG(cfg->gyr_bias_init_stddev_rps[1])),
              (double)(RAD2DEG(cfg->gyr_bias_init_stddev_rps[2])),
-             (double)(RAD2DEG(cfg->gyr_noise_psd)), (double)cfg->gyr_bias_rw);
+             (double)(RAD2DEG(cfg->gyr_noise_psd)), (double)cfg->gyr_bias_rw,
+             (double)(RAD2DEG(cfg->rpy_pred_stddev_rad_sqrts)));
     LOG_INFO("ahrs: accelerometer: noise %.3f m/s^2, max rate %.1f Hz, cutoff %.1f Hz, "
              "gravity penalty %.1f stddev/(m/s^2)%s, chi2 threshold %.2f",
              (double)cfg->acc_noise_mps2, (double)cfg->acc_freq_hz, (double)cfg->acc_cutoff_freq_hz,
@@ -277,14 +302,21 @@ static void ahrs_log_effective_config(const ahrs_t* a)
  * ============================================================================
  */
 
-/* @satisfies REQ-AHRS-001 REQ-AHRS-008 */
+/* @satisfies REQ-AHRS-001 REQ-AHRS-008 REQ-AHRS-026 */
 int ahrs_init(ahrs_t* a, const ahrs_config_t* cfg, ahrs_time_us_t t)
 {
     if (a == NULL || cfg == NULL) { return -1; }
     if (cfg->mode != AHRS_MODE_ARS && cfg->mode != AHRS_MODE_AHRS) { return -1; }
+#ifdef AHRS_NO_MAG
+    /* Built without the magnetometer code: no heading mode to offer. */
+    if (cfg->mode == AHRS_MODE_AHRS) { return -1; }
+#endif
     /* Attitude stddevs are mandatory (only positive values accepted;
        NaN fails the > 0 test as well). The yaw entry is only needed in
        AHRS mode. */
+    /* cppcheck-suppress knownConditionTrueFalse
+     * Only known in the AHRS_NO_MAG build, where AHRS mode was rejected
+     * above. */
     const int n_rpy = (cfg->mode == AHRS_MODE_AHRS) ? 3 : 2;
     int       i;
     for (i = 0; i < n_rpy; ++i)
@@ -362,12 +394,15 @@ int ahrs_init(ahrs_t* a, const ahrs_config_t* cfg, ahrs_time_us_t t)
  * Phi = I + F*dt with F = [ 0  -R[0:col,:] ]   (col = 2 in ARS mode,
  *                         [ 0       0      ]    col = 3 in AHRS mode)
  * and process noise in noise-input form:
- *   G = [ -R[0:col,:]  0 ],  Q = [gyr_noise_psd^2 * dt (x3),
- *       [      0       I ]        gyr_bias_rw^2   * dt (x3)]
+ *   G = [ -R[0:col,:]  0 ],  Q = [(gyr_noise_psd^2 + rpy_pred^2) * dt (x3),
+ *       [      0       I ]        gyr_bias_rw^2                  * dt (x3)]
+ * The extra attitude term rpy_pred is isotropic, so mapping it through the
+ * same rotation as the gyro noise gives the same n-frame covariance as
+ * adding it to the attitude states directly (ins does the latter).
  * ============================================================================
  */
 
-/* @satisfies REQ-AHRS-002 REQ-AHRS-021 REQ-AHRS-025 */
+/* @satisfies REQ-AHRS-002 REQ-AHRS-021 REQ-AHRS-025 REQ-AHRS-027 */
 static void ahrs_predict_covariance(ahrs_t* a, float dt_sec, float* phi_out)
 {
     const int n   = a->n;
@@ -394,8 +429,8 @@ static void ahrs_predict_covariance(ahrs_t* a, float dt_sec, float* phi_out)
     for (i = 0; i < 3; ++i)
     {
         MAT_ELEM(G, col + i, 3 + i, n, 6) = 1.0f;
-        Q[i]                              = qsquare(a->cfg.gyr_noise_psd) * dt_sec;
-        Q[3 + i]                          = qsquare(a->cfg.gyr_bias_rw) * dt_sec;
+        Q[i] = (qsquare(a->cfg.gyr_noise_psd) + qsquare(a->cfg.rpy_pred_stddev_rad_sqrts)) * dt_sec;
+        Q[3 + i] = qsquare(a->cfg.gyr_bias_rw) * dt_sec;
     }
 
     if (phi_out != NULL) { memcpy(phi_out, Phi, sizeof(Phi[0]) * (size_t)(n * n)); }
@@ -523,6 +558,7 @@ static void ahrs_fuse_acc(ahrs_t* a)
     (void)ahrs_fuse(a, z, R, Ht, 3, a->cfg.chi2_threshold);
 }
 
+#ifndef AHRS_NO_MAG
 /* De-tilt the body-frame magnetic field with the given roll/pitch:
  * (hx, hy) = horizontal components of Ry(pitch) * Rx(roll) * mag_b.
  * With the n-frame field pointing to magnetic north (east component zero
@@ -626,6 +662,7 @@ static void ahrs_fuse_mag(ahrs_t* a, const float mag_b[3])
         a->yaw_on_magnetic_north = true;
     }
 }
+#endif /* AHRS_NO_MAG */
 
 /* Zero-rotation update: with omega_b_nb == 0 the gyro should read just the gyro
  * bias. Earth rotation rate is NOT corrected here (~15 deg/h, far below what
@@ -893,6 +930,27 @@ static void ahrs_check_overconfidence(ahrs_t* a)
     }
 }
 
+/* IMU loss (REQ-AHRS-029): the rotation of the gap is unknown, so the filter
+ * stops. Only the gyro bias survives, with its 1-sigma widened and clamped to
+ * the cold-start prior, for the caller to seed the restart with. */
+/* @satisfies REQ-AHRS-029 */
+void ahrs_stop_imu_loss(ahrs_t* a)
+{
+    if (a == NULL || !a->is_initialized) { return; }
+    const int off = a->n - 3; /* gyro bias is always the last 3 error states */
+    int       i;
+    for (i = 0; i < 3; ++i)
+    {
+        a->bias_carry.gyr_bias_rps[i] = a->gyr_bias_rps[i];
+        a->bias_carry.gyr_bias_stddev_rps[i] =
+            fminf(INS_DEFAULT_BIAS_CARRY_STDDEV_INFLATION * SQRTF(ahrs_att_var(a, off + i)),
+                  a->cfg.gyr_bias_init_stddev_rps[i]);
+    }
+    a->bias_carry.valid = true;
+    a->is_initialized   = false;
+    LOG_WARN("ahrs: IMU lost, filter stopped, gyro bias kept for the restart");
+}
+
 /* Attitude-precision restart watchdog: once past the warm-up, if any tracked
  * attitude axis' reported 1-sigma exceeds its configured threshold the estimate
  * is no longer trustworthy, so the filter is marked uninitialized (fail-safe,
@@ -939,7 +997,7 @@ int ahrs_predict_step(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const
     /* Non-finite inputs (NaN/Inf) must not reach the math: every comparison
        with NaN is false, so the chi2/downweighting logic is blind to them and
        one corrupt sample would poison the state. Drop the epoch instead; the
-       next epoch's dt spans the gap, which the MAX_DT gate handles. */
+       next epoch's dt spans the gap, which the IMU-loss gate handles. */
     if (!ins_vec3_finite(gyr_rps) || !ins_vec3_finite(acc_mps2))
     {
         a->n_invalid_input++;
@@ -972,6 +1030,13 @@ int ahrs_predict_step(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const
         return AHRS_EPOCH_DROPPED;
     }
 
+    if (dt_sec >= a->cfg.imu_loss_timeout_sec)
+    {
+        ahrs_stop_imu_loss(a);
+        a->step_ctx.active = false;
+        return AHRS_EPOCH_DROPPED;
+    }
+
     /* PREDICTION STEP: the error dynamics are slow, so the covariance need not
      * propagate at the IMU rate (throttled to cfg.kalman_update_dt_sec). */
     int   status     = 0;
@@ -982,14 +1047,14 @@ int ahrs_predict_step(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const
     if (INS_CADENCE_DUE(dt_cov_sec, a->cfg.kalman_update_dt_sec))
     {
         a->t_last_cov_predict = t;
-        if (dt_cov_sec > AHRS_MAX_DT_SEC) { dt_cov_sec = AHRS_MAX_DT_SEC; }
+        if (dt_cov_sec > a->cfg.imu_loss_timeout_sec) { dt_cov_sec = a->cfg.imu_loss_timeout_sec; }
         ahrs_predict_covariance(a, dt_cov_sec, phi_out);
         status |= AHRS_EPOCH_COV_PROPAGATED;
     }
 
     /* Attitude integration with the bias-corrected angular rate, plus
      * accelerometer low pass (first order RC filter). */
-    if (dt_sec > 0.0f && dt_sec < AHRS_MAX_DT_SEC)
+    if (dt_sec > 0.0f)
     {
         const float omega[3] = {gyr_rps[0] - a->gyr_bias_rps[0], gyr_rps[1] - a->gyr_bias_rps[1],
                                 gyr_rps[2] - a->gyr_bias_rps[2]};
@@ -1039,6 +1104,7 @@ void ahrs_correct_step(ahrs_t* a)
         ahrs_fuse_acc(a);
     }
 
+#ifndef AHRS_NO_MAG
     /* FUSION STEP FOR MAGNETOMETER (AHRS mode, throttled to mag_freq_hz)
      * ------------------------------------------------------------------ */
     /* cppcheck-suppress knownConditionTrueFalse
@@ -1049,6 +1115,9 @@ void ahrs_correct_step(ahrs_t* a)
         a->t_last_mag_fusion = t;
         ahrs_fuse_mag(a, mag_b);
     }
+#else
+    (void)mag_b;
+#endif
 
     /* ZERO-ROTATION UPDATE (opt-in): the caller's trigger, OR'd with the
        velocity-blind auto-ZARU fallback if enabled (REQ-AHRS-017). */
@@ -1221,6 +1290,15 @@ bool ahrs_get_bias_gyr_stddev(const ahrs_t* a, float gyr_bias_stddev_rps[3])
     return true;
 }
 
+bool ahrs_get_bias_carry(const ahrs_t* a, float gyr_bias_rps[3], float gyr_bias_stddev_rps[3])
+{
+    if (a == NULL || !a->bias_carry.valid) { return false; }
+    memcpy(gyr_bias_rps, a->bias_carry.gyr_bias_rps, sizeof(a->bias_carry.gyr_bias_rps));
+    memcpy(gyr_bias_stddev_rps, a->bias_carry.gyr_bias_stddev_rps,
+           sizeof(a->bias_carry.gyr_bias_stddev_rps));
+    return true;
+}
+
 bool ahrs_auto_zaru_active(const ahrs_t* a)
 {
     return a != NULL && a->is_initialized && !a->cfg.auto_zaru_disable &&
@@ -1266,6 +1344,7 @@ void ahrs_leveling_from_acc(const float acc_mps2[3], float* roll_rad, float* pit
     *pitch_rad     = atan2f(-gx, SQRTF(gy * gy + gz * gz));
 }
 
+#ifndef AHRS_NO_MAG
 float ahrs_mag_heading(const float mag_b[3], float roll_rad, float pitch_rad)
 {
     float hx, hy;
@@ -1368,3 +1447,4 @@ void ahrs_set_position(ahrs_t* a, float lat_rad, float lon_rad, float year)
     a->declination_applied   = true;
     a->yaw_on_magnetic_north = false;
 }
+#endif /* AHRS_NO_MAG */

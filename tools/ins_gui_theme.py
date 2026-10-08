@@ -26,6 +26,8 @@ DARK = {
     "ghost": "#9aa4b2",
     # Where a ZUPT/ZARU was applied, on the 3D trail.
     "zupt": "#ff5ad2",
+    # Ranging anchors, once ranges are fed to the filter.
+    "anchor": "#ff9f43",
     "gl_bg": "#121418", "gl_grid": "#3c414b", "ref_trail": "#8cf08c",
     "position": "#ff5a5a", "ellipsoid": "#64c8ff",
     # Accelerometer bubble.
@@ -50,6 +52,7 @@ LIGHT = {
     "map_est": "#c0392b", "map_here": "#b86e00", "fix": "#c88a00",
     "ghost": "#8a93a0",
     "zupt": "#c2188f",
+    "anchor": "#d35400",
     "gl_bg": "#fbfbfd", "gl_grid": "#b9c0ca", "ref_trail": "#1c8a4e",
     "position": "#c0392b", "ellipsoid": "#1f6fb2",
     "bubble_ring": "#9aa4b2", "bubble_edge": "#b86e00",

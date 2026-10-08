@@ -310,6 +310,7 @@ def _bind():
     L.ins_suite_set_ahrs_gyr_noise.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_ahrs_acc_noise.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_ahrs_gyr_bias_rw.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    L.ins_suite_set_ahrs_rpy_pred_stddev.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_ahrs_gyr_bias_init_stddev.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_init_att_hint.argtypes = [ctypes.c_void_p, ctypes.c_float,
                                               ctypes.c_float, ctypes.c_float,
@@ -338,8 +339,11 @@ _bind()
 class Config:
     """Filter configuration (a friendly view of ins_cfg_t).
 
-    Defaults suit a ~100 Hz automotive/UAV setup; override the initial
-    lat/lon/h (ignored when ``auto_init`` bootstraps from the first fix),
+    Every tuning field defaults to 0, which the C library resolves to its
+    own default (ins.c, REQ-NAV-043/049). The binding deliberately keeps no
+    numbers of its own: a Python-side copy would silently differ from the C
+    filter the day either side is tuned. Override the initial lat/lon/h
+    (ignored when ``auto_init`` bootstraps from the first fix),
     ``magnetic_n`` (NED reference for magnetometer fusion) and the noise
     terms as needed.
     """
@@ -347,29 +351,29 @@ class Config:
     lat_rad: float = 0.0
     lon_rad: float = 0.0
     h_m: float = 0.0
-    pos_init_stddev_m: float = 5.0
-    vel_init_stddev_mps: float = 1.0
-    rpy_init_stddev_rad: tuple = (math.radians(5.0), math.radians(5.0), math.radians(5.0))
+    pos_init_stddev_m: float = 0.0      # [m], 0 -> C default
+    vel_init_stddev_mps: float = 0.0    # [m/s], 0 -> C default
+    rpy_init_stddev_rad: tuple = (0.0, 0.0, 0.0)
                                         # roll/pitch/yaw, independently
                                         # settable (each 0 -> its own C
                                         # default; no cross-axis fallback)
-    acc_bias_init_stddev_mps2: float = 0.1
-    gyr_bias_init_stddev_rps: float = math.radians(0.5)
-    pos_pred_stddev_m_sqrts: float = 0.01
-    vel_pred_stddev_mps_sqrts: float = 0.05
-    rpy_pred_stddev_rad_sqrts: float = math.radians(0.01)
-    acc_bias_pred_stddev_mps2_sqrts: float = 1e-4
-    gyr_bias_pred_stddev_rps_sqrts: float = 1e-6
-    zero_vel_stddev_mps: float = 0.05
-    zero_rot_stddev_rps: float = math.radians(0.1)
+    acc_bias_init_stddev_mps2: float = 0.0  # [m/s^2], 0 -> C default
+    gyr_bias_init_stddev_rps: float = 0.0   # [rad/s], 0 -> C default
+    pos_pred_stddev_m_sqrts: float = 0.0    # [m/sqrt(s)], 0 -> C default
+    vel_pred_stddev_mps_sqrts: float = 0.0  # [m/s/sqrt(s)], 0 -> C default
+    rpy_pred_stddev_rad_sqrts: float = 0.0  # [rad/sqrt(s)], 0 -> C default
+    acc_bias_pred_stddev_mps2_sqrts: float = 0.0  # [m/s^2/sqrt(s)], 0 -> C default
+    gyr_bias_pred_stddev_rps_sqrts: float = 0.0   # [rad/s/sqrt(s)], 0 -> C default
+    zero_vel_stddev_mps: float = 0.0    # [m/s], 0 -> C default
+    zero_rot_stddev_rps: float = 0.0    # [rad/s], 0 -> C default
     gyr_bias_init_rps: tuple = (0.0, 0.0, 0.0)
     magnetic_n: tuple = (0.0, 0.0, 0.0)
     kalman_update_dt_sec: float = 0.0  # 0 -> C default (20 Hz)
-    max_prediction_time_sec: float = 0.5
-    gnss_max_horizontal_pos_stddev_m: float = 10.0
-    gnss_max_vertical_pos_stddev_m: float = 20.0
-    gnss_max_horizontal_vel_stddev_mps: float = 1.0
-    gnss_max_vertical_vel_stddev_mps: float = 2.0
+    max_prediction_time_sec: float = 0.0  # [s], 0 -> C default
+    gnss_max_horizontal_pos_stddev_m: float = 0.0    # [m], 0 -> C default
+    gnss_max_vertical_pos_stddev_m: float = 0.0      # [m], 0 -> C default
+    gnss_max_horizontal_vel_stddev_mps: float = 0.0  # [m/s], 0 -> C default
+    gnss_max_vertical_vel_stddev_mps: float = 0.0    # [m/s], 0 -> C default
     magnetometer_min_delay_ms: int = 0  # 0 -> C default (1 Hz), negative ->
                                         # no rate limit (fuse every sample)
     auto_init: bool = True
