@@ -15,6 +15,7 @@
 #include "nav_suite.h"
 #include "geodetic_toolbox.h"
 #include "linalg.h" /* SQRTF */
+#include "sensor_defaults.h"
 #include "log.h"
 
 /* Diagnostics only (see log.h): how far the ARS's independently
@@ -853,6 +854,25 @@ void nav_suite_set_magnetic_model_position(nav_suite_t* s, double lat_rad, doubl
        position reaches it on its next start (nav_suite_ahrs_start). */
     ins_set_magnetic_model_from_position(&s->ins, lat_rad, lon_rad, year);
     ahrs_set_position(&s->ahrs, lat_f, lon_f, year);
+    s->mag_model.ins_refreshes = s->ins.mag_model_refreshes;
+}
+
+/* ins re-evaluates the tracked model at its own position as it travels
+ * (REQ-NAV-027), in an epoch without covariance work (REQ-NAV-094). Follow
+ * each such refresh: the kept position becomes ins' current one, and a
+ * running AHRS gets it in this same epoch. */
+/* @satisfies REQ-SUITE-029 */
+static void nav_suite_follow_mag_model(nav_suite_t* s)
+{
+    if (!s->mag_model.valid || !s->ins.mag_model_tracked ||
+        s->ins.mag_model_refreshes == s->mag_model.ins_refreshes)
+    {
+        return;
+    }
+    s->mag_model.ins_refreshes = s->ins.mag_model_refreshes;
+    s->mag_model.lat_rad       = (float)s->ins.latlonh[0];
+    s->mag_model.lon_rad       = (float)s->ins.latlonh[1];
+    ahrs_set_position(&s->ahrs, s->mag_model.lat_rad, s->mag_model.lon_rad, s->mag_model.year);
 }
 
 /* @satisfies REQ-SUITE-001 REQ-SUITE-003 REQ-SUITE-021 */
@@ -895,6 +915,7 @@ void nav_suite_correct_step(nav_suite_t* s)
     const ins_measurements_t* m = &s->step_ctx.m;
 
     ins_correct_step(&s->ins);
+    nav_suite_follow_mag_model(s);
 
     /* The static initial-hint (nav_suite_set_init_att_hint, REQ-SUITE-017) is
        consumed exactly once: cleared as soon as ins has bootstrapped, so a
@@ -963,6 +984,15 @@ void nav_suite_correct_step(nav_suite_t* s)
     if (!m->acc.is_valid || !m->gyr.is_valid)
     {
         return; /* the AHRS filters are pure IMU(+mag) filters */
+    }
+    /* A sample no inertial sensor can have produced is no sample at all: it
+       must not reach the leveling window, the bootstrap or the stillness
+       detectors either. ins and the filters apply the same bound themselves,
+       this keeps it out of the suite's own bookkeeping. */
+    if (!ins_vec3_within(m->acc.data, INS_IMU_ACC_ABS_MAX_MPS2) ||
+        !ins_vec3_within(m->gyr.data, INS_IMU_GYR_ABS_MAX_RPS))
+    {
+        return;
     }
     s->t_last_imu    = m->timestamp;
     s->have_last_imu = true;

@@ -137,7 +137,9 @@
  * TYPEDEFS
  ******************************************************************************/
 
-/** Timestamp in microseconds (monotonic). */
+/** Timestamp in microseconds (monotonic). The difference of two timestamps is a
+ *  plain signed subtraction, so the valid range is about +-2^62: values at the
+ *  ends of the int64 range overflow it (undefined behaviour). */
 typedef int64_t ins_time_us_t;
 
 /** @brief 3x1 Measurement (accel, gyro, magnetometer, GNSS velocity). */
@@ -1144,6 +1146,13 @@ typedef struct
     } buf[INS_AUTOINIT_SAMPLES_MAX]; /**< oldest first */
 } ins_level_window_t;
 
+/** @brief Stages of the deferred Earth parameter refresh (REQ-NAV-094),
+ *  ins_t.meta_refresh_stage. Each runs in its own free epoch. */
+#define INS_EARTH_REFRESH_IDLE      (0) /**< no refresh pending */
+#define INS_EARTH_REFRESH_CURVATURE (1) /**< next: Earth radii of curvature */
+#define INS_EARTH_REFRESH_GRAVITY   (2) /**< next: normal gravity */
+#define INS_EARTH_REFRESH_MAGNETIC  (3) /**< next: WMM reference field */
+
 /** @brief Main filter instance.
  *
  * Everything is statically sized. No heap allocations. Zero the struct before
@@ -1191,7 +1200,8 @@ typedef struct
 
     /* Cached Earth-curvature terms for the incremental latlonh book-keeping.
        Together with gravity_n these change by only ~d/R_earth per meter of
-       travel, so they are refreshed every INS_EARTH_REFRESH_DIST_M. The
+       travel, so they are refreshed every INS_EARTH_REFRESH_DIST_M, staged
+       and outside the epochs that update the covariance (REQ-NAV-094). The
        NED->ECEF rotation is deliberately NOT among them: nothing on the epoch
        path needs it, so it is built on request in ins_get_velocity_ecef()
        instead of being refreshed inside the worst-case epoch (REQ-NAV-080). */
@@ -1206,6 +1216,17 @@ typedef struct
     bool mag_heading_usable;      /**< false inside a dip pole exclusion zone,
                                        where magnetometer fusion is dropped.
                                        True until a position says otherwise */
+    uint8_t meta_refresh_stage;   /**< next pending INS_EARTH_REFRESH_*
+                                       stage (REQ-NAV-094) */
+    bool gravity_user;            /**< gravity_n came from
+                                       ins_set_world_model, never refreshed
+                                       (REQ-NAV-032) */
+    bool mag_model_tracked;       /**< magnetic_n follows the WMM at
+                                       latlonh (REQ-NAV-027) */
+    float    mag_model_year;      /**< decimal year of the tracked WMM */
+    uint32_t mag_model_refreshes; /**< WMM evaluations at the filter's own
+                                       position, lets nav_suite follow them
+                                       (REQ-SUITE-029) */
     float last_omega_b_nb[3];     /**< last computed omega_b_nb */
     float last_acc_n[3];          /**< last body accel in n-frame */
     float acc_n_avg[3];           /**< last_acc_n averaged over
@@ -1245,6 +1266,9 @@ typedef struct
         bool dr_frozen;        /**< restrict fusion to the position re-anchor channels */
         bool range_pos_aiding; /**< this epoch's ranges counted as position
                                     aiding (REQ-NAV-085) */
+        bool busy;             /**< this epoch propagated the covariance or ran
+                                    a Kalman update, no Earth refresh stage
+                                    (REQ-NAV-094) */
     } step_ctx;                /**< per-epoch scratch handed from ins_predict_step() to
                                     ins_correct_step() */
 
@@ -1944,6 +1968,12 @@ extern "C"
     bool ins_get_acc_n(const ins_t* f, float acc_n_mps2[3]);
 
     /** Update the gravity/magnetic model (e.g. from WMM).
+     *
+     *  A vector set here is the caller's: the filter's own Earth refresh
+     *  never overwrites it, and a magnetic vector ends the model tracking
+     *  started by ins_set_magnetic_model_from_position(). NULL leaves a
+     *  vector, and who owns it, unchanged.
+     *
      *  @param[in,out] f The filter instance.
      *  @param[in] gravity_n Gravity vector in NED [m/s^2].
      *  @param[in] magnetic_n Magnetic model vector in NED. */
@@ -1961,6 +1991,12 @@ extern "C"
      *  a first GNSS fix (or any coarse position) becomes available. Until
      *  then the filter uses the magnetic_n supplied at init (if any). A
      *  non-finite argument is ignored.
+     *
+     *  One call is enough: from then on the filter re-evaluates the model
+     *  at its own position, with this year, as it travels (alongside the
+     *  gravity refresh, in an epoch without covariance work), and at
+     *  initialization and re-acquisition. ins_set_world_model() with a
+     *  magnetic vector ends that.
      *
      *  @param[in,out] f The filter instance.
      *  @param[in] lat_rad Latitude [rad].

@@ -17,23 +17,27 @@
 #     git history or remotes.
 #
 # The script does NOT push. Review the diff and push yourself, in two
-# steps: main first, the tag only once the wheel build on main is green.
-# The tag starts the PyPI upload, and a PyPI version can never be
-# replaced (CLAUDE.md, release process step 7).
+# steps: main first, the tag only once the public CI and the wheel build
+# on main are green. The tag starts the PyPI upload, and a PyPI version
+# can never be replaced (CLAUDE.md, release process step 7).
 #
 # Verifies readme.md's coverage block is current for this exact commit
 # (see CLAUDE.md release process step 4), then runs `make check-all`
 # against the exported tree before committing - this needs a POSIX
-# environment with the toolchain from coding_style.md /
-# .github/workflows/ci.yml (WSL, not native Windows: `make check-all`
-# itself refuses to run outside POSIX).
+# environment (WSL, not native Windows: `make check-all` itself refuses
+# to run outside POSIX).
 #
-# Note that the coverage check only runs for real on gcc >= 14.2 with
-# lcov >= 2, the toolchain that can produce MC/DC numbers. Ubuntu 22.04,
-# which the static analysis gates are pinned to, cannot. On such a
-# toolchain the check aborts with instructions, and
-# INSLIB_COVERAGE_VERIFIED_ELSEWHERE=1 skips it after you confirmed the
-# block on the newer box. See the long comment at the check itself.
+# Run it on the gcc >= 14.2 / lcov >= 2 machine that produced the
+# coverage block, the whole release then happens on one box. Its
+# cppcheck/clang-tidy/doxygen are newer than the Ubuntu 22.04 versions
+# .github/workflows/ci.yml pins, so a finding only the older versions
+# report slips through here. The public CI run on main catches it, which
+# is why the tag waits for that run as well.
+#
+# On an older toolchain the coverage check cannot run (no MC/DC) and
+# aborts with instructions. INSLIB_COVERAGE_VERIFIED_ELSEWHERE=1 skips it
+# after you confirmed the block on the newer box. See the long comment at
+# the check itself.
 
 set -euo pipefail
 
@@ -74,13 +78,9 @@ fi
 # would report a stale block for every release no matter how current it
 # is, so detect that case and say what is actually wrong instead.
 #
-# This is not a corner case: the environment the rest of this script
-# wants (Ubuntu 22.04, matching the pinned cppcheck/clang-tidy/doxygen
-# versions in .github/workflows/ci.yml) ships gcc 11, which cannot do
-# MC/DC at all, so the coverage block has to come from a separate, newer
-# box. Running the whole export from that box is no fix either, it just
-# moves the failure to the static analysis gates, whose versions are
-# pinned to 22.04 and not vendored the way clang-format is.
+# Ubuntu 22.04, the box .github/workflows/ci.yml pins the static analysis
+# versions to, ships gcc 11 and is such a toolchain. Running the export
+# on the newer box avoids the case altogether (see the header).
 CC_FOR_COVERAGE="${CC:-cc}"
 GCC_VERSION_NUM="$("$CC_FOR_COVERAGE" -dumpfullversion 2>/dev/null |
     awk -F. '{ printf "%d%02d%02d", $1, $2, $3 }')"
@@ -199,9 +199,9 @@ if ! grep -q "$KFCORE_SHA" "$PRIVATE_ROOT/sbom.cdx.json"; then
 fi
 
 echo "Running make check-all on the exported tree ..."
-# Run this from an Ubuntu 22.04 environment (e.g. WSL) to match
-# .github/workflows/ci.yml's pinned clang-format/cppcheck/doxygen
-# versions - see the CI workflow comment for why 22.04, not 24.04.
+# With this machine's cppcheck/clang-tidy/doxygen, not the versions
+# .github/workflows/ci.yml pins. The public CI run on main is the gate
+# for those (see the header).
 if ! (cd "$PUBLIC_REPO_PATH" && make check-all); then
     echo "error: check-all failed on the exported tree, release aborted" >&2
     echo "the working tree in $PUBLIC_REPO_PATH is left as-is for inspection" >&2
@@ -226,8 +226,10 @@ echo
 echo "Committed and tagged ${VERSION} in $PUBLIC_REPO_PATH."
 echo "Review the commit, then push yourself, in two steps:"
 echo "  1. main only:  git -C \"$PUBLIC_REPO_PATH\" push origin main"
-echo "  2. In the public repo's Actions tab run \"Release Python package (PyPI)\""
-echo "     by hand on main (optionally with TestPyPI) and wait until it is green."
+echo "  2. Wait until the public CI run on main is green (pinned static analysis"
+echo "     versions), and in the public repo's Actions tab run \"Release Python"
+echo "     package (PyPI)\" by hand on main (optionally with TestPyPI) and wait"
+echo "     until it is green as well."
 echo "  3. the tag:    git -C \"$PUBLIC_REPO_PATH\" push origin ${VERSION}"
 echo "If step 2 fails: fix it here, export again and move the unpushed tag"
 echo "(git -C \"$PUBLIC_REPO_PATH\" tag -f -a ${VERSION} -m \"Release ${VERSION}\")."

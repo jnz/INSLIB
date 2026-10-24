@@ -1,106 +1,41 @@
 #!/usr/bin/env bash
 # (c) Jan Zwiener (jan@zwiener.org)
 #
-# Vendor the exact clang-format binary that .github/workflows/ci.yml's
-# ubuntu-22.04 runner uses (`apt-get install clang-format`, currently
-# resolving to 14.0.0-1ubuntu1.1) into .tools/clang-format-14/, without
-# touching any system package database.
+# Vendor the exact clang-format that `make format`/`make format-check`
+# are judged with into .tools/clang-format/, without touching any system
+# package database. .github/workflows/ci.yml runs this same script, so
+# this file is the one place the version is pinned.
 #
-# Why: clang-format's output depends on its exact version - e.g. Debian's
-# or Ubuntu 24.04's clang-format disagrees with 14.0.0-1ubuntu1.1 on
-# ambiguous constructs like `(MACRO_PARAM)*x` vs `(MACRO_PARAM) * x`.
-# `make format`/`make format-check` only reproduce CI's verdict bit-for-bit
-# when run with this exact build (see the pinning comment on the check-all
-# job in ci.yml). The Makefile picks up .tools/clang-format-14/bin/
-# clang-format automatically when it exists, falling back to the `clang-
-# format` on PATH otherwise.
+# Why: clang-format's output depends on its exact version - releases
+# disagree on ambiguous constructs like `(MACRO_PARAM)*x` vs
+# `(MACRO_PARAM) * x`. `make format`/`make format-check` only reproduce
+# CI's verdict when run with the same build. The Makefile picks up the
+# vendored binary automatically when it exists, falling back to the
+# `clang-format` on PATH otherwise.
 #
 # Usage:
 #   scripts/fetch_ci_clang_format.sh
 #
-# Linux x86_64 only (matches the CI runner's architecture). Downloads the
-# clang-format-14/libclang-cpp14/libllvm14 .debs straight from Launchpad
-# (which keeps every historical build indefinitely, unlike the rolling apt
-# mirrors that eventually prune old point releases) and checks each against
-# a pinned sha256 before unpacking it with ar/tar, so a re-run always
-# reproduces the same bytes CI ran against, whatever the mirror serves
-# later. If Ubuntu ever ships a new 14.x point release and CI's printed
-# `clang-format --version` step drifts, bump VERSION and the hashes below
-# to match.
+# Installs the `clang-format` wheel from PyPI (official LLVM release
+# binaries, Linux/macOS/Windows), so it works the same on a CI runner and
+# on any developer machine. A file on PyPI can never be replaced, so a
+# pinned version always yields the same binary. To move to a newer
+# clang-format, bump VERSION, run `make format` and commit both together.
 set -euo pipefail
 cd "$(dirname "$0")/.." # repo root
 
-VERSION="14.0.0-1ubuntu1.1"
-DEST=".tools/clang-format-14"
-BASE_URL="https://launchpad.net/ubuntu/+archive/primary/+files"
+VERSION="19.1.7"
+DEST=".tools/clang-format"
+PYTHON="${PYTHON:-python3}"
+BIN="$DEST/clang_format/data/bin/clang-format"
 
-# package -> sha256 of "<package>_${VERSION}_amd64.deb"
-PACKAGES="clang-format-14 libclang-cpp14 libllvm14"
-sha256_for() {
-    case "$1" in
-        clang-format-14) echo "d354b27c63204db6fc29ef0a0048c91562e97b3bf2497f9ee053faeb4ed10744" ;;
-        libclang-cpp14)  echo "462546f6149fbef99b47f3e1e01e0743d256ae279337c7f89a80a976dfd02175" ;;
-        libllvm14)       echo "9044b614a6c7fb6262e7cbeb13dc731fc0c92bed96281c1a3920dd706442ee8e" ;;
-    esac
-}
-
-if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
-    echo "fetch_ci_clang_format.sh: Linux x86_64 only (CI runner arch)." >&2
-    echo "on other platforms, just make sure a clang-format matching" >&2
-    echo "$VERSION is on PATH (see coding_style.md)." >&2
-    exit 1
-fi
-
-for tool in curl ar tar sha256sum; do
-    command -v "$tool" >/dev/null 2>&1 || {
-        echo "fetch_ci_clang_format.sh: missing required tool '$tool'." >&2
-        exit 1
-    }
-done
-tar --help 2>&1 | grep -q -- --zstd || {
-    echo "fetch_ci_clang_format.sh: need a tar with --zstd support" \
-         "(install the 'zstd' package)." >&2
-    exit 1
-}
-
-if [ -x "$DEST/bin/clang-format" ] \
-   && "$DEST/bin/clang-format" --version | grep -q "$VERSION"; then
-    echo "already installed: $("$DEST/bin/clang-format" --version)"
+if [ -x "$BIN" ] && "$BIN" --version | grep -q "version $VERSION\$"; then
+    echo "already installed: $("$BIN" --version)"
     exit 0
 fi
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-for pkg in $PACKAGES; do
-    file="${pkg}_${VERSION}_amd64.deb"
-    echo "fetching $file ..."
-    curl -sL --fail -o "$work/$pkg.deb" "$BASE_URL/$file"
-    got="$(sha256sum "$work/$pkg.deb" | cut -d' ' -f1)"
-    want="$(sha256_for "$pkg")"
-    if [ "$got" != "$want" ]; then
-        echo "fetch_ci_clang_format.sh: checksum mismatch for $file" >&2
-        echo "  expected $want" >&2
-        echo "  got      $got" >&2
-        exit 1
-    fi
-done
-
 rm -rf "$DEST"
-mkdir -p "$DEST/root"
-for pkg in $PACKAGES; do
-    ar p "$work/$pkg.deb" data.tar.zst | tar --zstd -x -C "$DEST/root"
-done
+"$PYTHON" -m pip install --quiet --disable-pip-version-check --no-deps \
+    --target "$DEST" "clang-format==$VERSION"
 
-mkdir -p "$DEST/bin"
-cat > "$DEST/bin/clang-format" <<'WRAPPER'
-#!/bin/sh
-# Generated by scripts/fetch_ci_clang_format.sh - execs the vendored
-# clang-format-14 with its own libs on LD_LIBRARY_PATH.
-here="$(cd "$(dirname "$0")" && pwd)"
-export LD_LIBRARY_PATH="$here/../root/usr/lib/llvm-14/lib:$here/../root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$here/../root/usr/lib/llvm-14/bin/clang-format" "$@"
-WRAPPER
-chmod +x "$DEST/bin/clang-format"
-
-echo "installed: $("$DEST/bin/clang-format" --version)"
+echo "installed: $("$BIN" --version)"

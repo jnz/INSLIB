@@ -89,12 +89,13 @@ def test_leverarm_relation_classifies_gnss_vs_score():
 
 def test_gui_records_rotated_lever_arms_for_ref_and_fix():
     try:
-        import PyQt6  # noqa: F401
+        # QtGui, not just the PyQt6 package: it is what needs libGL, which
+        # a headless box may lack even with PyQt6 installed
+        from PyQt6 import QtCore, QtGui  # noqa: F401
+        import inspostgui as gui
     except ImportError:
         print("  skip  PyQt6 not installed")
         return
-    from PyQt6 import QtCore
-    import inspostgui as gui
     QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
     gnss_la = (0.4, -0.2, -0.9)
     score_la = (-2.0, 0.1, -1.3)

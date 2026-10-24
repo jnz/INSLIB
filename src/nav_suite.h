@@ -206,10 +206,11 @@ typedef struct
      *  hands it over on every AHRS start. */
     struct
     {
-        bool  valid;   /**< a position has been set since nav_suite_init */
-        float lat_rad; /**< latitude [rad] */
-        float lon_rad; /**< longitude [rad] */
-        float year;    /**< decimal year */
+        bool     valid;         /**< a position has been set since nav_suite_init */
+        float    lat_rad;       /**< latitude [rad] */
+        float    lon_rad;       /**< longitude [rad] */
+        float    year;          /**< decimal year */
+        uint32_t ins_refreshes; /**< ins.mag_model_refreshes last followed */
     } mag_model;
 
     /** Heading carry-over across an ins re-initialization (REQ-SUITE-022): the
@@ -246,17 +247,17 @@ typedef struct
        the plausible pressure samples seen in a short window at bootstrap, so
        one glitched startup reading cannot skew the vertical datum. The
        accumulator resets whenever baro_alt is not initialized and idle. */
-    double             baro_boot_p_sum;  /**< sum of collected pressures [Pa] */
     uint32_t           baro_boot_count;  /**< samples in the sum (0 -> idle) */
+    double             baro_boot_p_sum;  /**< sum of collected pressures [Pa] */
     baro_alt_time_us_t baro_boot_t0;     /**< timestamp of the first collected sample */
     bool               baro_datum_known; /**< baro_alt has run: a re-bootstrap keeps its datum
                                               (baro_alt.h0_baro_m, REQ-SUITE-027) */
 
     /* IMU loss (REQ-SUITE-027): the suite sees the epochs without IMU that the
        ARS/AHRS and baro_alt never get, so it stops them itself. */
-    ins_time_us_t t_last_imu;    /**< last IMU epoch */
     bool          have_last_imu; /**< t_last_imu is set */
     uint32_t      n_imu_loss;    /**< IMU losses that stopped the filters */
+    ins_time_us_t t_last_imu;    /**< last IMU epoch */
 
     ins_level_window_t level_win; /**< leveling window for the ARS/AHRS
                                        bootstrap (REQ-SUITE-028) */
@@ -475,6 +476,14 @@ extern "C"
      *  (REQ-SUITE-022, the same heading INS is re-initialized from), and
      *  the ARS's raw, only-relative yaw where it is not, e.g. before INS
      *  has ever run. nav_suite_get_rpy_ars() always reports the raw one.
+     *
+     *  The sources are independent estimators and nothing reconciles them
+     *  at a switch. While they agree the yaw is continuous. When they do
+     *  not (a disturbed compass, an unaided INS heading) the yaw steps by
+     *  the difference at the switch and can step back at the next one:
+     *  INS to AHRS follows the magnetometer, AHRS to ARS returns to the
+     *  carried INS heading. A consumer that cannot take a heading step
+     *  has to look at nav_suite_get_mode() and the per-source accessors.
      *  @param[in] s The suite instance.
      *  @param[out] roll_rad Roll [rad].
      *  @param[out] pitch_rad Pitch [rad].

@@ -400,6 +400,13 @@ extern "C"
      *  @return true if every component is finite, false otherwise. */
     bool ins_vec3_finite(const float v[3]);
 
+    /** @brief True iff all three components are finite and none exceeds
+     *  abs_max in magnitude. A NaN component fails.
+     *  @param[in] v Input 3x1 vector.
+     *  @param[in] abs_max Largest admissible |component|.
+     *  @return true if the vector is finite and within the bound. */
+    bool ins_vec3_within(const float v[3], float abs_max);
+
     /** @brief International Standard Atmosphere (ISA) altitude from static
      *  pressure (REQ-BARO-004/REQ-NAV-054). Shared by ins and baro_alt so
      *  both filters agree on the same vertical datum from the same raw

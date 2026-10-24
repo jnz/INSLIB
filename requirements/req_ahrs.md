@@ -120,11 +120,15 @@ see REQ-AHRS-009.)
 
 - **Status:** verified
 - **Parent:** REQ-SYS-007
-- **Verification:** Test: tests/test_ahrs.c:scenario_nan_inputs
+- **Verification:** Test: tests/test_ahrs.c:scenario_nan_inputs; Test: tests/test_ahrs.c:scenario_imu_out_of_range
 
 ahrs_update shall drop epochs with non-finite gyro/accelerometer
 samples and ignore non-finite magnetometer samples (counting both in
-n_invalid_input), continuing normally with the next valid data.
+n_invalid_input), continuing normally with the next valid data. The same
+holds for a gyro or accelerometer component beyond
+INS_IMU_GYR_ABS_MAX_RPS respectively INS_IMU_ACC_ABS_MAX_MPS2
+(REQ-NAV-018): such a sample is finite, and one of them would rotate the
+attitude by an arbitrary angle.
 
 ## REQ-AHRS-011 — Time anomaly handling
 
@@ -529,3 +533,20 @@ therefore re-derived from scratch. The gyro bias cannot have moved in a
 fraction of a second and costs the longest to converge, so it is the one
 quantity worth keeping. The inflation covers a sensor that rebooted in
 the gap and came back with a different turn-on bias.
+
+## REQ-AHRS-030 — A non-finite gyro bias shuts the filter down and is not carried
+
+- **Status:** verified
+- **Parent:** REQ-SYS-007
+- **Verification:** Test: tests/test_ahrs.c:scenario_nonfinite_gyro_bias
+
+The health check shall shut the filter down when the gyro bias estimate is
+not finite, as it does for the quaternion and the covariance. A filter that
+is stopped by an IMU loss shall latch the gyro bias carry (REQ-AHRS-029)
+only if the bias and its 1-sigma are finite, and none otherwise.
+
+Rationale: a finite but absurd gyro sample makes the bias estimate
+non-finite while the quaternion and the covariance still look sane for one
+more epoch. A non-finite carry would be refused by ahrs_init() on every
+restart, and as nothing replaces it, the filter (inside nav_suite the ARS
+and the AHRS) would never run again.

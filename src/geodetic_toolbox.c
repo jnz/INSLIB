@@ -573,6 +573,13 @@ bool ins_vec3_finite(const float v[3])
     return isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]);
 }
 
+bool ins_vec3_within(const float v[3], float abs_max)
+{
+    /* Written as <= so that NaN fails without a separate isfinite test, and
+       an infinity exceeds any finite bound. */
+    return fabsf(v[0]) <= abs_max && fabsf(v[1]) <= abs_max && fabsf(v[2]) <= abs_max;
+}
+
 /* A baseline whose horizontal projection is shorter than this fraction of
    its length measures an azimuth amplified by at least the inverse of it:
    a 1 cm antenna phase error across a 1 m baseline tilted to 10 percent

@@ -218,6 +218,10 @@ _Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
    i.e. ~1.6e-5 relative per 100 m of travel. */
 #define INS_EARTH_REFRESH_DIST_M (100.0f)
 
+/* A refresh that found no free epoch (REQ-NAV-094) runs anyway, all stages
+   at once, once the travel reaches this many refresh distances. */
+#define INS_EARTH_REFRESH_FORCE_FACTOR (10.0f)
+
 /* The initial local n-frame is not supposed to jump around. When the carry of
    REQ-NAV-062 is refused, the bootstrap fix only defines a fresh origin if it
    cannot be the same platform, i.e. reaching it from the last known position
@@ -497,6 +501,17 @@ static inline float vec3_norm(const float v[3])
     return SQRTF(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
 
+static inline float vec3_norm2(const float v[3]) { return v[0] * v[0] + v[1] * v[1] + v[2] * v[2]; }
+
+/* |sqrt(norm2) - ref| <= tol evaluated on the squared norm, so a threshold
+ * gate on a vector length costs no square root. NaN fails the test. */
+static inline bool norm2_within(float norm2, float ref, float tol)
+{
+    const float lo = ref - tol;
+    const float hi = ref + tol;
+    return norm2 >= ((lo > 0.0f) ? lo * lo : 0.0f) && norm2 <= hi * hi;
+}
+
 /* Range comparison instead of isfinite(): MinGW's isfinite macro narrows
    its double argument to float internally, which trips -Wfloat-conversion
    (see also tools/insrcv.c's j_num). NaN fails both comparisons and an
@@ -696,27 +711,104 @@ static inline float ins_kalman_dt(const ins_t* f)
  * ============================================================================
  */
 
-/* Recompute the slowly-varying Earth-dependent quantities: gravity and the
- * cached curvature terms for the incremental latlonh book-keeping. Called at
- * init, afterwards throttled to once every INS_EARTH_REFRESH_DIST_M meters of
- * travel (see ins_update_meta). */
-static void ins_refresh_earth_params(ins_t* f)
+/* Curvature terms for the incremental latlonh book-keeping: the
+ * dNED->dlatlonh mapping for unit north/east steps (the mapping is
+ * component-wise). Restarts the travel count. */
+static void ins_refresh_curvature(ins_t* f)
 {
-    /* Curvature terms: evaluate the dNED->dlatlonh mapping for unit
-       north/east steps (the mapping is component-wise). */
     const float unit_ne[3] = {1.0f, 1.0f, 0.0f};
     double      dllh[3];
     ins_dned_to_dlatlonh(unit_ne, f->latlonh[0], f->latlonh[2], dllh);
     f->meta_dlat_per_dN = dllh[0];
     f->meta_dlon_per_dE = dllh[1];
     f->meta_travel_m    = 0.0f;
+}
 
-    /* Refresh gravity at the new position if the user did not supply one
-     * explicitly (i.e. if the init gravity was zero). Otherwise keep
-     * the user-supplied value (e.g. from a WMM-style model). */
-    if (vec3_norm(f->init.gravity_n) < 1e-4f)
+/* Gravity at the current position if the user did not supply one, neither at
+ * init (a zero init gravity) nor through ins_set_world_model (REQ-NAV-032).
+ * Otherwise keep the user-supplied value. */
+static void ins_refresh_gravity(ins_t* f)
+{
+    if (!f->gravity_user && vec3_norm(f->init.gravity_n) < 1e-4f)
     {
         ins_gravity_ned((float)f->latlonh[0], (float)f->latlonh[2], f->gravity_n);
+    }
+}
+
+/* World Magnetic Model reference at lat/lon [deg] for the tracked year: NED
+ * field, field-strength gate and the dip pole zone (REQ-NAV-027,
+ * REQ-SYS-018). */
+static void ins_apply_magnetic_model(ins_t* f, float lat_deg, float lon_deg)
+{
+    f->mag_model_refreshes++;
+
+    /* Inside a dip pole exclusion zone the declination that orients the
+       reference field is meaningless, so magnetometer fusion is dropped until
+       the position leaves the zone (REQ-SYS-018). Keep the last reference
+       rather than overwriting it with a bogus one. */
+    const bool was_usable = f->mag_heading_usable;
+    f->mag_heading_usable = magnetic_heading_reference_valid(lat_deg, lon_deg);
+    if (!f->mag_heading_usable)
+    {
+        if (was_usable)
+        {
+            LOG_INFO("ins: magnetic dip pole zone entered, magnetometer fusion suspended");
+        }
+        return;
+    }
+    if (!was_usable) { LOG_INFO("ins: magnetic dip pole zone left, magnetometer fusion resumed"); }
+
+    float b_ned[3];
+    magnetic_field_ned_uT(lat_deg, lon_deg, f->mag_model_year, b_ned);
+    vec3_copy(b_ned, f->magnetic_n);
+    /* Keep the init copy consistent so a later auto-init yaw bootstrap
+       (which reads init.magnetic_n) uses the same reference field. */
+    vec3_copy(b_ned, f->init.magnetic_n);
+    f->mag_field_expected_uT = magnetic_field_strength_uT(lat_deg, lon_deg);
+}
+
+/* The tracked magnetic model at the filter's own position (REQ-NAV-027). */
+static void ins_refresh_magnetic(ins_t* f)
+{
+    if (f->mag_model_tracked)
+    {
+        ins_apply_magnetic_model(f, (float)RAD2DEG(f->latlonh[0]), (float)RAD2DEG(f->latlonh[1]));
+    }
+}
+
+/* Recompute all slowly-varying Earth-dependent quantities at once. Used where
+ * the position was just set (init, re-acquisition) and as the forced refresh
+ * of REQ-NAV-094, the regular refresh runs staged (ins_refresh_earth_stage). */
+static void ins_refresh_earth_params(ins_t* f)
+{
+    ins_refresh_curvature(f);
+    ins_refresh_gravity(f);
+    ins_refresh_magnetic(f);
+    f->meta_refresh_stage = INS_EARTH_REFRESH_IDLE;
+}
+
+/* Run the next pending refresh stage, one per call. Called only from an
+ * epoch that neither propagates the covariance nor runs a Kalman update
+ * (REQ-NAV-094). */
+/* @satisfies REQ-NAV-094 */
+static void ins_refresh_earth_stage(ins_t* f)
+{
+    switch (f->meta_refresh_stage)
+    {
+    case INS_EARTH_REFRESH_CURVATURE:
+        ins_refresh_curvature(f);
+        f->meta_refresh_stage = INS_EARTH_REFRESH_GRAVITY;
+        break;
+    case INS_EARTH_REFRESH_GRAVITY:
+        ins_refresh_gravity(f);
+        f->meta_refresh_stage =
+            f->mag_model_tracked ? INS_EARTH_REFRESH_MAGNETIC : INS_EARTH_REFRESH_IDLE;
+        break;
+    case INS_EARTH_REFRESH_MAGNETIC:
+        ins_refresh_magnetic(f);
+        f->meta_refresh_stage = INS_EARTH_REFRESH_IDLE;
+        break;
+    default: break;
     }
 }
 
@@ -724,8 +816,9 @@ static void ins_refresh_earth_params(ins_t* f)
  * position (latlonh, double) is book-kept incrementally from the n-frame
  * deltas. Every position change arrives here as dxyz_n_delta (the delta that
  * was *applied* to pos_local), pass NULL if only the orientation changed. The
- * trigonometry only runs every INS_EARTH_REFRESH_DIST_M meters of travel. */
-/* @satisfies REQ-NAV-020 */
+ * trigonometry is only requested every INS_EARTH_REFRESH_DIST_M meters of
+ * travel, and runs later in a free epoch (REQ-NAV-094). */
+/* @satisfies REQ-NAV-020 REQ-NAV-094 */
 static void ins_update_meta(ins_t* f, bool orientation_changed,
                             const float* dxyz_n_delta) /* delta in n-frame, m */
 {
@@ -739,7 +832,15 @@ static void ins_update_meta(ins_t* f, bool orientation_changed,
 
         f->meta_travel_m +=
             fabsf(dxyz_n_delta[0]) + fabsf(dxyz_n_delta[1]) + fabsf(dxyz_n_delta[2]);
-        if (f->meta_travel_m > INS_EARTH_REFRESH_DIST_M) { ins_refresh_earth_params(f); }
+        if (f->meta_travel_m > INS_EARTH_REFRESH_FORCE_FACTOR * INS_EARTH_REFRESH_DIST_M)
+        {
+            ins_refresh_earth_params(f);
+        }
+        else if (f->meta_travel_m > INS_EARTH_REFRESH_DIST_M &&
+                 f->meta_refresh_stage == INS_EARTH_REFRESH_IDLE)
+        {
+            f->meta_refresh_stage = INS_EARTH_REFRESH_CURVATURE;
+        }
     }
 }
 
@@ -1276,7 +1377,7 @@ static bool ins_fuse_is_outlier(const ins_t* f, const float* z, const float* R, 
  * whitened in-place with decorrelate() first, so the scalar Bierman updates
  * inside kalman_udu() see independent unit-variance measurements. Returns 0 on
  * success. */
-/* @satisfies REQ-NAV-002 REQ-NAV-035 REQ-NAV-036 REQ-NAV-090 */
+/* @satisfies REQ-NAV-002 REQ-NAV-035 REQ-NAV-036 REQ-NAV-090 REQ-NAV-093 */
 static int ins_fuse(ins_t* f, float* z, float* R, float* Ht, int m_count, float chi2_threshold,
                     int downweight_outlier)
 {
@@ -1330,6 +1431,7 @@ static int ins_fuse(ins_t* f, float* z, float* R, float* Ht, int m_count, float 
     }
 
     memset(dx, 0, sizeof(dx));
+    f->step_ctx.busy = true; /* no Earth refresh stage this epoch (REQ-NAV-094) */
     if (downweight_outlier && ins_fuse_is_outlier(f, z, R_use, Ht, m_count, chi2_threshold))
     {
         f->diag.n_downweighted++;
@@ -3598,27 +3700,42 @@ static void ins_check_overconfidence(ins_t* f)
     float diag[INS_UNKNOWNS_MAX];
     udu_get_diag(f->U, f->d, diag, f->n);
 
-    /* Smallest per-axis 1-sigma in each group: the first channel to look
-       "too good" is what trips. */
-    float pos =
-        SQRTF(fminf(fminf(diag[INS_IDX_POS + 0], diag[INS_IDX_POS + 1]), diag[INS_IDX_POS + 2]));
-    float vel =
-        SQRTF(fminf(fminf(diag[INS_IDX_VEL + 0], diag[INS_IDX_VEL + 1]), diag[INS_IDX_VEL + 2]));
-    float att = RAD2DEG(
-        SQRTF(fminf(fminf(diag[INS_IDX_RPY + 0], diag[INS_IDX_RPY + 1]), diag[INS_IDX_RPY + 2])));
+    /* Smallest per-axis variance in each group: the first channel to look
+       "too good" is what trips. Everything is compared as a variance, the
+       square root is only taken on the rare paths that need a 1-sigma (a new
+       minimum, the warning). A negative variance (broken covariance) never
+       counts as overconfident here. */
+    const float pos_var =
+        fminf(fminf(diag[INS_IDX_POS + 0], diag[INS_IDX_POS + 1]), diag[INS_IDX_POS + 2]);
+    const float vel_var =
+        fminf(fminf(diag[INS_IDX_VEL + 0], diag[INS_IDX_VEL + 1]), diag[INS_IDX_VEL + 2]);
+    const float att_var =
+        fminf(fminf(diag[INS_IDX_RPY + 0], diag[INS_IDX_RPY + 1]), diag[INS_IDX_RPY + 2]);
 
-    if (pos < f->diag.min_pos_stddev_m) { f->diag.min_pos_stddev_m = pos; }
-    if (vel < f->diag.min_vel_stddev_mps) { f->diag.min_vel_stddev_mps = vel; }
-    if (att < f->diag.min_att_stddev_deg) { f->diag.min_att_stddev_deg = att; }
+    if (pos_var >= 0.0f && pos_var < qsquare(f->diag.min_pos_stddev_m))
+    {
+        f->diag.min_pos_stddev_m = SQRTF(pos_var);
+    }
+    if (vel_var >= 0.0f && vel_var < qsquare(f->diag.min_vel_stddev_mps))
+    {
+        f->diag.min_vel_stddev_mps = SQRTF(vel_var);
+    }
+    const float min_att_deg = f->diag.min_att_stddev_deg;
+    if (att_var >= 0.0f && att_var < qsquare(DEG2RAD(min_att_deg)))
+    {
+        f->diag.min_att_stddev_deg = RAD2DEG(SQRTF(att_var));
+    }
 
-    if (pos < INS_OVERCONF_POS_STDDEV_M || vel < INS_OVERCONF_VEL_STDDEV_MPS ||
-        att < INS_OVERCONF_ATT_STDDEV_DEG)
+    if ((pos_var >= 0.0f && pos_var < qsquare(INS_OVERCONF_POS_STDDEV_M)) ||
+        (vel_var >= 0.0f && vel_var < qsquare(INS_OVERCONF_VEL_STDDEV_MPS)) ||
+        (att_var >= 0.0f && att_var < qsquare(DEG2RAD(INS_OVERCONF_ATT_STDDEV_DEG))))
     {
         if (!f->diag.overconfident)
         {
             LOG_WARN("ins: covariance overconfidence detected (pos %.2g m, vel %.2g m/s, "
                      "att %.2g deg 1-sigma) - possible covariance collapse",
-                     (double)pos, (double)vel, (double)att);
+                     (double)SQRTF(fmaxf(pos_var, 0.0f)), (double)SQRTF(fmaxf(vel_var, 0.0f)),
+                     (double)RAD2DEG(SQRTF(fmaxf(att_var, 0.0f))));
         }
         f->diag.overconfident = true;
         f->diag.n_overconfident++;
@@ -4375,8 +4492,18 @@ void ins_shutdown(ins_t* f)
 void ins_set_world_model(ins_t* f, const float gravity_n[3], const float magnetic_n[3])
 {
     if (f == NULL) return;
-    if (gravity_n != NULL) vec3_copy(gravity_n, f->gravity_n);
-    if (magnetic_n != NULL) vec3_copy(magnetic_n, f->magnetic_n);
+    /* The caller's vectors stay the caller's: the Earth refresh leaves them
+       alone (REQ-NAV-094), and a magnetic one ends the WMM tracking. */
+    if (gravity_n != NULL)
+    {
+        vec3_copy(gravity_n, f->gravity_n);
+        f->gravity_user = true;
+    }
+    if (magnetic_n != NULL)
+    {
+        vec3_copy(magnetic_n, f->magnetic_n);
+        f->mag_model_tracked = false;
+    }
 }
 
 /* @satisfies REQ-NAV-027 */
@@ -4393,29 +4520,11 @@ void ins_set_magnetic_model_from_position(ins_t* f, double lat_rad, double lon_r
         return; /* drop at the API boundary */
     }
 
-    /* Inside a dip pole exclusion zone the declination that orients the
-       reference field is meaningless, so magnetometer fusion is dropped until
-       the position leaves the zone (REQ-SYS-018). Keep the last reference
-       rather than overwriting it with a bogus one. */
-    const bool was_usable = f->mag_heading_usable;
-    f->mag_heading_usable = magnetic_heading_reference_valid(lat_deg, lon_deg);
-    if (!f->mag_heading_usable)
-    {
-        if (was_usable)
-        {
-            LOG_INFO("ins: magnetic dip pole zone entered, magnetometer fusion suspended");
-        }
-        return;
-    }
-    if (!was_usable) { LOG_INFO("ins: magnetic dip pole zone left, magnetometer fusion resumed"); }
-
-    float b_ned[3];
-    magnetic_field_ned_uT(lat_deg, lon_deg, year, b_ned);
-    vec3_copy(b_ned, f->magnetic_n);
-    /* Keep the init copy consistent so a later auto-init yaw bootstrap
-       (which reads init.magnetic_n) uses the same reference field. */
-    vec3_copy(b_ned, f->init.magnetic_n);
-    f->mag_field_expected_uT = magnetic_field_strength_uT(lat_deg, lon_deg);
+    /* From here on the Earth refresh keeps the model current at the
+       filter's own position, in a stage of its own (REQ-NAV-094). */
+    f->mag_model_year    = year;
+    f->mag_model_tracked = true;
+    ins_apply_magnetic_model(f, lat_deg, lon_deg);
 }
 
 /* Pure vertical datum shift: the absolute position stays constant because the
@@ -5268,8 +5377,8 @@ static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
        gravity into the velocity states fast enough that the velocity gate can
        slam shut before the detector ever arms. */
     const bool var_static = ins_static_variance_update(f, m);
-    const bool is_static  = (vec3_norm(gyr_c) <= max_gyr) &&
-                           (fabsf(vec3_norm(acc_c) - g_nom) <= max_acc) &&
+    const bool is_static  = (vec3_norm2(gyr_c) <= max_gyr * max_gyr) &&
+                           norm2_within(vec3_norm2(acc_c), g_nom, max_acc) &&
                            ins_auto_zupt_velocity_gate_ok(f, m, max_vel);
 
     if (!is_static)
@@ -5634,12 +5743,12 @@ static void ins_sanitize_measurements(ins_t* f, const ins_measurements_t* in,
         out->strapdown_dt_sec = 0.0f;
         f->diag.n_invalid_input++;
     }
-    if (out->acc.is_valid && !ins_vec3_finite(out->acc.data))
+    if (out->acc.is_valid && !ins_vec3_within(out->acc.data, INS_IMU_ACC_ABS_MAX_MPS2))
     {
         out->acc.is_valid = false;
         f->diag.n_invalid_input++;
     }
-    if (out->gyr.is_valid && !ins_vec3_finite(out->gyr.data))
+    if (out->gyr.is_valid && !ins_vec3_within(out->gyr.data, INS_IMU_GYR_ABS_MAX_RPS))
     {
         out->gyr.is_valid = false;
         f->diag.n_invalid_input++;
@@ -6013,6 +6122,7 @@ int ins_predict_step(ins_t* f, const ins_measurements_t* m_in, float* phi_out)
     f->step_ctx.active     = true;
     f->step_ctx.run_fusion = !time_jump;
     f->step_ctx.dr_frozen  = dr_frozen;
+    f->step_ctx.busy       = (status & INS_EPOCH_COV_PROPAGATED) != 0;
     if (dr_frozen) status |= INS_EPOCH_DR_FROZEN;
     return status;
 }
@@ -6070,6 +6180,12 @@ void ins_correct_step(ins_t* f)
         ins_track_gnss_mode_gates(f, m);
     }
 
+    /* -------- Deferred Earth refresh (REQ-NAV-094) -------- */
+    /* After the fusion, so busy also knows about every Kalman update of this
+       epoch. A filter the fusion has just shut down may run a stage on its
+       stale position, harmless, since every (re)start refreshes everything. */
+    if (!f->step_ctx.busy) { ins_refresh_earth_stage(f); }
+
     /* -------- History save + health check -------- */
     ins_save_state(f, m->timestamp, false);
     ins_check_health(f);
@@ -6086,10 +6202,13 @@ void ins_correct_step(ins_t* f)
         /* Split off the variance above instead of nesting the call inside RAD2DEG:
          * cppcheck 2.7, the version the CI image pins, cannot build an AST for a
          * _Generic whose controlling expression is a call taking struct members. */
-        const float yaw_stddev_deg = RAD2DEG(SQRTF(yaw_var_rad2));
+        const float yaw_warn_rad = DEG2RAD(INS_LOG_YAW_STDDEV_WARN_DEG);
         if (yaw_aid_gap_sec >= INS_LOG_YAW_AID_GAP_WARN_SEC &&
-            yaw_stddev_deg >= INS_LOG_YAW_STDDEV_WARN_DEG)
+            yaw_var_rad2 >= qsquare(yaw_warn_rad))
         {
+            const float yaw_stddev_rad = SQRTF(yaw_var_rad2);
+            const float yaw_stddev_deg = RAD2DEG(yaw_stddev_rad);
+            (void)yaw_stddev_deg; /* log only */
             const bool  first_warn = (f->log_state.t_last_yaw_stddev_warn == 0);
             const float since_warn_sec =
                 first_warn ? 0.0f
@@ -6108,15 +6227,18 @@ void ins_correct_step(ins_t* f)
            diverging even while still nominally aided. */
         if (f->log_state.t_yaw_stddev_window == 0)
         {
+            const float yaw_stddev_rad         = SQRTF(yaw_var_rad2);
             f->log_state.t_yaw_stddev_window   = m->timestamp;
-            f->log_state.yaw_stddev_window_deg = yaw_stddev_deg;
+            f->log_state.yaw_stddev_window_deg = RAD2DEG(yaw_stddev_rad);
         }
         else
         {
             const float window_sec = time_diff_sec(m->timestamp, f->log_state.t_yaw_stddev_window);
             if (window_sec >= INS_LOG_RUNAWAY_WINDOW_SEC)
             {
-                const float growth_deg = yaw_stddev_deg - f->log_state.yaw_stddev_window_deg;
+                const float yaw_stddev_rad = SQRTF(yaw_var_rad2);
+                const float yaw_stddev_deg = RAD2DEG(yaw_stddev_rad);
+                const float growth_deg     = yaw_stddev_deg - f->log_state.yaw_stddev_window_deg;
                 if (growth_deg >= INS_LOG_YAW_RUNAWAY_DEG)
                 {
                     LOG_WARN("ins: yaw stddev runaway: grew %.1f deg in %.1f s (%.2f deg/s) "

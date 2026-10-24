@@ -131,7 +131,7 @@
        \large Software Documentation and Mathematical Models\\[1cm]
        \includegraphics[width=0.33\textwidth]{figures/inslib_logo.pdf}
 }
-\newcommand{\inslibversion}{1.4.0}
+\newcommand{\inslibversion}{1.4.1}
 \author{Jan Zwiener \\ \texttt{jan@zwiener.org}}
 \date{Version \inslibversion\\[2mm] \today}
 
@@ -226,7 +226,11 @@ KFCore     & submodule               & \code{linalg} (column-major matrix functi
         body-to-NED rotation $\Rbn$. Euler angles are Tait--Bryan angles in ZYX
         order (roll $\phi$, pitch $\theta$, yaw $\psi$).
   \item \textbf{Matrices} are stored column-major (BLAS/LAPACK convention).
-  \item \textbf{Timestamps} are monotonic \code{int64} microseconds.
+  \item \textbf{Timestamps} are monotonic \code{int64} microseconds. The
+        difference of two timestamps is formed as a plain signed subtraction,
+        so the valid range of a timestamp is $\pm 2^{62}\,\mu$s (about 146
+        thousand years either way). Values at the very ends of the \code{int64}
+        range overflow it, which is undefined behaviour.
   \item $\cross{\vect{a}}$ is the skew-symmetric cross-product matrix with
         $\cross{\vect{a}}\vect{b} = \vect{a}\times\vect{b}$.
   \item $\vect{f}^\bframe$ is the specific force measured by the accelerometer,
@@ -626,7 +630,14 @@ following common best practices of navigation filters \cite{carpenter2018}:
         normalised to $[-\pi,\pi]$. A heading beyond one full turn is a unit or
         unwrapping error however (degrees written into a radian field, an
         accumulated course). It is rejected and counted, instead of being
-        wrapped into a plausible-looking but wrong heading.
+        wrapped into a plausible-looking but wrong heading. The same holds for
+        the inertial sensors: a gyroscope or accelerometer component beyond a
+        magnitude no sensor of this class reports
+        (\code{INS\_IMU\_GYR\_ABS\_MAX\_RPS}, \code{INS\_IMU\_ACC\_ABS\_MAX\_MPS2} in
+        \code{sensor\_defaults.h}) is dropped and counted like a non-finite one.
+        Such a value is finite and passes every finiteness test, but a single one
+        rotates the attitude by an arbitrary angle within one epoch, from which a
+        filter with a small covariance needs minutes to recover.
   \item Statistical screening with two policies: each scalar measurement row is
         tested with a Mahalanobis (chi-square) gate inside the UDU update
         (\S\ref{sec:robust-udu}). \emph{Persistent absolute references} (GNSS,
@@ -694,8 +705,9 @@ struct is $\approx$\SI{50}{\kibi\byte}, with
 $\approx$\SI{38}{\kibi\byte}.
 The loops of the per-epoch path are bounded by compile-time constants or by the
 runtime state count $n \le$ \code{INS\_\allowbreak{}UNKNOWNS\_\allowbreak{}MAX}.
-Slowly varying Earth quantities (curvature radii, $\Rne$, gravity) are cached
-and refreshed only every \SI{100}{\metre} of travel. The per-step
+Slowly varying Earth quantities (curvature radii, gravity) are cached
+and refreshed only every \SI{100}{\metre} of travel, outside the epochs
+that update the covariance (\S\ref{sec:llh}). The per-step
 latitude/longitude/height bookkeeping then costs some double
 multiply-adds (\S\ref{sec:llh}).
 
@@ -961,7 +973,16 @@ $(\varphi, \lambda, h)$ is maintained in double precision from the
 \end{equation}
 The curvature terms (and gravity) change only by
 $\sim d / R_{\text{earth}}$ per metre of travel and are cached. They are
-refreshed after every \SI{100}{\metre} of accumulated travel. $\Rne$ is
+refreshed after every \SI{100}{\metre} of accumulated travel. The
+refresh does not run where the travel crosses the threshold: it waits for
+the next epoch that neither propagates the covariance nor runs a
+measurement update, and it is split into stages (curvature terms, then
+gravity, then the World Magnetic Model while it is tracked,
+\S\ref{sec:wmm}), one per such epoch. With an IMU faster than the covariance
+prediction and the aiding, that costs a few metres of travel at most.
+A configuration without free epochs, a covariance prediction at the IMU
+rate for instance, gets all stages at once after ten refresh distances.
+$\Rne$ is
 not among them: no epoch-path computation uses it, so it is
 built on demand in \code{ins\_\allowbreak{}get\_\allowbreak{}velocity\_\allowbreak{}ecef()}
 instead of being refreshed inside the worst-case epoch.
@@ -1850,50 +1871,6 @@ to avoid. The two are tuned as a pair. The \textbf{velocity} gate
 receiver actually reports a velocity \emph{with} its covariance. On a
 position-only stream it never applies, whatever it is set to.
 
-\paragraph{Worked example: \code{datasets/kfgins}.} An automotive
-fibre-optic-gyro dataset that trips the second failure at the built-in
-defaults. Its GNSS stream is position-only (no velocity), so the
-velocity gate never applies and the two IMU criteria decide alone.
-A navigation-grade FOG in a smoothly cruising car is also far quieter than
-the consumer MEMS that the defaults are sized against. The detector armed
-mid-drive: \num{357} triggers instead of \num{328}, attitude-error
-scatter up thirtyfold, biases unmoved. Sweeping only
-\code{auto\_\allowbreak{}zupt\_\allowbreak{}static\_\allowbreak{}gyr\_\allowbreak{}stddev\_\allowbreak{}deg}:
-
-\begin{center}
-\begin{tabular}{rrrrr}
-\toprule
-threshold [\si{\degree\per\second}] & \code{n auto-zupt} &
-roll err.\ $\sigma$ [\si{\degree}] & yaw err.\ $\sigma$ [\si{\degree}] &
-ARS yaw drift [\si{\degree\per\minute}] \\
-\midrule
-0.25 (default) & 357 & 0.120 & 0.148 & 0.775 \\
-0.15           & 335 & 0.053 & 0.049 & --    \\
-0.12           & 329 & 0.004 & 0.026 & 0.253 \\
-\textbf{0.10}  & \textbf{315} & \textbf{0.004} & \textbf{0.026} & \textbf{0.011} \\
-0.08           & 245 & 0.004 & 0.026 & 0.120 \\
-0.03           &  92 & 0.004 & 0.026 & 0.725 \\
-$\le$ 0.02     &   0 & 0.004 & 0.104 & --    \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Two things generalise from the shape of that table. The \code{ins} metrics have
-a broad \emph{plateau} (here \numrange{0.03}{0.12}), so the value is not picked
-at the first setting that passes: a threshold chosen on an edge is tuned to
-the noise of one dataset and not to the platform. And over-tightening is not
-harmless: in the bottom row, with no triggers at all, the yaw error grows again,
-because the genuine standstill updates were doing real work.
-
-Where the \code{ins} plateau leaves the choice open, the \emph{ARS} resolves it.
-The same key configures every stillness detector in the suite
-(\S\ref{sec:autozupt}), and the ARS runs free-yaw here (no magnetometer), so its
-$z$-gyro bias is observable only through ZARU. This turns its yaw drift into
-a smooth optimum in the last column: too high and spurious mid-drive updates
-corrupt the bias, too low and there are too few updates to determine it. That
-optimum is visible only on a fine sweep, sampled coarsely the column reads as
-noise.
-
 \subsection{Dead reckoning, re-acquisition, readiness}
 \label{sec:readiness}
 
@@ -2673,7 +2650,17 @@ Consumers: \code{ins\_\allowbreak{}set\_\allowbreak{}magnetic\_\allowbreak{}mode
 the full reference vector (so the vector fusion yaw of ins is true-north)
 and arms the field-strength gate,
 \code{ahrs\_\allowbreak{}set\_\allowbreak{}position()} uses $D$ for the deterministic declination
-step and $F$ for the opt-in gate. Like geodetic\_toolbox, the module
+step and $F$ for the opt-in gate.
+One call is enough: from then on ins re-evaluates the model at its own
+position, with the year given, as a stage of its Earth parameter refresh
+(\S\ref{sec:llh}), in a free epoch of its own after the gravity stage,
+and at initialization and re-acquisition. \code{nav\_\allowbreak{}suite}
+follows each such refresh in the same epoch and hands the ins position to
+the running AHRS, so its declination moves with the vehicle as well.
+A vector set through
+\code{ins\_\allowbreak{}set\_\allowbreak{}world\_\allowbreak{}model()} belongs to the
+caller: the refresh never overwrites it, gravity or magnetic field, and a
+magnetic one ends the model tracking. Like geodetic\_toolbox, the module
 carries no filter policy: ``is this measurement trustworthy'' is
 decided in the filters.
 

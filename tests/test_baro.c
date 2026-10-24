@@ -4565,9 +4565,52 @@ static void scenario_predict_correct_equivalence(void)
 
 /* ------------------------------------------------------------------------- */
 
+/* A finite but impossible accelerometer sample is dropped like a non-finite
+ * one (REQ-BARO-007): one wrong value would otherwise be integrated into the
+ * vertical velocity and height as a violent acceleration. */
+static void scenario_baro_accel_out_of_range(void)
+{
+    printf("\n-- scenario: baro_alt out-of-range accelerometer sample --\n");
+
+    const float base_alt = 300.0f;
+    const float q[4]     = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float f_b[3]   = {0.0f, 0.0f, -GRAVITY};
+
+    baro_alt_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    baro_alt_t         b;
+    baro_alt_time_us_t t = 1000000;
+    CHECK_TRUE(baro_alt_init(&b, &cfg, t, pressure_from_altitude(base_alt), 0.0f, 0.0f) == 0,
+               "baro_alt_init");
+    int i;
+    for (i = 1; i <= 500; ++i)
+    {
+        t += US_PER_SEC / 100;
+        baro_alt_update(&b, t, f_b, q, pressure_from_altitude(base_alt), 0.0f, (i % 5) == 0);
+    }
+    float h0, v0, h1, v1;
+    CHECK_TRUE(baro_alt_get_height(&b, &h0) && baro_alt_get_velocity(&b, &v0), "state before");
+
+    float    f_out[3] = {0.0f, 0.0f, 1.1f * INS_IMU_ACC_ABS_MAX_MPS2};
+    uint32_t n0       = b.n_invalid_input;
+    t += US_PER_SEC / 100;
+    baro_alt_update(&b, t, f_out, q, pressure_from_altitude(base_alt), 0.0f, false);
+    CHECK_TRUE(b.n_invalid_input == n0 + 1u, "an accel value beyond the bound is dropped");
+    f_out[2] = 1.0e30f;
+    n0       = b.n_invalid_input;
+    t += US_PER_SEC / 100;
+    baro_alt_update(&b, t, f_out, q, pressure_from_altitude(base_alt), 0.0f, false);
+    CHECK_TRUE(b.n_invalid_input == n0 + 1u, "a huge accel value is dropped");
+
+    CHECK_TRUE(baro_alt_get_height(&b, &h1) && baro_alt_get_velocity(&b, &v1), "state after");
+    CHECK_NEAR(h1, h0, 0.01, "height untouched [m]");
+    CHECK_NEAR(v1, v0, 0.01, "vertical velocity untouched [m/s]");
+}
+
 int main(void)
 {
     scenario_isa_conversion();
+    scenario_baro_accel_out_of_range();
     scenario_baro_convergence();
     scenario_baro_deadreckon();
     scenario_baro_zupt();

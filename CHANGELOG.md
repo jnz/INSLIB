@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.4.1] - 2026-10-24 - Tweaks
+
+### Changed
+
+- Lower worst-case epoch time: the Earth parameter refresh every 100 m of
+  travel (curvature terms, gravity, magnetic model) no longer runs in an
+  epoch with covariance prediction or a Kalman update. It waits for a free
+  epoch (forced after 1000 m).
+- IMU samples that are finite but physically impossible (a unit mix-up, a
+  corrupt frame) are now dropped like non-finite ones and counted in
+  `n_invalid_input`, by INS, AHRS/ARS, `baro_alt` and `nav_suite` alike
+  (bounds in `sensor_defaults.h`). One such sample used to rotate the
+  attitude by an arbitrary angle.
+- Static/stillness checks compare squared norms and no longer take a
+  square root per epoch.
+
+### Fixed
+
+- `nav_suite`: the magnetometer AHRS kept the World Magnetic Model at the
+  position it was first given. It now follows the INS's own refresh as the
+  vehicle travels, so one `nav_suite_set_magnetic_model_position()` call
+  is enough.
+- AHRS/ARS: a non-finite gyro bias estimate now shuts the filter down
+  instead of corrupting the next epochs, and is never carried over into a
+  restart.
+
+- A gravity vector set at runtime with `ins_set_world_model()` was
+  replaced by the computed normal gravity again after at most 100 m of
+  travel, if the filter had been started with automatic gravity
+  (`init.gravity_n` zero). The refresh now leaves vectors set there alone.
+
 ## [1.4.0] - 2026-10-18 - PyPI Package (pip install inslib)
 
 ### Added

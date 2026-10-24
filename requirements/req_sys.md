@@ -75,12 +75,26 @@ cannot deadlock on a persistent offset.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ins_core.c:scenario_nan_inf_inputs; Test: tests/test_ahrs.c:scenario_nan_inputs
+- **Verification:** Test: tests/test_ins_core.c:scenario_nan_inf_inputs; Test: tests/test_ahrs.c:scenario_nan_inputs; Test: tests/test_ahrs.c:scenario_suite_fuzz
 
 Measurement inputs containing non-finite values (NaN/Inf) shall be
 dropped at the API boundary and counted in the diagnostics. A single
 corrupt sample shall not degrade or disable the filters; processing
 shall continue with the next valid data.
+
+The same shall hold for the other ways a broken sensor driver or a corrupt
+frame misrepresents a measurement: flags raised over zeroed data, zero or
+negative covariances, a frozen IMU, repeated, backward or far forward
+timestamps, implausible delays and dt. The verification drives the whole
+suite with a seeded random mix of these faults and requires that every
+value the suite reports is finite, that every filter claiming to run holds
+finite covariance factors with positive d, and that after the faults stop
+the suite is running again and agrees with the truth. Finite inertial
+values of absurd magnitude belong to those faults and are dropped by a
+magnitude bound (REQ-NAV-018, REQ-AHRS-010, REQ-BARO-007).
+
+The valid range of a timestamp is about +-2^62 microseconds, so that the
+difference of two timestamps cannot overflow the signed subtraction.
 
 ## REQ-SYS-008 — Portability
 

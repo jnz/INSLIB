@@ -60,7 +60,7 @@ transient corruption.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-010
-- **Verification:** Test: tests/test_ahrs.c:scenario_tunnel; Test: tests/test_ahrs.c:scenario_suite_fallbacks; Test: tests/test_ahrs.c:scenario_suite_heading_switch_no_jump
+- **Verification:** Test: tests/test_ahrs.c:scenario_tunnel; Test: tests/test_ahrs.c:scenario_suite_fallbacks; Test: tests/test_ahrs.c:scenario_suite_heading_switch_no_jump; Test: tests/test_ahrs.c:scenario_suite_heading_switch_disagreeing
 
 The wrapper shall expose the current solution mode
 (nav_suite_get_mode): FULL (ins ready with recent position aiding),
@@ -69,6 +69,14 @@ ATTITUDE_ONLY (ins position solution unavailable, AHRS attitude
 available) or NONE. nav_suite_get_rpy() shall return the attitude
 from the best available source (ins, else magnetometer AHRS, else
 ARS), so a consumer keeps receiving an attitude throughout an outage.
+
+The yaw is continuous across a switch only while the sources agree. The
+wrapper does not reconcile ins, the magnetometer AHRS and the ARS: with a
+disturbed compass the yaw steps by the disagreement when ins drops out
+(the AHRS heading is reported) and steps back when the AHRS drops out as
+well (the ARS carries the last 3D heading, REQ-SUITE-022). This is the
+documented behaviour, not a defect to be hidden, and the per-source
+accessors and the mode let a consumer detect it.
 
 ## REQ-SUITE-006 — Barometric vertical filter integration
 
@@ -818,7 +826,7 @@ restart is meant to undo.
 
 - **Status:** verified
 - **Parent:** REQ-AHRS-014
-- **Verification:** Test: tests/test_ahrs.c:scenario_suite_mag_model_before_ahrs_start
+- **Verification:** Test: tests/test_ahrs.c:scenario_suite_mag_model_before_ahrs_start; Test: tests/test_ahrs.c:scenario_suite_mag_model_follows_ins
 
 The wrapper shall offer one interface that sets the World Magnetic Model
 position (latitude, longitude, decimal year) for both attitude sources:
@@ -830,6 +838,13 @@ precision watchdog), and at once if the AHRS is already running. A
 position given before the AHRS has started shall therefore reference
 its yaw to true north from the start, and no restart shall fall back
 to magnetic north. nav_suite_init shall forget a kept position.
+
+While ins tracks the model at its own position (REQ-NAV-027), the
+wrapper shall follow every model refresh of ins: it shall replace the
+kept position with ins' current one and hand that to a running AHRS in
+the same epoch, which ins kept free of covariance work (REQ-NAV-094).
+The AHRS declination then moves with the vehicle like the ins reference
+does.
 
 Rationale: the AHRS only accepts a position while it is running and
 forgets it when it restarts. A caller that sets the position once, the

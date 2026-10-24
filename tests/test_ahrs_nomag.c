@@ -23,7 +23,7 @@
 
 #define GRAVITY     (9.80665f)
 #define DEG2RADF(x) ((x) * (float)M_PI / 180.0f)
-#define RAD2DEGF(x) ((x)*180.0f / (float)M_PI)
+#define RAD2DEGF(x) ((x) * 180.0f / (float)M_PI)
 
 static int fails = 0;
 

@@ -72,7 +72,8 @@
  * TYPEDEFS
  ******************************************************************************/
 
-/** Timestamp in microseconds (monotonic), same convention as ins. */
+/** Timestamp in microseconds (monotonic), same convention and valid range
+ *  (about +-2^62) as ins_time_us_t. */
 typedef int64_t baro_alt_time_us_t;
 
 /** @brief Filter configuration.

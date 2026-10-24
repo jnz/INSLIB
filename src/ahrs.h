@@ -78,7 +78,8 @@
  * TYPEDEFS
  ******************************************************************************/
 
-/** Timestamp in microseconds (monotonic), same convention as ins. */
+/** Timestamp in microseconds (monotonic), same convention and valid range
+ *  (about +-2^62) as ins_time_us_t. */
 typedef int64_t ahrs_time_us_t;
 
 /** @brief Filter mode (fixed per instance, set in ahrs_config_t). */

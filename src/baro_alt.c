@@ -51,13 +51,12 @@
 #define BARO_ALT_LOG_GAP_WARN_SEC   (5.0f)
 #define BARO_ALT_LOG_GAP_REPEAT_SEC (10.0f)
 
-/* Initial bias-prior consistency check (see log.h, REQ-BARO-024). While the
-   caller feeds zero-velocity updates the platform stands still, so the
+/* Initial bias initial std.-dev. consistency check (see log.h, REQ-BARO-024).
+   While the caller feeds zero-velocity updates the platform stands still, so the
    up-acceleration input a_up (specific force rotated to NED, gravity removed)
    is the vertical accelerometer bias itself, up to the sensor noise. Averaged
    over a long enough window it can be held against the configured 1-sigma prior
-   cfg.acc_bias_init_stddev_mps2; a gross mismatch means that prior was written
-   for a different sensor.
+   cfg.acc_bias_init_stddev_mps2.
      - SIGMA_FACTOR: sigma the averaged evidence may exceed before the prior
        counts as mis-specified.
      - MIN_DWELL_SEC / MIN_SAMPLES: window long and dense enough for the white
@@ -76,23 +75,19 @@
 /* Config defaults. sigma_a/sigma_b are continuous-time spectral noise densities
  * [X/sqrt(Hz)], scaled by dt_sec in baro_alt_predict.
  *
- * sigma_a is deliberately not shared with ins.c's accelerometer VRW density
- * (sensor_defaults.h): a_up_mps2 here is a full 3D-to-vertical projection (body
- * specific force rotated to NED via the supplied attitude, gravity removed,
- * REQ-BARO-002), so roll/pitch error leaks in as additional apparent noise and
- * a much larger effective density is needed.
+ * sigma_a is not shared with ins.c's accelerometer VRW density
+ * (sensor_defaults.h): a_up_mps2 here is a full 3D-to-vertical projection
+ * (body specific force rotated to NED via the supplied attitude, gravity
+ * removed, REQ-BARO-002), so roll/pitch error leaks in as additional apparent
+ * noise and a much larger effective value is needed.
  *
  * sigma_h (direct process noise on h) is meant to stay small: a safety margin
- * against the discretization/model-mismatch gap described at
- * baro_alt_predict, not a primary noise source.
+ * against a discretization/model-mismatch gap.
  *
- * The a_b prior and sigma_b are sized for an UNCALIBRATED accelerometer, which
- * is what the filter has to survive: a sensitivity error of a percent already
- * lands well over 0.1 m/s^2 in a_up, and a prior far below that leaves the
- * residual in v, where it stands out as a vertical velocity that never decays.
+ * The a_b prior and sigma_b are sized for an UNCALIBRATED accelerometer.
  * sigma_b is what lets a_b keep tracking a residual that moves with orientation
  * or temperature instead of freezing at its first estimate. Both are therefore
- * loose relative to the pure sensor-datasheet numbers. */
+ * NOT the pure sensor-datasheet numbers. */
 #define BARO_ALT_DEFAULT_H_STDDEV_M             (0.8f)
 #define BARO_ALT_DEFAULT_V_STDDEV_MPS           (0.20f)
 #define BARO_ALT_DEFAULT_AB_STDDEV_MPS2         (0.1f)
@@ -537,11 +532,12 @@ int baro_alt_predict_step(baro_alt_t* b, baro_alt_time_us_t t, const float acc_m
     /* Non-finite inputs (NaN/Inf) must not reach the math (a NaN passes every
        chi2/variance gate because NaN comparisons are false). Drop the epoch;
        the next epoch's dt spans the gap, which the loss gate handles. */
-    if (!isfinite(acc_mps2[0]) || !isfinite(acc_mps2[1]) || !isfinite(acc_mps2[2]) ||
-        !isfinite(q_bn[0]) || !isfinite(q_bn[1]) || !isfinite(q_bn[2]) || !isfinite(q_bn[3]))
+    if (!ins_vec3_within(acc_mps2, INS_IMU_ACC_ABS_MAX_MPS2) || !isfinite(q_bn[0]) ||
+        !isfinite(q_bn[1]) || !isfinite(q_bn[2]) || !isfinite(q_bn[3]))
     {
         b->n_invalid_input++;
-        LOG_WARN("baro_alt: non-finite accel/attitude input dropped (%u total since init)",
+        LOG_WARN("baro_alt: non-finite or out-of-range accel/attitude input dropped (%u total "
+                 "since init)",
                  (unsigned int)b->n_invalid_input);
         b->step_ctx.active = false;
         return BARO_ALT_EPOCH_DROPPED;

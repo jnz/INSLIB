@@ -276,7 +276,8 @@ nav.local_pos(pos_ned, var_ned)      # indoor tracker: Lighthouse / UWB / mocap
 ```
 
 With a magnetometer, call `nav.set_magnetic_model(lat_rad, lon_rad, 2026.5)`
-once (decimal year) so the yaw refers to true north. Conventions match the
+once (decimal year) so the yaw refers to true north. The filter keeps the
+model current at its own position from then on. Conventions match the
 C library: body frame FRD, nav frame NED, time in `int64` microseconds,
 angles in radians.
 

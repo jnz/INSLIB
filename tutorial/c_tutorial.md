@@ -282,7 +282,8 @@ have:
 * **`m.mag`** - a magnetometer sample. Call
   `ins_set_magnetic_model_from_position(&ins, lat, lon, year)` once (e.g.
   on your first fix) so yaw is referenced to **true** north via the World
-  Magnetic Model. Leave `m.mag.Qll_diag` at zero unless you have
+  Magnetic Model. Once is enough: the filter keeps the model current at its
+  own position as it travels. Leave `m.mag.Qll_diag` at zero unless you have
   characterised the sensor *on your platform*: the filter then uses its
   own noise default, which is deliberately weak (roughly the horizontal
   field itself, so about a radian of heading per sample), and throttles

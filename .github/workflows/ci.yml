@@ -14,14 +14,10 @@ concurrency:
 jobs:
   check-all:
     name: check-all (build, tests, reqs, format, cppcheck, clang-tidy, doxygen, coverage)
-    # Pinned (not ubuntu-latest, and not 24.04): clang-format/cppcheck/
-    # doxygen results depend on their exact version. ubuntu-22.04's
-    # clang-format package (14.0.0-1ubuntu1.1) is a normal stable Ubuntu
-    # package - unlike 24.04's, which is an experimental snapshot build
-    # from universe ("~exp" suffix) that can drift on its own. This also
-    # matches the clang-format already available in a stock Ubuntu 22.04
-    # WSL install, so local and CI results agree without installing
-    # anything extra.
+    # Pinned (not ubuntu-latest): cppcheck/clang-tidy/doxygen results
+    # depend on their exact version. clang-format does not come from the
+    # runner: scripts/fetch_ci_clang_format.sh pins it (PyPI wheel), the
+    # same copy `make format` uses locally.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -32,11 +28,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cppcheck clang-tidy clang-format lcov doxygen
+            build-essential cppcheck clang-tidy lcov doxygen
+          scripts/fetch_ci_clang_format.sh
 
       - name: Print toolchain versions
         run: |
-          clang-format --version
+          .tools/clang-format/clang_format/data/bin/clang-format --version
           cppcheck --version
           clang-tidy --version
           doxygen --version

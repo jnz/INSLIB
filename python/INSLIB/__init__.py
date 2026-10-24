@@ -44,4 +44,4 @@ __all__ = [
     "telemetry", "ecef_to_llh", "llh_to_ecef", "rpy_to_quat",
     "wmm_field_ned", "yaw_from_baseline_heading",
 ]
-__version__ = "1.4.0"
+__version__ = "1.4.1"

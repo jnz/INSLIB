@@ -22,6 +22,9 @@
 #include "geodetic_toolbox.h"
 #include "magnetic_model.h"
 #include "sensor_defaults.h"
+#include "linalg.h"
+#include "kalman_udu.h"
+#include "udu_takasu_vectors.h"
 
 static int fails = 0;
 
@@ -751,6 +754,12 @@ static void scenario_magnetic_model_from_position(void)
     CHECK_NEAR(f.magnetic_n[1], ref_before[1], 1e-6, "zone: reference east retained");
     CHECK_NEAR(f.magnetic_n[2], ref_before[2], 1e-6, "zone: reference down retained");
 
+    /* Staying in the zone, as every model refresh there does
+       (REQ-NAV-094): still unusable, the old reference still kept. */
+    ins_set_magnetic_model_from_position(&f, 85.0 * M_PI / 180.0, 133.0 * M_PI / 180.0, year);
+    CHECK_TRUE(!f.mag_heading_usable, "zone: staying keeps it unusable");
+    CHECK_NEAR(f.magnetic_n[0], ref_before[0], 1e-6, "zone: reference still retained");
+
     const float psi = 45.0f * (float)M_PI / 180.0f;
     const float cz = cosf(psi), sz = sinf(psi);
     const float turned[3] = {cz * wmm_n[0] - sz * wmm_n[1], sz * wmm_n[0] + cz * wmm_n[1],
@@ -915,7 +924,7 @@ static float magc_gauss(double sigma)
    of 20 m radius (14.3 deg/s yaw rate), with a gentle roll/pitch rocking
    throughout. Heading in closed form so the body rate can be differentiated. */
 /* Column-major 3x3 element. */
-#define MAGC_EL(A, r, c) ((A)[(c)*3 + (r)])
+#define MAGC_EL(A, r, c) ((A)[(c) * 3 + (r)])
 #define MAGC_R_M         (20.0)
 #define MAGC_V_MPS       (5.0)
 #define MAGC_T_STILL     (10.0)
@@ -1128,6 +1137,116 @@ static void scenario_mag_bias_circle_drive(void)
     CHECK_TRUE(rms18 < 1.0, "18-state: heading RMS below 1 deg");
     CHECK_TRUE(rms15 > 3.0 && rms15 > 5.0 * rms18,
                "15-state: the unestimated hard iron pulls the heading off");
+}
+
+/* One run of the burst scenario: spin with a hard iron, converge, inject a
+   1 s foreign field, run on. Reports the bias before/after, the largest bias
+   excursion since the burst began and the final yaw error. */
+typedef struct
+{
+    float  b_pre[3];
+    float  b_end[3];
+    double max_dev;
+    float  yaw_err;
+    bool   ok;
+} mag_burst_result_t;
+
+static void run_mag_burst(bool chi2_disable, int burst_steps, float dist_scale,
+                          const float b_true[3], mag_burst_result_t* res)
+{
+    memset(res, 0, sizeof(*res));
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.estimate_mag_bias = true;
+    opt.chi2_disable      = chi2_disable;
+    if (ins_init(&f, &init, &opt) != 0 || f.n != 18) { return; }
+
+    const float wz     = 30.0f * (float)M_PI / 180.0f;
+    const float d_n[3] = {40.0f * dist_scale, -25.0f * dist_scale,
+                          10.0f * dist_scale}; /* foreign field, n-frame [uT] */
+
+    float g_vec[3];
+    ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, wz};
+
+    const float   dt      = 0.01f;
+    ins_time_us_t t       = 0;
+    const int     n_steps = 8000 + burst_steps + 6000; /* 60 s of recovery */
+    for (int step = 1; step <= n_steps; ++step)
+    {
+        t += us_from_sec(dt);
+        const float        psi = wz * (float)step * dt;
+        const float        c = cosf(psi), s = sinf(psi);
+        const bool         burst = (step > 8000 && step <= 8000 + burst_steps);
+        const float        mn[3] = {init.magnetic_n[0] + (burst ? d_n[0] : 0.0f),
+                                    init.magnetic_n[1] + (burst ? d_n[1] : 0.0f),
+                                    init.magnetic_n[2] + (burst ? d_n[2] : 0.0f)};
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_body, dt);
+        m.mag.data[0]     = c * mn[0] + s * mn[1] + b_true[0];
+        m.mag.data[1]     = -s * mn[0] + c * mn[1] + b_true[1];
+        m.mag.data[2]     = mn[2] + b_true[2];
+        m.mag.Qll_diag[0] = m.mag.Qll_diag[1] = m.mag.Qll_diag[2] = 0.25f;
+        m.mag.is_valid                                            = true;
+        ins_update(&f, &m);
+
+        if (step == 8000 && !ins_get_bias_mag(&f, res->b_pre)) { return; }
+        if (step > 8000)
+        {
+            float b[3];
+            (void)ins_get_bias_mag(&f, b);
+            for (int k = 0; k < 3; ++k)
+            {
+                const double d = fabs((double)b[k] - (double)res->b_pre[k]);
+                if (d > res->max_dev) { res->max_dev = d; }
+            }
+        }
+    }
+    float roll, pitch, yaw;
+    (void)ins_get_bias_mag(&f, res->b_end);
+    ins_get_rpy(&f, &roll, &pitch, &yaw);
+    res->yaw_err = ins_angle_diff(yaw, wz * (float)n_steps * dt);
+    res->ok      = true;
+}
+
+/* 18-state mode, long strong magnetic disturbance (REQ-NAV-029): after the
+   hard iron has converged under rotation, a 10 s foreign field of about
+   190 uT (4x the reference burst, a vehicle parked next to the sensor) is
+   injected. The chi2 gate downweights instead of rejecting, so some of it
+   leaks into the bias, but the stronger the field the less plausible it is
+   and the harder it is downweighted (R grows with the squared innovation).
+   A twin run with chi2_disable is the negative control: there the same burst
+   has to corrupt the estimate far more, otherwise the test would prove
+   nothing. */
+static void scenario_mag_bias_transient_disturbance(void)
+{
+    printf("\n=== Scenario 7e: 18-state bias through a 10 s strong mag disturbance ===\n");
+    const float b_true[3] = {3.0f, -2.0f, 1.5f};
+
+    mag_burst_result_t gated, open;
+    run_mag_burst(false, 1000, 4.0f, b_true, &gated);
+    run_mag_burst(true, 1000, 4.0f, b_true, &open);
+    CHECK_TRUE(gated.ok && open.ok, "both runs completed in 18-state mode");
+    printf("   chi2 on : bias excursion %5.2f uT, yaw error %5.2f deg\n", gated.max_dev,
+           RAD2DEG(gated.yaw_err));
+    printf("   chi2 off: bias excursion %5.2f uT, yaw error %5.2f deg\n", open.max_dev,
+           RAD2DEG(open.yaw_err));
+
+    for (int k = 0; k < 3; ++k)
+    {
+        CHECK_NEAR(gated.b_pre[k], b_true[k], 0.5, "hard iron converged before the burst");
+        CHECK_NEAR(gated.b_end[k], b_true[k], 0.5, "chi2 on: hard iron recovered after the burst");
+    }
+    CHECK_TRUE(gated.max_dev < 3.5, "chi2 on: bias excursion stays small");
+    CHECK_TRUE(open.max_dev > 3.0 * gated.max_dev, "chi2 off: burst corrupts the bias far more");
+    CHECK_NEAR(gated.yaw_err, 0.0f, 2.0 * M_PI / 180.0, "chi2 on: yaw error after the burst [rad]");
 }
 
 static void scenario_zero_rotation_bias(void)
@@ -3094,25 +3213,25 @@ static void scenario_gnss_init_dwell(void)
     const float dwell_sec   = 2.0f;  /* -> min_count = 2 fixes */
 
     /* One 100 Hz IMU epoch, plus a usable GNSS fix every `fix_period_s`. */
-#define DWELL_STEP(F, T, FIX_PERIOD_S)                      \
-    do {                                                    \
-        (T) += us_from_sec(dt);                             \
-        ins_measurements_t m;                               \
-        memset(&m, 0, sizeof(m));                           \
-        m.timestamp = (T);                                  \
-        set_imu(&m, acc_body, gyr_body, dt);                \
-        const long period_us = (long)((FIX_PERIOD_S)*1e6f); \
-        if ((long)((T) % period_us) < (long)(dt * 1e6f))    \
-        {                                                   \
-            m.gnss_pos.llh[0]     = init.llh[0];            \
-            m.gnss_pos.llh[1]     = init.llh[1];            \
-            m.gnss_pos.llh[2]     = init.llh[2];            \
-            m.gnss_pos.Qll_ned[0] = 1.0f;                   \
-            m.gnss_pos.Qll_ned[4] = 1.0f;                   \
-            m.gnss_pos.Qll_ned[8] = 1.0f;                   \
-            m.gnss_pos.is_valid   = true;                   \
-        }                                                   \
-        ins_update(&(F), &m);                               \
+#define DWELL_STEP(F, T, FIX_PERIOD_S)                        \
+    do {                                                      \
+        (T) += us_from_sec(dt);                               \
+        ins_measurements_t m;                                 \
+        memset(&m, 0, sizeof(m));                             \
+        m.timestamp = (T);                                    \
+        set_imu(&m, acc_body, gyr_body, dt);                  \
+        const long period_us = (long)((FIX_PERIOD_S) * 1e6f); \
+        if ((long)((T) % period_us) < (long)(dt * 1e6f))      \
+        {                                                     \
+            m.gnss_pos.llh[0]     = init.llh[0];              \
+            m.gnss_pos.llh[1]     = init.llh[1];              \
+            m.gnss_pos.llh[2]     = init.llh[2];              \
+            m.gnss_pos.Qll_ned[0] = 1.0f;                     \
+            m.gnss_pos.Qll_ned[4] = 1.0f;                     \
+            m.gnss_pos.Qll_ned[8] = 1.0f;                     \
+            m.gnss_pos.is_valid   = true;                     \
+        }                                                     \
+        ins_update(&(F), &m);                                 \
     } while (0)
 
 /* Same epoch without any fix: the stream is simply interrupted. */
@@ -7062,8 +7181,8 @@ static void scenario_automotive_gnss_yaw(void)
             if (k % 20 == 0) /* 1 Hz GNSS velocity */                                          \
             {                                                                                  \
                 m.gnss_vel.is_valid   = true;                                                  \
-                m.gnss_vel.vel_ned[0] = (SPD)*cosf(COURSE);                                    \
-                m.gnss_vel.vel_ned[1] = (SPD)*sinf(COURSE);                                    \
+                m.gnss_vel.vel_ned[0] = (SPD) * cosf(COURSE);                                  \
+                m.gnss_vel.vel_ned[1] = (SPD) * sinf(COURSE);                                  \
                 m.gnss_vel.vel_ned[2] = 0.0f;                                                  \
                 m.gnss_vel.Qll_ned[0] = m.gnss_vel.Qll_ned[4] = m.gnss_vel.Qll_ned[8] = 0.09f; \
             }                                                                                  \
@@ -9158,6 +9277,94 @@ static void scenario_bias_prior_check(void)
  * always false), poison the state and force a permanent health-check
  * shutdown. After each corrupt sample the filter must remain ready and
  * keep working on good data. */
+/* A finite but impossible inertial sample (REQ-NAV-018): it passes any
+ * finiteness test, so only a magnitude bound keeps it from rotating the
+ * attitude by an arbitrary angle within one epoch. */
+static void scenario_imu_out_of_range(void)
+{
+    printf("\n=== Scenario: out-of-range IMU samples are dropped (REQ-NAV-018) ===\n");
+
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    if (ins_init(&f, &init, &opt) != 0)
+    {
+        printf("init failed\n");
+        fails++;
+        return;
+    }
+
+    float g_vec[3];
+    ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+    const float dt          = 0.01f;
+
+    ins_time_us_t      t = 0;
+    ins_measurements_t m;
+    int                i;
+    for (i = 0; i < 100; ++i)
+    {
+        t += us_from_sec(dt);
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_body, dt);
+        ins_update(&f, &m);
+    }
+    float roll0, pitch0, yaw0;
+    CHECK_TRUE(ins_get_rpy(&f, &roll0, &pitch0, &yaw0), "attitude before");
+
+    /* Beyond the bound, on either sensor: dropped, the attitude does not move. */
+    const float gyr_out[3] = {0.0f, 1.1f * INS_IMU_GYR_ABS_MAX_RPS, 0.0f};
+    const float acc_out[3] = {0.0f, 1.1f * INS_IMU_ACC_ABS_MAX_MPS2, -g_vec[2]};
+
+    uint32_t n0 = ins_get_diag(&f)->n_invalid_input;
+    t += us_from_sec(dt);
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    set_imu(&m, acc_body, gyr_out, dt);
+    ins_update(&f, &m);
+    CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == n0 + 1u,
+               "a gyro value beyond the bound is dropped");
+
+    n0 = ins_get_diag(&f)->n_invalid_input;
+    t += us_from_sec(dt);
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    set_imu(&m, acc_out, gyr_body, dt);
+    ins_update(&f, &m);
+    CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == n0 + 1u,
+               "an accel value beyond the bound is dropped");
+
+    n0 = ins_get_diag(&f)->n_invalid_input;
+    t += us_from_sec(dt);
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    set_imu(&m, acc_body, gyr_body, dt);
+    m.gyr.data[0] = 1.0e30f;
+    ins_update(&f, &m);
+    CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == n0 + 1u, "a huge gyro value is dropped");
+
+    float roll1, pitch1, yaw1;
+    CHECK_TRUE(ins_get_rpy(&f, &roll1, &pitch1, &yaw1), "attitude after");
+    CHECK_NEAR(RAD2DEG(roll1), RAD2DEG(roll0), 0.05, "roll untouched by the dropped samples [deg]");
+    CHECK_NEAR(RAD2DEG(pitch1), RAD2DEG(pitch0), 0.05,
+               "pitch untouched by the dropped samples [deg]");
+
+    /* Inside the bound: used (it rotates the attitude, which is the point). */
+    const float gyr_in[3] = {0.0f, 0.9f * INS_IMU_GYR_ABS_MAX_RPS, 0.0f};
+    n0                    = ins_get_diag(&f)->n_invalid_input;
+    t += us_from_sec(dt);
+    memset(&m, 0, sizeof(m));
+    m.timestamp = t;
+    set_imu(&m, acc_body, gyr_in, dt);
+    ins_update(&f, &m);
+    CHECK_TRUE(ins_get_diag(&f)->n_invalid_input == n0, "a gyro value inside the bound is used");
+}
+
 static void scenario_nan_inf_inputs(void)
 {
     printf("\n=== Scenario 28: non-finite inputs dropped, filter survives ===\n");
@@ -11906,6 +12113,76 @@ static void scenario_fuse_rejects_bad_noise(void)
     }
 }
 
+/* A GNSS fix whose correlated covariance cannot be decorrelated (REQ-NAV-093)
+ * must leave the covariance factors exactly as they were: the failed Cholesky
+ * has already overwritten its working copies of z, Ht and R, so everything
+ * hinges on ins_fuse() returning before kalman_udu() touches U and d. A twin
+ * filter receives the identical IMU stream without the fix, so "untouched"
+ * is a bitwise comparison and not a plausibility check. */
+static void scenario_fuse_rejects_undecorrelatable_fix(void)
+{
+    printf("\n=== Scenario: fusion discards a fix that cannot be decorrelated (REQ-NAV-093) ===\n");
+
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    float g_vec[3];
+    {
+        double lat, lon, h;
+        ins_ecef_to_latlonh(init_ecef(&init), &lat, &lon, &h);
+        ins_gravity_ned((float)lat, (float)h, g_vec);
+    }
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+    const float dt          = 0.01f;
+
+    /* Off-diagonal N-E covariance of a 1 m^2 per axis position fix:
+       5 -> indefinite (eigenvalues 6 and -4), 1 -> exactly singular. */
+    const float cov_ne[2]    = {5.0f, 1.0f};
+    const char* case_name[2] = {"indefinite covariance", "exactly singular covariance"};
+    int         c;
+
+    for (c = 0; c < 2; ++c)
+    {
+        static ins_t fa, fb; /* fa gets the fix, fb is the twin without it */
+        memset(&fa, 0, sizeof(fa));
+        memset(&fb, 0, sizeof(fb));
+        if (ins_init(&fa, &init, &opt) != 0 || ins_init(&fb, &init, &opt) != 0)
+        {
+            printf("init failed\n");
+            fails++;
+            return;
+        }
+
+        ins_time_us_t t = 0;
+        int           i;
+        for (i = 0; i < 41; ++i)
+        {
+            t += us_from_sec(dt);
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            set_imu(&m, acc_body, gyr_body, dt);
+            ins_update(&fb, &m); /* twin: IMU only, all epochs */
+            if (i == 40)
+            {
+                m.gnss_pos.is_valid = true;
+                memcpy(m.gnss_pos.llh, init.llh, sizeof(double) * 3);
+                m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = m.gnss_pos.Qll_ned[8] = 1.0f;
+                m.gnss_pos.Qll_ned[1] = m.gnss_pos.Qll_ned[3] = cov_ne[c];
+            }
+            ins_update(&fa, &m);
+        }
+
+        printf("  case: %s\n", case_name[c]);
+        CHECK_TRUE(ins_get_diag(&fa)->n_fuse_fail >= 1, "counted as fuse fail");
+        CHECK_TRUE(memcmp(fa.U, fb.U, sizeof(fa.U)) == 0, "covariance U factor untouched");
+        CHECK_TRUE(memcmp(fa.d, fb.d, sizeof(fa.d)) == 0, "covariance d factor untouched");
+        CHECK_TRUE(memcmp(&fa.state, &fb.state, sizeof(fa.state)) == 0, "nominal state untouched");
+    }
+}
+
 /* --------------------------------------------------------------------------
  * Vertical origin relocation: a pure datum shift. The absolute solution
  * (ECEF, lat/lon/height) must be invariant, all local heights shift by
@@ -14296,6 +14573,159 @@ static void scenario_geodetic_origin(void)
     CHECK_NEAR(ecef[2], ecef_from_llh[2], 1e-9, "ecef accessor matches the anchor, z");
 }
 
+/* REQ-NAV-094: the Earth parameter refresh stays out of the epochs that
+ * propagate the covariance or run a Kalman update, runs staged, one stage per
+ * free epoch, and is forced at INS_EARTH_REFRESH_FORCE_FACTOR refresh
+ * distances when no free epoch comes. REQ-NAV-027/032: the tracked magnetic
+ * model is one of those stages, and vectors the caller set are left alone.
+ *
+ * The vehicle flies north at 100 m/s, 1 m per 100 Hz IMU epoch. Pass 0
+ * predicts the covariance at 20 Hz and fuses a speed sample at 10 Hz, so
+ * most epochs are free. Pass 1 predicts at the IMU rate, so none is. Pass 2
+ * is pass 0 with gravity and magnetic field set by the caller.
+ */
+static void scenario_earth_refresh_scheduling(void)
+{
+    printf("\n=== Scenario: Earth parameter refresh scheduling ===\n");
+
+    static const char* const pass_name[] = {"free epochs available", "no free epoch",
+                                            "caller's own vectors"};
+    const float              v_north     = 100.0f;
+    const float              year        = 2026.5f;
+    int                      pass;
+    for (pass = 0; pass < 3; ++pass)
+    {
+        const bool free_epochs = (pass != 1);
+        const bool user_vecs   = (pass == 2);
+        printf("  -- %s\n", pass_name[pass]);
+
+        ins_init_t init;
+        fill_default_init(&init, 0);
+        init.vel_ned[0] = v_north;
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.kalman_update_dt_sec = free_epochs ? 0.05f : 0.01f;
+        /* noiseless constant velocity reads as a standstill (see Scenario 9),
+           and its ZUPTs would also be Kalman updates this scenario does not
+           count */
+        opt.auto_zupt_disable = true;
+
+        ins_t f;
+        memset(&f, 0, sizeof(f));
+        CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init ok");
+        ins_time_us_t t = 0;
+        start_manual_filter(&f, &t, 0.01f, NULL);
+        CHECK_TRUE(f.is_initialized, "filter started");
+
+        ins_set_magnetic_model_from_position(&f, init.llh[0], init.llh[1], year);
+        const float g_user[3] = {0.0f, 0.0f, 9.7f};
+        const float m_user[3] = {18.0f, 1.0f, 40.0f};
+        if (user_vecs) { ins_set_world_model(&f, g_user, m_user); }
+        const uint32_t mag_refreshes0 = f.mag_model_refreshes;
+
+        float g_vec[3];
+        ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+        const float acc_body[3]   = {0.0f, 0.0f, -g_vec[2]};
+        const float gyr_body[3]   = {0.0f, 0.0f, 0.0f};
+        int         n_busy_stage  = 0; /* stage advanced in a busy epoch */
+        int         n_two_stages  = 0; /* more than one stage in one epoch */
+        int         n_curv        = 0; /* curvature refreshes */
+        int         n_grav        = 0; /* gravity stages */
+        int         n_mag         = 0; /* magnetic stages */
+        int         n_speed_fused = 0;
+        float       travel_max    = 0.0f;
+        double      llh_grav[3]   = {0.0, 0.0, 0.0}; /* where the last stage ran */
+        double      llh_mag[3]    = {0.0, 0.0, 0.0};
+        int         i;
+        for (i = 0; i < 1500; ++i)
+        {
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            t += us_from_sec(0.01f);
+            m.timestamp = t;
+            set_imu(&m, acc_body, gyr_body, 0.01f);
+            if (free_epochs && (i % 10) == 3)
+            {
+                m.speed.speed_mps  = v_north;
+                m.speed.stddev_mps = 0.1f;
+                m.speed.is_valid   = true;
+            }
+
+            const float    travel_before = f.meta_travel_m;
+            const uint8_t  stage_before  = f.meta_refresh_stage;
+            const uint32_t speed_before  = f.diag.n_speed_used;
+            const int      status        = ins_predict_step(&f, &m, NULL);
+            ins_correct_step(&f);
+
+            const bool fused = f.diag.n_speed_used != speed_before;
+            const bool busy  = fused || (status & INS_EPOCH_COV_PROPAGATED) != 0;
+            n_speed_fused += fused ? 1 : 0;
+            if (f.meta_travel_m > travel_max) { travel_max = f.meta_travel_m; }
+
+            /* The curvature refresh restarts the travel count. Its value
+               is no witness: the radii are evaluated in float and 100 m
+               of latitude can sit below their resolution. */
+            const bool curv = f.meta_travel_m < travel_before;
+            const bool grav = stage_before == INS_EARTH_REFRESH_GRAVITY &&
+                              f.meta_refresh_stage != INS_EARTH_REFRESH_GRAVITY;
+            const bool mag = stage_before == INS_EARTH_REFRESH_MAGNETIC &&
+                             f.meta_refresh_stage == INS_EARTH_REFRESH_IDLE;
+            if (grav) { memcpy(llh_grav, f.latlonh, sizeof(llh_grav)); }
+            if (mag) { memcpy(llh_mag, f.latlonh, sizeof(llh_mag)); }
+            n_curv += curv ? 1 : 0;
+            n_grav += grav ? 1 : 0;
+            n_mag += mag ? 1 : 0;
+            if ((curv ? 1 : 0) + (grav ? 1 : 0) + (mag ? 1 : 0) > 1) { n_two_stages++; }
+            if (free_epochs && busy && (curv || grav || mag)) { n_busy_stage++; }
+        }
+
+        printf("  curvature %d, gravity %d, magnetic %d stages, max travel %.1f m\n", n_curv,
+               n_grav, n_mag, (double)travel_max);
+        if (pass == 0)
+        {
+            CHECK_TRUE(n_speed_fused > 100, "the speed samples were fused (busy epochs exist)");
+            CHECK_TRUE(n_busy_stage == 0, "no refresh stage ran in a busy epoch");
+            CHECK_TRUE(n_two_stages == 0, "every stage ran in an epoch of its own");
+            /* 1500 m of travel, a refresh per 100 m plus a few metres of
+               deferral each */
+            CHECK_TRUE(n_curv >= 13 && n_curv <= 15, "curvature refreshed every ~100 m");
+            CHECK_TRUE(n_grav == n_curv && n_mag == n_curv, "gravity and WMM refreshed as often");
+            CHECK_TRUE(f.mag_model_refreshes - mag_refreshes0 == (uint32_t)n_mag,
+                       "each magnetic stage is one model evaluation");
+            CHECK_TRUE(travel_max < 110.0f, "the deferral costs only a few metres");
+
+            float g_exp[3], b_exp[3];
+            ins_gravity_ned((float)llh_grav[0], (float)llh_grav[2], g_exp);
+            magnetic_field_ned_uT((float)(llh_mag[0] * 180.0 / M_PI),
+                                  (float)(llh_mag[1] * 180.0 / M_PI), year, b_exp);
+            CHECK_NEAR(f.gravity_n[2], g_exp[2], 1e-6, "gravity is the one at the refresh");
+            CHECK_NEAR(f.magnetic_n[0], b_exp[0], 1e-4, "WMM north at the refresh position");
+            CHECK_NEAR(f.magnetic_n[2], b_exp[2], 1e-4, "WMM down at the refresh position");
+        }
+        else if (pass == 1)
+        {
+            /* Never a free epoch: forced at 10 x 100 m, all stages at once */
+            CHECK_TRUE(n_curv == 1, "exactly one forced refresh in 1500 m");
+            CHECK_TRUE(f.meta_refresh_stage == INS_EARTH_REFRESH_CURVATURE ||
+                           f.meta_refresh_stage == INS_EARTH_REFRESH_IDLE,
+                       "the forced refresh left no later stage behind");
+            CHECK_TRUE(f.mag_model_refreshes - mag_refreshes0 == 1,
+                       "the forced refresh evaluated the WMM once");
+            CHECK_TRUE(travel_max <= 1001.0f && travel_max > 999.0f,
+                       "forced right at the 1000 m bound");
+        }
+        else
+        {
+            CHECK_TRUE(n_curv >= 13, "curvature still refreshed");
+            CHECK_TRUE(n_mag == 0, "no magnetic stage once the caller set the field");
+            CHECK_TRUE(f.mag_model_refreshes == mag_refreshes0, "and no WMM evaluation");
+            CHECK_NEAR(f.gravity_n[2], g_user[2], 0.0, "the caller's gravity is kept");
+            CHECK_NEAR(f.magnetic_n[0], m_user[0], 0.0, "the caller's field is kept, north");
+            CHECK_NEAR(f.magnetic_n[2], m_user[2], 0.0, "the caller's field is kept, down");
+        }
+    }
+}
+
 /* REQ-NAV-079: a GNSS fix is stated geodetically and is fused in that form.
  * What has to hold is that the solution lands on the fix, and that a
  * non-finite component drops it instead of poisoning the filter.
@@ -14839,6 +15269,182 @@ static void scenario_predict_correct_equivalence(void)
     CHECK_TRUE(f1.diag.n_predict == f2.diag.n_predict, "n_predict matches");
 }
 
+/* Largest |P - P_ref| / sqrt(P_ref_ii * P_ref_jj) over all entries, with
+ * P = U diag(d) U' rebuilt in double (U unit upper triangular, column-major,
+ * its diagonal not stored meaningfully) and P_ref column-major n x n. */
+static double udu_max_rel_err(const float* U, const float* d, int n, const double* P_ref)
+{
+    double max_e = 0.0;
+    int    i, j, k;
+    for (i = 0; i < n; ++i)
+    {
+        for (j = 0; j < n; ++j)
+        {
+            double p = 0.0;
+            for (k = (i > j ? i : j); k < n; ++k)
+            {
+                const double uik = (k == i) ? 1.0 : (double)MAT_ELEM(U, i, k, n, n);
+                const double ujk = (k == j) ? 1.0 : (double)MAT_ELEM(U, j, k, n, n);
+                p += uik * ujk * (double)d[k];
+            }
+            const double ref = MAT_ELEM(P_ref, i, j, n, n);
+            const double sc = sqrt(fabs(MAT_ELEM(P_ref, i, i, n, n) * MAT_ELEM(P_ref, j, j, n, n)));
+            max_e           = fmax(max_e, fabs(p - ref) / sc);
+        }
+    }
+    return max_e;
+}
+
+/* Fully correlated measurement covariance through the UDU pipeline against an
+ * independent double-precision reference (REQ-NAV-002). kalman_udu() itself
+ * consumes the diagonal of R only, so correlated fixes reach it decorrelated
+ * (ins_fuse: decorrelate(), then R = I), and a dropped or wrong decorrelation
+ * is exactly the error that stays invisible to every scenario with a diagonal
+ * R. The reference is the Takasu/Cholesky update computed by
+ * scripts/generate_udu_takasu_vectors.py, which is committed as
+ * tests/udu_takasu_vectors.h. Dense R (0.9 equicorrelation and a random
+ * correlation), 15 and 6 states, 6 and 3 measurements, covariance entries
+ * over four orders of magnitude.
+ *
+ * Tolerances are relative: state to the largest state change of the case,
+ * covariance to sqrt(P_ii * P_jj). They sit above the single-precision error
+ * seen here and far below what ignoring the correlation does, which is the
+ * negative control at the end of each case. */
+static void scenario_udu_vs_takasu(void)
+{
+    printf("\n=== Scenario: UDU update with fully correlated R vs Takasu (REQ-NAV-002) ===\n");
+
+    const int n_cases = (int)(sizeof(udu_takasu_cases) / sizeof(udu_takasu_cases[0]));
+    int       c, i;
+
+    for (c = 0; c < n_cases; ++c)
+    {
+        const udu_takasu_case_t* tc = &udu_takasu_cases[c];
+        const int                n = tc->n, m = tc->m;
+        float                    P0[UDU_TAKASU_N_MAX * UDU_TAKASU_N_MAX];
+        float                    U[UDU_TAKASU_N_MAX * UDU_TAKASU_N_MAX];
+        float                    d[UDU_TAKASU_N_MAX];
+        float                    R[UDU_TAKASU_M_MAX * UDU_TAKASU_M_MAX];
+        float                    Reye[UDU_TAKASU_M_MAX * UDU_TAKASU_M_MAX];
+        float                    Ht[UDU_TAKASU_N_MAX * UDU_TAKASU_M_MAX];
+        float                    z[UDU_TAKASU_M_MAX];
+        float                    x[UDU_TAKASU_N_MAX];
+        float                    U0[UDU_TAKASU_N_MAX * UDU_TAKASU_N_MAX];
+        float                    d0[UDU_TAKASU_N_MAX];
+
+        printf("  case: %s\n", tc->name);
+        for (i = 0; i < n * n; ++i) { P0[i] = (float)tc->P0[i]; }
+        for (i = 0; i < m * m; ++i) { R[i] = (float)tc->R[i]; }
+        for (i = 0; i < n * m; ++i) { Ht[i] = (float)tc->Ht[i]; }
+        for (i = 0; i < m; ++i) { z[i] = (float)tc->dz[i]; }
+        memset(x, 0, sizeof(x));
+
+        CHECK_TRUE(udu(P0, U, d, n) == 0, "factorise a priori covariance");
+        memcpy(U0, U, sizeof(U));
+        memcpy(d0, d, sizeof(d));
+
+        /* Pipeline as in ins_fuse() for a non-diagonal R. A near-singular R
+           may be refused as not positive definite (ins_fuse then discards the
+           measurement, the a priori factors stay untouched), anything it
+           accepts has to be right. */
+        const bool dec_ok = (decorrelate(z, Ht, R, n, m) == 0);
+        if (!dec_ok && tc->may_reject)
+        {
+            CHECK_TRUE(true, "near-singular R refused by decorrelate, update discarded");
+            continue;
+        }
+        CHECK_TRUE(dec_ok, "decorrelate");
+        mateye(Reye, m);
+        CHECK_TRUE(kalman_udu(x, U, d, z, Reye, Ht, n, m, 0.0f, 0) == 0, "kalman_udu");
+
+        double x_scale = 0.0;
+        for (i = 0; i < n; ++i) { x_scale = fmax(x_scale, fabs(tc->x_post[i])); }
+        double max_ex = 0.0;
+        for (i = 0; i < n; ++i) { max_ex = fmax(max_ex, fabs((double)x[i] - tc->x_post[i])); }
+        CHECK_NEAR(max_ex / x_scale, 0.0, tc->tol_rel, "state update, max error / max |dx|");
+
+        CHECK_NEAR(udu_max_rel_err(U, d, n, tc->P_post), 0.0, tc->tol_rel,
+                   "posterior P, max error / sqrt(Pii Pjj)");
+
+        /* Negative control: the same update treating R as diagonal (the
+           correlation dropped) must land clearly off the reference, or this
+           case could not see a missing decorrelation. */
+        float xd[UDU_TAKASU_N_MAX];
+        float Rd[UDU_TAKASU_M_MAX * UDU_TAKASU_M_MAX];
+        float Ht2[UDU_TAKASU_N_MAX * UDU_TAKASU_M_MAX];
+        float z2[UDU_TAKASU_M_MAX];
+        memset(xd, 0, sizeof(xd));
+        memset(Rd, 0, sizeof(Rd));
+        for (i = 0; i < m; ++i) { Rd[i + i * m] = (float)tc->R[i + i * m]; }
+        for (i = 0; i < n * m; ++i) { Ht2[i] = (float)tc->Ht[i]; }
+        for (i = 0; i < m; ++i) { z2[i] = (float)tc->dz[i]; }
+        (void)kalman_udu(xd, U0, d0, z2, Rd, Ht2, n, m, 0.0f, 0);
+        double max_ed = 0.0;
+        for (i = 0; i < n; ++i) { max_ed = fmax(max_ed, fabs((double)xd[i] - tc->x_post[i])); }
+        CHECK_TRUE(max_ed / x_scale > 1e-4, "negative control: diagonal R is clearly off");
+    }
+}
+
+/* Thornton covariance prediction against the textbook form in double
+ * (REQ-NAV-002): P+ = Phi P Phi' + G diag(Q) G', x+ = Phi x. The cases use
+ * a dense Phi, so every U column is rewritten, a dense G with as many noise
+ * columns as states (the modified Gram-Schmidt step orthogonalises the
+ * widest possible block) and an INS-like sparse G with fewer columns. The
+ * input G is passed through a copy because the routine modifies it. */
+static void scenario_udu_predict_vs_reference(void)
+{
+    printf("\n=== Scenario: UDU (Thornton) prediction vs textbook form (REQ-NAV-002) ===\n");
+
+    const double tol_rel_x = 1e-4;
+    const double tol_rel_P = 1e-4;
+    const int    n_cases =
+        (int)(sizeof(udu_takasu_predict_cases) / sizeof(udu_takasu_predict_cases[0]));
+    int c, i;
+
+    for (c = 0; c < n_cases; ++c)
+    {
+        const udu_takasu_predict_case_t* tc = &udu_takasu_predict_cases[c];
+        const int                        n = tc->n, r = tc->r;
+        float                            P0[UDU_TAKASU_N_MAX * UDU_TAKASU_N_MAX];
+        float                            U[UDU_TAKASU_N_MAX * UDU_TAKASU_N_MAX];
+        float                            d[UDU_TAKASU_N_MAX];
+        float                            Phi[UDU_TAKASU_N_MAX * UDU_TAKASU_N_MAX];
+        float                            G[UDU_TAKASU_N_MAX * UDU_TAKASU_Q_MAX];
+        float                            Q[UDU_TAKASU_Q_MAX];
+        float                            x[UDU_TAKASU_N_MAX];
+
+        printf("  case: %s\n", tc->name);
+        for (i = 0; i < n * n; ++i)
+        {
+            P0[i]  = (float)tc->P0[i];
+            Phi[i] = (float)tc->Phi[i];
+        }
+        for (i = 0; i < n * r; ++i) { G[i] = (float)tc->G[i]; }
+        for (i = 0; i < r; ++i) { Q[i] = (float)tc->Q[i]; }
+        for (i = 0; i < n; ++i) { x[i] = (float)tc->x0[i]; }
+
+        CHECK_TRUE(udu(P0, U, d, n) == 0, "factorise a priori covariance");
+        CHECK_TRUE(kalman_udu_predict(x, U, d, Phi, G, Q, n, r) == 0, "kalman_udu_predict");
+
+        double x_scale = 0.0;
+        double max_ex  = 0.0;
+        for (i = 0; i < n; ++i)
+        {
+            x_scale = fmax(x_scale, fabs(tc->x_post[i]));
+            max_ex  = fmax(max_ex, fabs((double)x[i] - tc->x_post[i]));
+        }
+        CHECK_NEAR(max_ex / x_scale, 0.0, tol_rel_x, "state Phi*x, max error / max |x|");
+        CHECK_NEAR(udu_max_rel_err(U, d, n, tc->P_post), 0.0, tol_rel_P,
+                   "predicted P, max error / sqrt(Pii Pjj)");
+
+        /* The factors stay a valid UDU' pair: positive d, which every later
+           update relies on. */
+        bool d_pos = true;
+        for (i = 0; i < n; ++i) { d_pos = d_pos && (d[i] > 0.0f); }
+        CHECK_TRUE(d_pos, "predicted d stays positive");
+    }
+}
+
 int main(void)
 {
     scenario_stationary();
@@ -14852,6 +15458,7 @@ int main(void)
     scenario_magnetic_model_from_position();
     scenario_mag_bias_estimation();
     scenario_mag_bias_circle_drive();
+    scenario_mag_bias_transient_disturbance();
     scenario_zero_rotation_bias();
     scenario_gnss_moving_delayed();
     scenario_subepoch_age();
@@ -14937,6 +15544,8 @@ int main(void)
     scenario_time_jump_reset_reacquires();
     scenario_time_source_restart_recovers();
     scenario_fuse_rejects_bad_noise();
+    scenario_fuse_rejects_undecorrelatable_fix();
+    scenario_imu_out_of_range();
     scenario_origin_shift();
     scenario_degenerate_process_noise();
     scenario_set_world_model();
@@ -14956,10 +15565,13 @@ int main(void)
     scenario_chi2_disable();
     scenario_chi2_reject_alpha();
     scenario_chi2_outlier_swarm();
+    scenario_udu_vs_takasu();
+    scenario_udu_predict_vs_reference();
     scenario_mag_disturbance_diagnostics();
     scenario_nhc_lateral();
     scenario_gnss_pos_llh_input();
     scenario_geodetic_origin();
+    scenario_earth_refresh_scheduling();
     scenario_init_llh_vel_ned();
     scenario_get_latlonh_accessor();
     scenario_api_and_config_guards();

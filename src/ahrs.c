@@ -778,6 +778,15 @@ static bool ahrs_static_variance_update(ahrs_t* a, const float gyr_rps[3], const
     return a->static_var_ok;
 }
 
+/* |sqrt(norm2) - ref| <= tol evaluated on the squared norm, so a threshold
+ * gate on a vector length costs no square root. NaN fails the test. */
+static inline bool ahrs_norm2_within(float norm2, float ref, float tol)
+{
+    const float lo = ref - tol;
+    const float hi = ref + tol;
+    return norm2 >= ((lo > 0.0f) ? lo * lo : 0.0f) && norm2 <= hi * hi;
+}
+
 /* Velocity-blind auto-ZARU fallback: the same criteria as ins's own
  * auto-ZUPT/ZARU detector MINUS the velocity check this filter cannot do, so it
  * also arms during genuine constant-velocity cruise. Returns true for the whole
@@ -800,17 +809,17 @@ static bool ahrs_auto_zaru_detect(ahrs_t* a, const float gyr_rps[3], const float
         return false;
     }
 
-    const float gyr_c[3] = {gyr_rps[0] - a->gyr_bias_rps[0], gyr_rps[1] - a->gyr_bias_rps[1],
-                            gyr_rps[2] - a->gyr_bias_rps[2]};
-    const float gyr_norm = SQRTF(qsquare(gyr_c[0]) + qsquare(gyr_c[1]) + qsquare(gyr_c[2]));
-    const float acc_norm =
-        SQRTF(qsquare(acc_mps2[0]) + qsquare(acc_mps2[1]) + qsquare(acc_mps2[2]));
+    const float gyr_c[3]  = {gyr_rps[0] - a->gyr_bias_rps[0], gyr_rps[1] - a->gyr_bias_rps[1],
+                             gyr_rps[2] - a->gyr_bias_rps[2]};
+    const float gyr_norm2 = qsquare(gyr_c[0]) + qsquare(gyr_c[1]) + qsquare(gyr_c[2]);
+    const float acc_norm2 = qsquare(acc_mps2[0]) + qsquare(acc_mps2[1]) + qsquare(acc_mps2[2]);
     /* The window is fed unconditionally and its verdict applied after the
        dwell timer has started, not folded into is_static -- same latency
        reasoning as ins.c's ins_auto_zupt_detect, see there. */
     const bool var_static = ahrs_static_variance_update(a, gyr_rps, acc_mps2, t);
-    const bool is_static  = (gyr_norm <= a->cfg.auto_zaru_static_gyr_rps) &&
-                           (fabsf(acc_norm - AHRS_GRAVITY) <= a->cfg.auto_zaru_static_acc_mps2);
+    const bool is_static =
+        (gyr_norm2 <= qsquare(a->cfg.auto_zaru_static_gyr_rps)) &&
+        ahrs_norm2_within(acc_norm2, AHRS_GRAVITY, a->cfg.auto_zaru_static_acc_mps2);
 
     if (!is_static)
     {
@@ -855,6 +864,7 @@ static bool ahrs_auto_zaru_detect(ahrs_t* a, const float gyr_rps[3], const float
  * ============================================================================
  */
 
+/* @satisfies REQ-AHRS-030 */
 static void ahrs_check_health(ahrs_t* a)
 {
     const int n = a->n;
@@ -877,6 +887,14 @@ static void ahrs_check_health(ahrs_t* a)
             a->is_initialized = false;
             return;
         }
+    }
+    /* The gyro bias is state of its own: it turns non-finite from a sample that
+       is finite but absurd (a gyro value near FLT_MAX), while the quaternion
+       and the covariance only follow one epoch later. */
+    if (!ins_vec3_finite(a->gyr_bias_rps))
+    {
+        LOG_ERROR("ahrs: health check failed (non-finite gyro bias), filter shut down");
+        a->is_initialized = false;
     }
 }
 
@@ -914,15 +932,26 @@ static void ahrs_check_overconfidence(ahrs_t* a)
         const float p = ahrs_att_var(a, i);
         if (p < minvar) { minvar = p; }
     }
-    const float att = RAD2DEG(SQRTF(minvar));
-    if (att < a->min_att_stddev_deg) { a->min_att_stddev_deg = att; }
-    if (att < AHRS_OVERCONF_ATT_STDDEV_DEG)
+    /* Compared as a variance: the square root is only taken for a new minimum
+       or the warning. A negative variance never counts as overconfident. */
+    const float min_prev_deg = a->min_att_stddev_deg;
+    const float min_prev_rad = DEG2RAD(min_prev_deg);
+    const float floor_rad    = DEG2RAD(AHRS_OVERCONF_ATT_STDDEV_DEG);
+    if (minvar >= 0.0f && minvar < qsquare(min_prev_rad))
+    {
+        const float att_rad   = SQRTF(minvar);
+        a->min_att_stddev_deg = RAD2DEG(att_rad);
+    }
+    if (minvar >= 0.0f && minvar < qsquare(floor_rad))
     {
         if (!a->overconfident)
         {
+            const float att_rad = SQRTF(minvar);
+            const float att_deg = RAD2DEG(att_rad);
+            (void)att_deg; /* log only */
             LOG_WARN("ahrs: covariance overconfidence detected (att %.2g deg 1-sigma) -- "
                      "possible covariance collapse",
-                     (double)att);
+                     (double)att_deg);
         }
         a->overconfident = true;
         a->n_overconfident++;
@@ -932,7 +961,7 @@ static void ahrs_check_overconfidence(ahrs_t* a)
 /* IMU loss (REQ-AHRS-029): the rotation of the gap is unknown, so the filter
  * stops. Only the gyro bias survives, with its 1-sigma widened and clamped to
  * the cold-start prior, for the caller to seed the restart with. */
-/* @satisfies REQ-AHRS-029 */
+/* @satisfies REQ-AHRS-029 REQ-AHRS-030 */
 void ahrs_stop_imu_loss(ahrs_t* a)
 {
     if (a == NULL || !a->is_initialized) { return; }
@@ -945,8 +974,11 @@ void ahrs_stop_imu_loss(ahrs_t* a)
             fminf(INS_DEFAULT_BIAS_CARRY_STDDEV_INFLATION * SQRTF(ahrs_att_var(a, off + i)),
                   a->cfg.gyr_bias_init_stddev_rps[i]);
     }
-    a->bias_carry.valid = true;
-    a->is_initialized   = false;
+    /* A carry that is not finite would make every restart fail in ahrs_init,
+       and nothing would ever replace it: keep none then. */
+    a->bias_carry.valid = ins_vec3_finite(a->bias_carry.gyr_bias_rps) &&
+                          ins_vec3_finite(a->bias_carry.gyr_bias_stddev_rps);
+    a->is_initialized = false;
     LOG_WARN("ahrs: IMU lost, filter stopped, gyro bias kept for the restart");
 }
 
@@ -997,10 +1029,11 @@ int ahrs_predict_step(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const
        with NaN is false, so the chi2/downweighting logic is blind to them and
        one corrupt sample would poison the state. Drop the epoch instead; the
        next epoch's dt spans the gap, which the IMU-loss gate handles. */
-    if (!ins_vec3_finite(gyr_rps) || !ins_vec3_finite(acc_mps2))
+    if (!ins_vec3_within(gyr_rps, INS_IMU_GYR_ABS_MAX_RPS) ||
+        !ins_vec3_within(acc_mps2, INS_IMU_ACC_ABS_MAX_MPS2))
     {
         a->n_invalid_input++;
-        LOG_WARN("ahrs: non-finite gyro/accel input dropped (%u total since init)",
+        LOG_WARN("ahrs: non-finite or out-of-range gyro/accel input dropped (%u total since init)",
                  (unsigned int)a->n_invalid_input);
         a->step_ctx.active = false;
         return AHRS_EPOCH_DROPPED;
@@ -1135,11 +1168,14 @@ void ahrs_correct_step(ahrs_t* a)
        uncertainty are large enough to matter. */
     if (a->is_initialized && a->cfg.mode == AHRS_MODE_AHRS)
     {
-        const float mag_gap_sec    = time_diff_sec(t, a->t_last_mag_fusion);
-        const float yaw_stddev_deg = RAD2DEG(SQRTF(ahrs_att_var(a, 2)));
-        if (mag_gap_sec >= AHRS_LOG_MAG_GAP_WARN_SEC &&
-            yaw_stddev_deg >= AHRS_LOG_YAW_STDDEV_WARN_DEG)
+        const float mag_gap_sec  = time_diff_sec(t, a->t_last_mag_fusion);
+        const float yaw_var_rad2 = ahrs_att_var(a, 2);
+        const float yaw_warn_rad = DEG2RAD(AHRS_LOG_YAW_STDDEV_WARN_DEG);
+        if (mag_gap_sec >= AHRS_LOG_MAG_GAP_WARN_SEC && yaw_var_rad2 >= qsquare(yaw_warn_rad))
         {
+            const float yaw_stddev_rad = SQRTF(yaw_var_rad2);
+            const float yaw_stddev_deg = RAD2DEG(yaw_stddev_rad);
+            (void)yaw_stddev_deg; /* log only */
             const bool  first_warn = (a->log_state.t_last_mag_gap_warn == 0);
             const float since_warn_sec =
                 first_warn ? 0.0f : time_diff_sec(t, a->log_state.t_last_mag_gap_warn);
@@ -1158,15 +1194,18 @@ void ahrs_correct_step(ahrs_t* a)
            divergence even while nominally aided. */
         if (a->log_state.t_yaw_stddev_window == 0)
         {
+            const float yaw_stddev_rad         = SQRTF(yaw_var_rad2);
             a->log_state.t_yaw_stddev_window   = t;
-            a->log_state.yaw_stddev_window_deg = yaw_stddev_deg;
+            a->log_state.yaw_stddev_window_deg = RAD2DEG(yaw_stddev_rad);
         }
         else
         {
             const float window_sec = time_diff_sec(t, a->log_state.t_yaw_stddev_window);
             if (window_sec >= AHRS_LOG_RUNAWAY_WINDOW_SEC)
             {
-                const float growth_deg = yaw_stddev_deg - a->log_state.yaw_stddev_window_deg;
+                const float yaw_stddev_rad = SQRTF(yaw_var_rad2);
+                const float yaw_stddev_deg = RAD2DEG(yaw_stddev_rad);
+                const float growth_deg     = yaw_stddev_deg - a->log_state.yaw_stddev_window_deg;
                 if (growth_deg >= AHRS_LOG_YAW_RUNAWAY_DEG)
                 {
                     LOG_WARN("ahrs: yaw stddev runaway: grew %.1f deg in %.1f s (%.2f deg/s) "

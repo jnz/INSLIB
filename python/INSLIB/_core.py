@@ -886,7 +886,9 @@ class _Base:
         reference becomes the full WMM NED vector (declination included),
         so yaw is estimated relative to TRUE north, and the field-strength
         disturbance gate is armed. Callable at any time, e.g. on the first
-        GNSS fix. ``year`` is a decimal year (e.g. 2026.5)."""
+        GNSS fix. ``year`` is a decimal year (e.g. 2026.5). One call is
+        enough: the filter keeps the model current at its own position as
+        it travels, for the AHRS heading as well."""
         self._c("set_magnetic_model_position")(
             self._h, float(lat_rad), float(lon_rad), float(year))
 

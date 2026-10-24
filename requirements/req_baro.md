@@ -128,10 +128,11 @@ shall be rejected for a non-finite or implausible anchor pressure.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-007
-- **Verification:** Test: tests/test_baro.c:scenario_baro_nan_inputs
+- **Verification:** Test: tests/test_baro.c:scenario_baro_nan_inputs; Test: tests/test_baro.c:scenario_baro_accel_out_of_range
 
 baro_alt_update shall drop epochs with non-finite accelerometer or
-quaternion input and ignore non-finite or implausible pressure
+quaternion input, or an accelerometer component beyond
+INS_IMU_ACC_ABS_MAX_MPS2 (REQ-NAV-018) and ignore non-finite or implausible pressure
 samples (counting both in n_invalid_input), continuing normally with
 the next valid data.
 

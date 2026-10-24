@@ -14,11 +14,28 @@ yaw), accelerometer bias and gyroscope bias.
 
 - **Status:** implemented
 - **Parent:** REQ-SYS-001
-- **Verification:** Inspection: covariance stored as U/d in ins_t, fusion via kalman_udu (Bierman), prediction via kalman_udu_predict (Thornton)
+- **Verification:** Inspection: covariance stored as U/d in ins_t, fusion via kalman_udu (Bierman), prediction via kalman_udu_predict (Thornton); Test: tests/test_ins_core.c:scenario_udu_vs_takasu; Test: tests/test_ins_core.c:scenario_udu_predict_vs_reference
 
 The error-state covariance shall be maintained as a UDU ("square
 root") factorisation and updated with the Bierman/Thornton routines
 for numerical robustness in single precision.
+
+A measurement with a fully correlated covariance R shall give the same
+state and covariance update as a conventional Kalman filter computed in
+double precision. The verification compares the decorrelation and UDU
+update pipeline of ins_fuse() in single precision with a Takasu/Cholesky
+reference update (scripts/generate_udu_takasu_vectors.py, committed as
+tests/udu_takasu_vectors.h) for dense R, with the correlation dropped as
+a negative control. The prediction shall equal the textbook form
+P = Phi P Phi' + G diag(Q) G' and x = Phi x, verified against a double
+precision evaluation for a dense Phi, a dense G with as many noise columns
+as states and a sparse G with fewer.
+
+The update comparison also covers a state covariance whose standard
+deviations span seven decades and a measurement covariance that is nearly
+singular (correlation 1 - 1e-4 and 1 - 1e-6). A near-singular covariance
+may be refused as not positive definite (REQ-NAV-093), anything the
+pipeline accepts shall match the reference.
 
 ## REQ-NAV-003 — Strapdown integration
 
@@ -351,7 +368,7 @@ of injecting zero process noise.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-007
-- **Verification:** Test: tests/test_ins_core.c:scenario_nan_inf_inputs
+- **Verification:** Test: tests/test_ins_core.c:scenario_nan_inf_inputs; Test: tests/test_ins_core.c:scenario_imu_out_of_range
 
 ins_update shall validate every consumed measurement field for
 finiteness before any math: non-finite sensor payloads invalidate the
@@ -362,6 +379,14 @@ ins_diag_t.n_invalid_input. This covers the external attitude hint
 (REQ-NAV-048) as well, whose angles and gyro biases are consumed
 without a residual or a chi2 gate and would otherwise propagate a
 non-finite value straight into the nominal state.
+
+An accelerometer or gyroscope sample with a component beyond
+INS_IMU_ACC_ABS_MAX_MPS2 respectively INS_IMU_GYR_ABS_MAX_RPS
+(sensor_defaults.h) shall be treated like a non-finite one: the block is
+invalidated and counted. The bounds are far outside what any sensor of
+this class reports and exist for the finite but absurd value (unit mix-up,
+corrupt frame, uninitialised float), which passes a finiteness test and
+rotates the attitude by an arbitrary angle within one epoch.
 
 ## REQ-NAV-019 — Diagnostics
 
@@ -551,7 +576,7 @@ independent variances and are unaffected.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-013
-- **Verification:** Test: tests/test_ins_core.c:scenario_magnetic_model_from_position
+- **Verification:** Test: tests/test_ins_core.c:scenario_magnetic_model_from_position; Test: tests/test_ins_core.c:scenario_earth_refresh_scheduling
 
 ins shall provide an interface to set the NED magnetic reference
 field from a position (latitude, longitude, decimal year) via the
@@ -570,6 +595,15 @@ unknown-heading case (REQ-NAV-048), so a filter started there still
 runs with valid roll and pitch and an honest yaw covariance instead of
 a heading seeded from an ill-conditioned declination. Fusion and the
 reference field resume on the first position outside the zone.
+
+Once set this way, ins shall keep the reference current on its own: the
+Earth parameter refresh (REQ-NAV-094) shall re-evaluate the model, with
+the decimal year given, at the filter's own position, including the dip
+pole zone handling above. It does so at initialization and
+re-acquisition as well, so a position handed in before the start is
+replaced by the filter's own one. A magnetic vector supplied through
+ins_set_world_model (REQ-NAV-032) ends this tracking until the interface
+is called again.
 
 ## REQ-NAV-028 — Magnetometer field-strength disturbance rejection
 
@@ -590,7 +624,7 @@ defeatable for an uncalibrated magnetometer.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ins_core.c:scenario_mag_bias_estimation; Test: tests/test_ins_core.c:scenario_mag_bias_circle_drive
+- **Verification:** Test: tests/test_ins_core.c:scenario_mag_bias_estimation; Test: tests/test_ins_core.c:scenario_mag_bias_circle_drive; Test: tests/test_ins_core.c:scenario_mag_bias_transient_disturbance
 
 ins shall optionally (off by default, enabled per instance at init)
 extend its error state by a 3-state body-frame magnetometer hard-iron
@@ -647,7 +681,7 @@ observation remains under investigation on the dataset side.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ins_core.c:scenario_set_world_model
+- **Verification:** Test: tests/test_ins_core.c:scenario_set_world_model; Test: tests/test_ins_core.c:scenario_earth_refresh_scheduling
 
 ins_set_world_model shall replace the gravity and/or magnetic
 reference vectors of a running filter; a NULL argument shall leave
@@ -656,6 +690,11 @@ follow the updated reference (the estimated yaw converges to the new
 horizontal field direction). Unlike the WMM path (REQ-NAV-027) no
 field-strength gate is armed -- the caller supplies raw reference
 vectors in units of their choice.
+
+A vector supplied this way belongs to the caller: the Earth parameter
+refresh (REQ-NAV-094) shall never overwrite it, for the rest of the
+filter's life (until the next ins_init), and a magnetic vector ends the
+model tracking of REQ-NAV-027.
 
 ## REQ-NAV-033 — Startup stream-coherence gate
 
@@ -3075,3 +3114,52 @@ times age along the track. On the KF-GINS car datasets (200 Hz IMU,
 about half of the total, and a -2.5 ms offset in the time-shift test.
 Snapping to the nearest history entry instead of interpolating leaves up
 to half a grid step (10 ms) of the same error for any delay.
+
+## REQ-NAV-093 — A measurement with an unusable noise model is discarded without effect
+
+- **Status:** verified
+- **Parent:** REQ-NAV-002
+- **Verification:** Test: tests/test_ins_core.c:scenario_fuse_rejects_undecorrelatable_fix
+
+A measurement whose noise model is unusable shall be discarded as a whole,
+without any effect on the covariance factors or the nominal state, and
+counted in n_fuse_fail. Unusable means a non-positive measurement variance
+or a correlated covariance that cannot be decorrelated (not positive
+definite, including an exactly singular one).
+
+Rationale: decorrelation overwrites its working copies of the residual,
+the sensitivity matrix and R in place and fails only part way through. The
+update that follows would then run on half-transformed inputs and corrupt
+U and d, which cannot be repaired afterwards. The verification feeds one
+filter a GNSS fix with an indefinite and with an exactly singular
+covariance and compares U, d and the nominal state bitwise with a twin
+that received the same IMU stream without the fix.
+
+## REQ-NAV-094 — Earth parameter refresh outside the worst-case epoch
+
+- **Status:** verified
+- **Parent:** REQ-SYS-004
+- **Verification:** Test: tests/test_ins_core.c:scenario_earth_refresh_scheduling
+
+The cached Earth parameters (the curvature terms of the latitude,
+longitude and height book-keeping, gravity unless the caller supplied it,
+and the World Magnetic Model reference while it is tracked, REQ-NAV-027)
+shall be refreshed once the accumulated travel exceeds
+INS_EARTH_REFRESH_DIST_M. The refresh shall not run in an epoch that
+propagates the covariance or runs a Kalman measurement update. It shall
+be deferred to the next epoch that does neither, and split into stages,
+at most one stage per such epoch. Once the travel since the last
+curvature refresh exceeds INS_EARTH_REFRESH_FORCE_FACTOR times
+INS_EARTH_REFRESH_DIST_M, all pending stages shall run at once,
+whatever the epoch. Initialization and re-acquisition refresh all stages
+at once, since the position they set can be far from the cached one.
+
+Rationale: the trigonometry of a refresh is small, but it used to land
+wherever the travel crossed the threshold, including the epoch that
+fuses a GNSS fix, the most expensive epoch there is. With the IMU running
+faster than the covariance prediction and the aiding, free epochs come
+every few milliseconds, so the deferral costs centimetres of travel, and
+the cached values change by only about 1.6e-5 relative per 100 m. The
+forced refresh bounds the staleness for a configuration that never leaves
+a free epoch (a covariance prediction at the IMU rate, say). That
+configuration gets the old behaviour back, at a ten times lower rate.

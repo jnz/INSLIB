@@ -20,6 +20,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <float.h>
 
 #include "ahrs.h"
 #include "nav_suite.h"
@@ -1757,6 +1758,165 @@ static void scenario_suite_heading_cross_check(void)
                "ahrs followed the disturbed field [deg]");
     CHECK_TRUE(s.log_state.t_last_yaw_warn != 0, "heading cross-check warning raised");
 #undef HEADING_STEP
+}
+
+/* ---------------------------------------------------------------------------
+ * Scenario 5f: what nav_suite_get_rpy() reports for yaw when ins, the
+ * magnetometer AHRS and the ARS DISAGREE about the heading (REQ-SUITE-005,
+ * REQ-SUITE-022)
+ *
+ * scenario_suite_heading_switch_no_jump shows the hand-off is smooth while
+ * the estimators agree, and nothing reconciles them otherwise. This pins down
+ * what a consumer gets when they do not. ins is held on the true heading by
+ * an external aid, the compass is disturbed by 25 deg, the AHRS follows it
+ * (the setup of REQ-SUITE-023). Then, in turn:
+ *   ins down:   the suite reports the AHRS, so the heading steps by the
+ *               disturbance (nothing carries ins's heading into the AHRS),
+ *   AHRS down:  the suite falls back to the ARS carried on the last 3D
+ *               heading (REQ-SUITE-022), so it steps back to ins's heading
+ *               and not to the AHRS's.
+ * The yaw therefore moves 25 deg and back within one outage chain. A
+ * consumer that cannot take a heading step has to watch the heading source
+ * (nav_suite_get_rpy_ins/_ahrs/_ars and nav_suite_get_mode) and not just
+ * nav_suite_get_rpy().
+ * ---------------------------------------------------------------------------
+ */
+
+static void heading_disagree_epoch(nav_suite_t* s, ahrs_time_us_t* t, int i, const ins_init_t* init,
+                                   const float f_b[3], const float mag_n[3], float yaw_mag,
+                                   float yaw_true, bool ins_aid, bool with_mag)
+{
+    ins_measurements_t m;
+    float              mag_b[3], dummy[3];
+
+    *t += US_PER_SEC / 100;
+    memset(&m, 0, sizeof(m));
+    m.timestamp        = *t;
+    m.strapdown_dt_sec = 0.01f;
+    m.acc.is_valid     = true;
+    m.gyr.is_valid     = true;
+    memcpy(m.acc.data, f_b, 3 * sizeof(float));
+    if (with_mag)
+    {
+        body_meas_from_rpy(0.0f, 0.0f, yaw_mag, dummy, mag_n, mag_b);
+        m.mag.is_valid = true;
+        memcpy(m.mag.data, mag_b, sizeof(mag_b));
+        m.mag.Qll_diag[0] = m.mag.Qll_diag[1] = m.mag.Qll_diag[2] = 2500.0f;
+    }
+    if (ins_aid)
+    {
+        m.yaw.yaw_rad    = yaw_true;
+        m.yaw.stddev_rad = DEG2RAD(0.5f);
+        m.yaw.is_valid   = true;
+        if ((i % 100) == 0)
+        {
+            m.gnss_pos.is_valid = true;
+            memcpy(m.gnss_pos.llh, init->llh, sizeof(double) * 3);
+            m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.25f;
+            m.gnss_pos.Qll_ned[8]                         = 1.0f;
+        }
+    }
+    nav_suite_update(s, &m);
+}
+
+static void scenario_suite_heading_switch_disagreeing(void)
+{
+    printf("\n-- scenario: suite heading when ins, AHRS and ARS disagree "
+           "(REQ-SUITE-005, REQ-SUITE-022) --\n");
+
+    const float yaw_true      = DEG2RAD(30.0f);
+    const float yaw_disturbed = DEG2RAD(55.0f);
+    const float mag_n[3]      = {20.0f, 0.0f, 44.0f};
+    float       f_b[3];
+    body_meas_from_rpy(0.0f, 0.0f, 0.0f, f_b, (const float*)0, (float*)0);
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ahrs_time_us_t t               = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
+    init.pos_init_stddev_m         = 1.0f;
+    init.vel_init_stddev_mps       = 0.1f;
+    init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
+    init.rpy_init_stddev_rad[1]    = DEG2RAD(3.0f);
+    init.acc_bias_init_stddev_mps2 = 0.05f;
+    init.gyr_bias_init_stddev_rps  = DEG2RAD(0.05f);
+    init.pos_pred_stddev_m_sqrts   = 0.01f;
+    init.vel_pred_stddev_mps_sqrts = 0.05f;
+    init.rpy_pred_stddev_rad_sqrts = DEG2RAD(0.01f);
+    init.zero_vel_stddev_mps       = 0.01f;
+    init.zero_rot_stddev_rps       = DEG2RAD(0.001f);
+    init.magnetic_n[0]             = mag_n[0];
+    init.magnetic_n[1]             = mag_n[1];
+    init.magnetic_n[2]             = mag_n[2];
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.kalman_update_dt_sec               = 0.01f;
+    opt.max_prediction_time_sec            = 0.5f;
+    opt.gnss_max_horizontal_pos_stddev_m   = 10.0f;
+    opt.gnss_max_vertical_pos_stddev_m     = 20.0f;
+    opt.gnss_max_horizontal_vel_stddev_mps = 1.0f;
+    opt.gnss_max_vertical_vel_stddev_mps   = 2.0f;
+    opt.magnetometer_min_delay_ms          = 200;
+    opt.auto_init                          = true;
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+
+    int   i;
+    float roll, pitch, yaw, ins_yaw, ahrs_yaw;
+
+    /* Phase 1: everything agrees, then the compass is disturbed. */
+    for (i = 0; i < 1000; ++i)
+    {
+        heading_disagree_epoch(&s, &t, i, &init, f_b, mag_n, yaw_true, yaw_true, true, true);
+    }
+    for (i = 0; i < 6000; ++i)
+    {
+        heading_disagree_epoch(&s, &t, i, &init, f_b, mag_n, yaw_disturbed, yaw_true, true, true);
+    }
+    CHECK_TRUE(ins_is_ready(&s.ins) && s.ahrs.is_initialized, "ins and AHRS running");
+    CHECK_TRUE(nav_suite_get_rpy(&s, &roll, &pitch, &yaw), "suite rpy from ins");
+    CHECK_TRUE(ins_get_rpy(&s.ins, &roll, &pitch, &ins_yaw), "ins yaw");
+    CHECK_TRUE(ahrs_get_rpy(&s.ahrs, &roll, &pitch, &ahrs_yaw), "AHRS yaw");
+    CHECK_NEAR(RAD2DEG(yaw), RAD2DEG(ins_yaw), 0.01, "ins ready: suite reports ins [deg]");
+    CHECK_NEAR(RAD2DEG(ins_yaw), RAD2DEG(yaw_true), 2.0, "ins on the true heading [deg]");
+    CHECK_NEAR(RAD2DEG(ahrs_yaw), RAD2DEG(yaw_disturbed), 5.0, "AHRS on the disturbed field [deg]");
+    CHECK_TRUE(s.yaw_carry.valid, "heading latched for the ARS fallback");
+    const float yaw_ins_ready = yaw;
+
+    /* Phase 2: ins goes down (a quality-loss re-arm or health reset leaves
+       exactly this) and no fix or heading aid comes back. */
+    s.ins.is_initialized = false;
+    s.ins.is_collecting  = true;
+    for (i = 0; i < 50; ++i)
+    {
+        heading_disagree_epoch(&s, &t, i + 1, &init, f_b, mag_n, yaw_disturbed, yaw_true, false,
+                               true);
+    }
+    CHECK_TRUE(!ins_is_ready(&s.ins) && s.ahrs.is_initialized, "ins down, AHRS up");
+    CHECK_TRUE(nav_suite_get_rpy(&s, &roll, &pitch, &yaw), "suite rpy from the AHRS");
+    CHECK_TRUE(ahrs_get_rpy(&s.ahrs, &roll, &pitch, &ahrs_yaw), "AHRS yaw");
+    CHECK_NEAR(RAD2DEG(yaw), RAD2DEG(ahrs_yaw), 0.01, "ins down: suite reports the AHRS [deg]");
+    CHECK_NEAR(RAD2DEG(ins_angle_diff(yaw, yaw_ins_ready)), 25.0, 5.0,
+               "ins -> AHRS: heading steps by the disturbance [deg]");
+
+    /* Phase 3: the AHRS goes down as well (compass lost, no magnetometer
+       samples any more). */
+    s.ahrs.is_initialized = false;
+    for (i = 0; i < 50; ++i)
+    {
+        heading_disagree_epoch(&s, &t, i + 1, &init, f_b, mag_n, yaw_disturbed, yaw_true, false,
+                               false);
+    }
+    CHECK_TRUE(!s.ahrs.is_initialized, "AHRS down");
+    CHECK_TRUE(nav_suite_get_rpy(&s, &roll, &pitch, &yaw), "suite rpy from the ARS");
+    CHECK_NEAR(RAD2DEG(ins_angle_diff(yaw, yaw_ins_ready)), 0.0, 3.0,
+               "AHRS -> ARS: heading steps back onto the carried ins heading [deg]");
 }
 
 /* ---------------------------------------------------------------------------
@@ -4093,7 +4253,7 @@ static void scenario_ahrs_bias_diagnostics(void)
     int i;
 #define AHRS_DIAG_RUN(SECONDS)                                         \
     do {                                                               \
-        int n_ = (int)((SECONDS)*100.0f + 0.5f);                       \
+        int n_ = (int)((SECONDS) * 100.0f + 0.5f);                     \
         for (i = 0; i < n_; ++i)                                       \
         {                                                              \
             t += US_PER_SEC / 100;                                     \
@@ -5109,6 +5269,109 @@ static void scenario_suite_mag_model_before_ahrs_start(void)
     CHECK_TRUE(!s.mag_model.valid, "re-init forgets the position");
 }
 
+/* REQ-SUITE-029, REQ-NAV-027: one position call is enough. ins re-evaluates
+ * the WMM at its own position as it travels, nav_suite follows every such
+ * refresh in the same epoch and hands the new position to the running AHRS.
+ * The platform flies north at 100 m/s for 40 s, level, yaw 0. */
+static void scenario_suite_mag_model_follows_ins(void)
+{
+    printf("\n-- scenario: WMM position follows the ins position (REQ-SUITE-029) --\n");
+
+    const double lat = 49.867378, lon = 8.638174, h = 150.0;
+    const float  year = 2026.5f;
+    float        mag_n[3], g_n[3];
+    magnetic_field_ned_uT((float)lat, (float)lon, year, mag_n);
+    ins_gravity_ned((float)(lat * M_PI / 180.0), (float)h, g_n);
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    init.llh[0]     = lat * M_PI / 180.0;
+    init.llh[1]     = lon * M_PI / 180.0;
+    init.llh[2]     = h;
+    init.vel_ned[0] = 100.0f;
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.allow_unlimited_deadreckoning = true;
+    /* noiseless constant velocity reads as a standstill */
+    opt.auto_zupt_disable = true;
+
+    static nav_suite_t s; /* keep the large struct off the stack */
+    memset(&s, 0, sizeof(s));
+    ins_time_us_t t = 1000000;
+    init.time       = t;
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+    nav_suite_set_magnetic_model_position(&s, init.llh[0], init.llh[1], year);
+
+    const float f_b[3]       = {0.0f, 0.0f, -g_n[2]};
+    int         n_refresh    = 0; /* ins model refreshes seen */
+    int         n_not_follow = 0; /* refreshes nav_suite did not follow at once */
+    uint32_t    last         = s.ins.mag_model_refreshes;
+    int         i;
+    for (i = 0; i < 4000; ++i)
+    {
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        t += US_PER_SEC / 100;
+        m.timestamp        = t;
+        m.strapdown_dt_sec = 0.01f;
+        m.acc.is_valid     = true;
+        m.gyr.is_valid     = true;
+        memcpy(m.acc.data, f_b, sizeof(f_b));
+        if ((i % 10) == 0) /* leaves free epochs for the refresh stages */
+        {
+            m.mag.is_valid = true;
+            memcpy(m.mag.data, mag_n, sizeof(mag_n));
+            m.mag.Qll_diag[0] = m.mag.Qll_diag[1] = m.mag.Qll_diag[2] = 1.0f;
+        }
+        nav_suite_update(&s, &m);
+        if (s.ins.mag_model_refreshes != last)
+        {
+            last = s.ins.mag_model_refreshes;
+            n_refresh++;
+            if (s.mag_model.ins_refreshes != last) { n_not_follow++; }
+        }
+    }
+
+    float roll, pitch, yaw;
+    CHECK_TRUE(s.ins.is_initialized, "ins running");
+    CHECK_TRUE(nav_suite_get_rpy_ahrs(&s, &roll, &pitch, &yaw), "AHRS running");
+    printf("    %d model refreshes over %.0f m\n", n_refresh,
+           (s.ins.latlonh[0] - init.llh[0]) * 6.37e6);
+    CHECK_TRUE(n_refresh >= 30, "ins refreshed the model as it travelled");
+    CHECK_TRUE(n_not_follow == 0, "nav_suite followed every refresh in its epoch");
+    CHECK_NEAR(s.mag_model.lat_rad, s.ins.latlonh[0], 150.0 / 6.37e6,
+               "kept position is the ins one, within a refresh distance");
+    CHECK_TRUE(s.mag_model.lat_rad > (float)(init.llh[0] + 3000.0 / 6.37e6),
+               "kept position moved with the vehicle");
+    const float decl =
+        magnetic_declination_deg(RAD2DEG(s.mag_model.lat_rad), RAD2DEG(s.mag_model.lon_rad), year);
+    CHECK_NEAR(RAD2DEG(s.ahrs.declination_rad), decl, 1e-4,
+               "AHRS declination is the one at the kept position");
+
+    /* A field the caller sets on ins ends the tracking (REQ-NAV-032): the
+       kept position and the AHRS stay where they are from then on, even
+       when the ins model counter moves (here by hand). */
+    ins_set_world_model(&s.ins, (const float*)0, mag_n);
+    const float lat_kept  = s.mag_model.lat_rad;
+    const float decl_kept = s.ahrs.declination_rad;
+    s.ins.mag_model_refreshes++;
+    for (i = 0; i < 1000; ++i)
+    {
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        t += US_PER_SEC / 100;
+        m.timestamp        = t;
+        m.strapdown_dt_sec = 0.01f;
+        m.acc.is_valid     = true;
+        m.gyr.is_valid     = true;
+        memcpy(m.acc.data, f_b, sizeof(f_b));
+        nav_suite_update(&s, &m);
+    }
+    CHECK_TRUE(!s.ins.mag_model_tracked, "the caller's field ended the ins tracking");
+    CHECK_NEAR(s.mag_model.lat_rad, lat_kept, 0.0, "kept position no longer follows ins");
+    CHECK_NEAR(s.ahrs.declination_rad, decl_kept, 0.0, "AHRS declination unchanged");
+}
+
 static void scenario_imu_outage_700ms(void)
 {
     int k;
@@ -5197,6 +5460,508 @@ static void scenario_imu_outage_700ms(void)
     gapscn_turn   = true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Scenario: a finite but impossible inertial sample is dropped (REQ-AHRS-010)
+ *
+ * It passes the finiteness test, so only a magnitude bound keeps one wrong
+ * gyro value from rotating the attitude by an arbitrary angle in one epoch.
+ * ---------------------------------------------------------------------------
+ */
+
+static void scenario_imu_out_of_range(void)
+{
+    printf("\n-- scenario: out-of-range IMU samples (REQ-AHRS-010) --\n");
+
+    ahrs_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode                   = AHRS_MODE_ARS;
+    cfg.rpy_init_stddev_rad[0] = DEG2RAD(5.0f);
+    cfg.rpy_init_stddev_rad[1] = DEG2RAD(5.0f);
+
+    static ahrs_t  a;
+    ahrs_time_us_t t = 1000000;
+    float          f_b[3], zero[3] = {0.0f, 0.0f, 0.0f};
+    body_meas_from_rpy(0.0f, 0.0f, 0.0f, f_b, (const float*)0, (float*)0);
+    CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "ahrs_init");
+    int i;
+    for (i = 0; i < 200; ++i)
+    {
+        t += US_PER_SEC / 100;
+        ahrs_update(&a, t, zero, f_b, (const float*)0, false);
+    }
+    float roll0, pitch0, yaw0;
+    CHECK_TRUE(ahrs_get_rpy(&a, &roll0, &pitch0, &yaw0), "attitude before");
+
+    float gyr_out[3] = {0.0f, 1.1f * INS_IMU_GYR_ABS_MAX_RPS, 0.0f};
+    float acc_out[3] = {f_b[0], 1.1f * INS_IMU_ACC_ABS_MAX_MPS2, f_b[2]};
+
+    uint32_t n0 = a.n_invalid_input;
+    t += US_PER_SEC / 100;
+    ahrs_update(&a, t, gyr_out, f_b, (const float*)0, false);
+    CHECK_TRUE(a.n_invalid_input == n0 + 1u, "a gyro value beyond the bound is dropped");
+    n0 = a.n_invalid_input;
+    t += US_PER_SEC / 100;
+    ahrs_update(&a, t, zero, acc_out, (const float*)0, false);
+    CHECK_TRUE(a.n_invalid_input == n0 + 1u, "an accel value beyond the bound is dropped");
+    n0         = a.n_invalid_input;
+    gyr_out[1] = 1.0e30f;
+    t += US_PER_SEC / 100;
+    ahrs_update(&a, t, gyr_out, f_b, (const float*)0, false);
+    CHECK_TRUE(a.n_invalid_input == n0 + 1u, "a huge gyro value is dropped");
+
+    float roll1, pitch1, yaw1;
+    CHECK_TRUE(a.is_initialized && ahrs_get_rpy(&a, &roll1, &pitch1, &yaw1),
+               "filter still running");
+    CHECK_NEAR(RAD2DEG(roll1), RAD2DEG(roll0), 0.05, "roll untouched [deg]");
+    CHECK_NEAR(RAD2DEG(pitch1), RAD2DEG(pitch0), 0.05, "pitch untouched [deg]");
+
+    const float gyr_in[3] = {0.0f, 0.9f * INS_IMU_GYR_ABS_MAX_RPS, 0.0f};
+    n0                    = a.n_invalid_input;
+    t += US_PER_SEC / 100;
+    ahrs_update(&a, t, gyr_in, f_b, (const float*)0, false);
+    CHECK_TRUE(a.n_invalid_input == n0, "a gyro value inside the bound is used");
+}
+
+/* ---------------------------------------------------------------------------
+ * Scenario: a non-finite gyro bias shuts the filter down and is never carried
+ * into a restart (REQ-AHRS-030)
+ *
+ * Found by the fuzzing below: a gyro sample near FLT_MAX is finite, so it
+ * passes the input check, and turns the bias estimate non-finite. The health
+ * check looked at the quaternion and the covariance only. When the filter was
+ * then stopped by an IMU loss it latched that bias as its restart carry, and
+ * from then on every restart was refused by ahrs_init(): the suite ran on
+ * without an ARS or AHRS for good.
+ * ---------------------------------------------------------------------------
+ */
+
+static void scenario_nonfinite_gyro_bias(void)
+{
+    printf("\n-- scenario: non-finite gyro bias (REQ-AHRS-030) --\n");
+
+    /* Standalone: the health check catches the bias state. */
+    {
+        ahrs_config_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.mode                   = AHRS_MODE_ARS;
+        cfg.rpy_init_stddev_rad[0] = DEG2RAD(5.0f);
+        cfg.rpy_init_stddev_rad[1] = DEG2RAD(5.0f);
+
+        static ahrs_t  a;
+        ahrs_time_us_t t = 1000000;
+        float          f_b[3], zero[3] = {0.0f, 0.0f, 0.0f};
+        body_meas_from_rpy(0.0f, 0.0f, 0.0f, f_b, (const float*)0, (float*)0);
+        CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "ahrs_init");
+        int i;
+        for (i = 0; i < 200; ++i)
+        {
+            t += US_PER_SEC / 100;
+            ahrs_update(&a, t, zero, f_b, (const float*)0, false);
+        }
+        CHECK_TRUE(a.is_initialized, "ARS running");
+
+        a.gyr_bias_rps[1] = NAN;
+        t += US_PER_SEC / 100;
+        ahrs_update(&a, t, zero, f_b, (const float*)0, false);
+        CHECK_TRUE(!a.is_initialized, "a non-finite gyro bias shuts the filter down");
+
+        /* An IMU loss on a filter that holds such a bias keeps no carry. */
+        CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "ahrs_init again");
+        a.gyr_bias_rps[2] = INFINITY;
+        ahrs_stop_imu_loss(&a);
+        float b[3], sd[3];
+        CHECK_TRUE(!ahrs_get_bias_carry(&a, b, sd), "no bias carry latched from a non-finite bias");
+    }
+
+    /* Suite: the bias turns non-finite, the IMU drops out, and the ARS has to
+       come back from the restart. */
+    {
+        ins_init_t     init;
+        ins_options_t  opt;
+        ahrs_time_us_t t = 1000000;
+        yaw_carry_config(&init, &opt, t);
+        static nav_suite_t s;
+        memset(&s, 0, sizeof(s));
+        CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+
+        int i;
+        for (i = 0; i < 600; ++i)
+        {
+            t += US_PER_SEC / 100;
+            yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), false, (const float*)0);
+        }
+        CHECK_TRUE(s.ars.is_initialized, "ARS running");
+
+        s.ars.gyr_bias_rps[0] = NAN;
+        t += US_PER_SEC; /* the IMU was silent for a second */
+        yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), false, (const float*)0);
+        CHECK_TRUE(!s.ars.is_initialized, "IMU loss stopped the ARS");
+        for (i = 0; i < 600; ++i)
+        {
+            t += US_PER_SEC / 100;
+            yaw_carry_epoch(&s, t, 0.0f, init_ecef(&init), false, (const float*)0);
+        }
+        float roll, pitch, yaw;
+        CHECK_TRUE(s.ars.is_initialized, "ARS restarted after the IMU loss");
+        CHECK_TRUE(nav_suite_get_rpy_ars(&s, &roll, &pitch, &yaw), "ARS attitude available");
+        CHECK_NEAR(RAD2DEG(roll), 0.0, 1.0, "restarted ARS roll [deg]");
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Scenario: seeded fuzzing of the whole suite through nav_suite_update()
+ * (REQ-SYS-007)
+ *
+ * A clean, level, GNSS/magnetometer/barometer aided stream is corrupted at
+ * random: NaN, Inf, FLT_MAX, denormals and negative or zero covariances in
+ * every input block, flags set over garbage, duplicate / backward / forward
+ * timestamps, bad dt, absurd delays. The generator is a fixed xorshift, so a
+ * failure reproduces from its seed on every machine. What is checked is what
+ * a consumer relies on and not a particular filter result:
+ *  - every getter that reports a value reports a finite one,
+ *  - a filter that claims to be running holds finite factors with d > 0,
+ *  - after the garbage stops, the suite comes back and ends on the truth.
+ * Crashes and memory errors are caught by running this under test-asan.
+ * ---------------------------------------------------------------------------
+ */
+
+typedef struct
+{
+    uint32_t s;
+} fz_rng_t;
+
+static uint32_t fz_u32(fz_rng_t* r)
+{
+    uint32_t x = r->s; /* xorshift32 */
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    r->s = x;
+    return x;
+}
+
+static float fz_unit(fz_rng_t* r) { return (float)(fz_u32(r) >> 8) * (1.0f / 16777216.0f); }
+
+static float fz_gauss(fz_rng_t* r)
+{
+    return (fz_unit(r) + fz_unit(r) + fz_unit(r) + fz_unit(r) - 2.0f) * 1.7320508f;
+}
+
+/* A value that is wrong in one of the ways a broken driver produces. */
+static float fz_bad_float(fz_rng_t* r)
+{
+    switch (fz_u32(r) % 12u)
+    {
+    case 0: return NAN;
+    case 1: return INFINITY;
+    case 2: return -INFINITY;
+    case 3: return FLT_MAX;
+    case 4: return -FLT_MAX;
+    case 5: return 1e30f;
+    case 6: return 1e-40f; /* denormal */
+    case 7: return 0.0f;
+    case 8: return -0.0f;
+    case 9: return 1e10f;
+    case 10: return -1.0f;
+    default: return 1e-30f;
+    }
+}
+
+typedef struct
+{
+    const ins_init_t* init;
+    float             f_b[3];
+    float             mag_n[3];
+    float             yaw_true;
+    ahrs_time_us_t    t_clean; /* the stream's own clock */
+    int               epoch;
+    bool              extreme_ts;
+} fz_ctx_t;
+
+static void fz_build_clean(fz_ctx_t* c, fz_rng_t* r, ins_measurements_t* m)
+{
+    float mag_b[3], dummy[3];
+    int   k;
+
+    memset(m, 0, sizeof(*m));
+    m->timestamp        = c->t_clean;
+    m->strapdown_dt_sec = 0.01f;
+    m->acc.is_valid     = true;
+    m->gyr.is_valid     = true;
+    for (k = 0; k < 3; ++k)
+    {
+        m->acc.data[k] = c->f_b[k] + 0.02f * fz_gauss(r);
+        m->gyr.data[k] = 0.0005f * fz_gauss(r);
+    }
+    body_meas_from_rpy(0.0f, 0.0f, c->yaw_true, dummy, c->mag_n, mag_b);
+    if ((c->epoch % 5) == 0) /* 20 Hz magnetometer */
+    {
+        m->mag.is_valid = true;
+        for (k = 0; k < 3; ++k) { m->mag.data[k] = mag_b[k] + 0.1f * fz_gauss(r); }
+        m->mag.Qll_diag[0] = m->mag.Qll_diag[1] = m->mag.Qll_diag[2] = 1.0f;
+    }
+    if ((c->epoch % 10) == 0) /* 10 Hz barometer */
+    {
+        m->baro.is_valid    = true;
+        m->baro.pressure_pa = pressure_at_altitude(300.0f) + 5.0f * fz_gauss(r);
+        m->baro.stddev_m    = 0.5f;
+    }
+    if ((c->epoch % 100) == 0) /* 1 Hz GNSS */
+    {
+        m->gnss_pos.is_valid = true;
+        memcpy(m->gnss_pos.llh, c->init->llh, 3 * sizeof(double));
+        m->gnss_pos.Qll_ned[0] = m->gnss_pos.Qll_ned[4] = 0.25f;
+        m->gnss_pos.Qll_ned[8]                          = 1.0f;
+        m->gnss_vel.is_valid                            = true;
+        m->gnss_vel.Qll_ned[0] = m->gnss_vel.Qll_ned[4] = m->gnss_vel.Qll_ned[8] = 0.01f;
+        m->yaw.is_valid                                                          = true;
+        m->yaw.yaw_rad                                                           = c->yaw_true;
+        m->yaw.stddev_rad                                                        = DEG2RAD(2.0f);
+    }
+}
+
+static void fz_corrupt(fz_ctx_t* c, fz_rng_t* r, ins_measurements_t* m)
+{
+    const int k = (int)(fz_u32(r) % 3u);
+    const int q = (int)(fz_u32(r) % 9u);
+
+    switch (fz_u32(r) % (c->extreme_ts ? 20u : 19u))
+    {
+    case 0: m->acc.data[k] = fz_bad_float(r); break;
+    case 1: m->gyr.data[k] = fz_bad_float(r); break;
+    case 2:
+        m->mag.is_valid = true;
+        m->mag.data[k]  = fz_bad_float(r);
+        break;
+    case 3:
+        m->baro.is_valid    = true;
+        m->baro.pressure_pa = fz_bad_float(r);
+        m->baro.stddev_m    = fz_bad_float(r);
+        break;
+    case 4:
+        m->gnss_pos.is_valid = true;
+        m->gnss_pos.llh[k]   = (double)fz_bad_float(r);
+        break;
+    case 5:
+        m->gnss_pos.is_valid   = true;
+        m->gnss_pos.Qll_ned[q] = fz_bad_float(r);
+        break;
+    case 6:
+        m->gnss_vel.is_valid   = true;
+        m->gnss_vel.vel_ned[k] = fz_bad_float(r);
+        break;
+    case 7:
+        m->gnss_vel.is_valid   = true;
+        m->gnss_vel.Qll_ned[q] = fz_bad_float(r);
+        break;
+    case 8: m->timestamp = c->t_clean - (ahrs_time_us_t)(fz_u32(r) % 1000000u); break;
+    case 9: m->timestamp = c->t_clean + (ahrs_time_us_t)fz_u32(r) * 1000; break;
+    case 10: m->timestamp = c->t_clean - 10000; break; /* repeats the last epoch */
+    case 11: m->strapdown_dt_sec = fz_bad_float(r); break;
+    case 12:
+        m->yaw.is_valid   = true;
+        m->yaw.yaw_rad    = fz_bad_float(r);
+        m->yaw.stddev_rad = fz_bad_float(r);
+        break;
+    case 13:
+        m->zero_velocity_update = (fz_u32(r) & 1u) != 0u;
+        m->zero_rotation_update = (fz_u32(r) & 1u) != 0u;
+        break;
+    case 14:
+        m->gnss_pos.is_valid = true;
+        m->gnss_delay_ms     = ((fz_u32(r) & 1u) != 0u) ? 0x7fffffff : -1000000;
+        m->gnss_delay_us     = ((fz_u32(r) & 1u) != 0u) ? 0x7fffffff : -2000000000;
+        break;
+    case 15: /* flags raised over zeroed data */
+        m->mag.is_valid = m->baro.is_valid = m->gnss_pos.is_valid = true;
+        m->gnss_vel.is_valid = m->yaw.is_valid = m->speed.is_valid = true;
+        break;
+    case 16: /* a frozen IMU: exact zeros */
+        memset(m->acc.data, 0, sizeof(m->acc.data));
+        memset(m->gyr.data, 0, sizeof(m->gyr.data));
+        break;
+    case 17: /* the clock jumps and stays there */
+        c->t_clean += (ahrs_time_us_t)(fz_u32(r) % 4000000u) - 2000000;
+        m->timestamp = c->t_clean;
+        break;
+    case 18:
+        m->gnss_leverarm_b[k] = fz_bad_float(r);
+        m->gnss_pos.is_valid  = true;
+        break;
+    default: /* 19, only with extreme_ts: far out on the time axis. A quarter
+                of the int64 range, so that the difference of any two
+                timestamps still fits: the exact ends overflow the signed
+                subtraction in the time-difference helpers (undefined
+                behaviour, reported by UBSan in nav_suite.c), i.e. the
+                valid range of a timestamp is about +-2^62 us. */
+        m->timestamp = ((fz_u32(r) & 1u) != 0u) ? INT64_MAX / 4 : INT64_MIN / 4;
+        break;
+    }
+}
+
+static bool fz_finite3(const float* v)
+{
+    return isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]);
+}
+
+/* Returns the number of invariant violations in this epoch. */
+static int fz_check_outputs(const nav_suite_t* s)
+{
+    int    bad = 0;
+    float  a[3], b[3], h, v;
+    double p[3];
+
+    if (nav_suite_get_rpy(s, &a[0], &a[1], &a[2]) && !fz_finite3(a)) { bad++; }
+    if (nav_suite_get_rpy_ins(s, &a[0], &a[1], &a[2]) && !fz_finite3(a)) { bad++; }
+    if (nav_suite_get_rpy_ahrs(s, &a[0], &a[1], &a[2]) && !fz_finite3(a)) { bad++; }
+    if (nav_suite_get_rpy_ars(s, &a[0], &a[1], &a[2]) && !fz_finite3(a)) { bad++; }
+    if (nav_suite_get_height(s, &h) && !isfinite(h)) { bad++; }
+    if (nav_suite_get_height_ellipsoid(s, &h) && !isfinite(h)) { bad++; }
+    if (nav_suite_get_baro_alt(s, &h, &v) && !(isfinite(h) && isfinite(v))) { bad++; }
+    if (ins_is_ready(&s->ins))
+    {
+        if (ins_get_position_local(&s->ins, a) && !fz_finite3(a)) { bad++; }
+        if (ins_get_velocity_ned(&s->ins, b) && !fz_finite3(b)) { bad++; }
+        if (ins_get_rpy_stddev(&s->ins, &a[0], &a[1], &a[2]) && !fz_finite3(a)) { bad++; }
+        /* range test instead of isfinite(): MinGW's macro narrows a double */
+        if (ins_get_position_ecef(&s->ins, p) &&
+            !(fabs(p[0]) <= DBL_MAX && fabs(p[1]) <= DBL_MAX && fabs(p[2]) <= DBL_MAX))
+        {
+            bad++;
+        }
+    }
+    return bad;
+}
+
+/* A filter that reports itself initialized has to hold usable factors. */
+static int fz_check_factors(const float* U, const float* d, int n)
+{
+    int i, bad = 0;
+    for (i = 0; i < n; ++i)
+    {
+        if (!(isfinite(d[i]) && d[i] > 0.0f)) { bad++; }
+    }
+    for (i = 0; i < n * n; ++i)
+    {
+        if (!isfinite(U[i])) { bad++; }
+    }
+    return bad;
+}
+
+static int fz_check_state(const nav_suite_t* s)
+{
+    int bad = 0;
+    if (s->ins.is_initialized) { bad += fz_check_factors(s->ins.U, s->ins.d, s->ins.n); }
+    if (s->ars.is_initialized) { bad += fz_check_factors(s->ars.U, s->ars.d, s->ars.n); }
+    if (s->ahrs.is_initialized) { bad += fz_check_factors(s->ahrs.U, s->ahrs.d, s->ahrs.n); }
+    return bad;
+}
+
+static void fuzz_run(uint32_t seed, int fuzz_epochs, int corrupt_permille, bool extreme_ts)
+{
+    printf("  seed %u, %d epochs, %d permille corrupt%s\n", (unsigned)seed, fuzz_epochs,
+           corrupt_permille, extreme_ts ? ", extreme timestamps" : "");
+
+    fz_rng_t rng = {seed};
+    fz_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.mag_n[0]   = 20.0f;
+    c.mag_n[2]   = 44.0f;
+    c.yaw_true   = DEG2RAD(30.0f);
+    c.extreme_ts = extreme_ts;
+    body_meas_from_rpy(0.0f, 0.0f, 0.0f, c.f_b, (const float*)0, (float*)0);
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    init.time                      = 1000000;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
+    init.pos_init_stddev_m         = 1.0f;
+    init.vel_init_stddev_mps       = 0.1f;
+    init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
+    init.rpy_init_stddev_rad[1]    = DEG2RAD(3.0f);
+    init.acc_bias_init_stddev_mps2 = 0.05f;
+    init.gyr_bias_init_stddev_rps  = DEG2RAD(0.05f);
+    init.pos_pred_stddev_m_sqrts   = 0.01f;
+    init.vel_pred_stddev_mps_sqrts = 0.05f;
+    init.rpy_pred_stddev_rad_sqrts = DEG2RAD(0.01f);
+    init.zero_vel_stddev_mps       = 0.01f;
+    init.zero_rot_stddev_rps       = DEG2RAD(0.001f);
+    init.magnetic_n[0]             = c.mag_n[0];
+    init.magnetic_n[2]             = c.mag_n[2];
+    c.init                         = &init;
+    c.t_clean                      = init.time;
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.kalman_update_dt_sec               = 0.01f;
+    opt.max_prediction_time_sec            = 0.5f;
+    opt.gnss_max_horizontal_pos_stddev_m   = 10.0f;
+    opt.gnss_max_vertical_pos_stddev_m     = 20.0f;
+    opt.gnss_max_horizontal_vel_stddev_mps = 1.0f;
+    opt.gnss_max_vertical_vel_stddev_mps   = 2.0f;
+    opt.magnetometer_min_delay_ms          = 200;
+    opt.auto_init                          = true;
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+
+    int bad_out = 0, bad_state = 0, n_corrupt = 0;
+    int i;
+    for (i = 0; i < fuzz_epochs; ++i)
+    {
+        ins_measurements_t m;
+        c.epoch = i;
+        c.t_clean += 10000;
+        fz_build_clean(&c, &rng, &m);
+        if ((int)(fz_u32(&rng) % 1000u) < corrupt_permille)
+        {
+            fz_corrupt(&c, &rng, &m);
+            n_corrupt++;
+            if ((fz_u32(&rng) % 4u) == 0u) { fz_corrupt(&c, &rng, &m); } /* sometimes two */
+        }
+        nav_suite_update(&s, &m);
+        bad_out += fz_check_outputs(&s);
+        if ((i % 10) == 0) { bad_state += fz_check_state(&s); }
+    }
+    printf("    %d corrupted epochs, %d output violations, %d state violations\n", n_corrupt,
+           bad_out, bad_state);
+    CHECK_TRUE(bad_out == 0, "every reported value is finite");
+    CHECK_TRUE(bad_state == 0, "running filters keep finite factors with d > 0");
+
+    /* The garbage stops. The suite has to come back and end on the truth;
+       a clock left far away by a jump is just a new time base. */
+    for (i = 0; i < 6000; ++i) /* 60 s */
+    {
+        ins_measurements_t m;
+        c.epoch = fuzz_epochs + i;
+        c.t_clean += 10000;
+        fz_build_clean(&c, &rng, &m);
+        nav_suite_update(&s, &m);
+    }
+    float roll, pitch, yaw;
+    CHECK_TRUE(ins_is_ready(&s.ins), "ins is ready again after the garbage");
+    CHECK_TRUE(nav_suite_get_rpy_ins(&s, &roll, &pitch, &yaw), "ins attitude available");
+    CHECK_NEAR(RAD2DEG(roll), 0.0, 3.0, "ins roll back on the truth [deg]");
+    CHECK_NEAR(RAD2DEG(pitch), 0.0, 3.0, "ins pitch back on the truth [deg]");
+    CHECK_NEAR(RAD2DEG(ins_angle_diff(yaw, c.yaw_true)), 0.0, 5.0,
+               "ins yaw back on the truth [deg]");
+    CHECK_TRUE(nav_suite_get_rpy_ars(&s, &roll, &pitch, &yaw), "ARS attitude available");
+    CHECK_NEAR(RAD2DEG(roll), 0.0, 3.0, "ARS roll back on the truth [deg]");
+    CHECK_TRUE(fz_check_outputs(&s) == 0 && fz_check_state(&s) == 0, "clean again at the end");
+}
+
+static void scenario_suite_fuzz(void)
+{
+    printf("\n-- scenario: seeded fuzzing of the suite (REQ-SYS-007) --\n");
+    fuzz_run(0x1badcafeu, 20000, 50, false);
+    fuzz_run(0x2468ace1u, 20000, 50, false);
+    fuzz_run(0x13579bdfu, 20000, 300, false);
+    fuzz_run(0xdeadbeefu, 20000, 20, true);
+}
+
 int main(void)
 {
     scenario_pyahrs_example();
@@ -5204,6 +5969,7 @@ int main(void)
     scenario_mag_yaw_convergence();
     scenario_wmm_position_aiding();
     scenario_suite_mag_model_before_ahrs_start();
+    scenario_suite_mag_model_follows_ins();
     scenario_mag_heading_helper();
     scenario_nav_suite();
     scenario_suite_att_hint();
@@ -5214,6 +5980,7 @@ int main(void)
     scenario_suite_yaw_carry_reacquire();
     scenario_suite_heading_switch_no_jump();
     scenario_suite_heading_cross_check();
+    scenario_suite_heading_switch_disagreeing();
     scenario_nan_inputs();
     scenario_tunnel();
     scenario_time_anomaly();
@@ -5246,6 +6013,9 @@ int main(void)
     scenario_suite_predict_correct_equivalence();
     scenario_ahrs_config_passthrough();
     scenario_imu_outage_700ms();
+    scenario_imu_out_of_range();
+    scenario_nonfinite_gyro_bias();
+    scenario_suite_fuzz();
     printf("\n==== %d failures ====\n", fails);
     return fails == 0 ? 0 : 1;
 }

@@ -19,9 +19,9 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.4% (4314/4340) |
-| C1 (Branch) | 91.7% (2867/3125) |
-| MC/DC | 91.7% (2845/3104) |
+| C0 (Line) | 99.4% (4413/4439) |
+| C1 (Branch) | 92.1% (2935/3187) |
+| MC/DC | 92.0% (2908/3162) |
 <!-- COVERAGE:END -->
 
 <!-- STACK:START -->

@@ -273,7 +273,7 @@ endif
         datasets-kfgins-faults \
         datasets-fog datasets-tunnel datasets-tunnel-nhc datasets-tunnel-odometry \
         datasets-pedestrian datasets-inertial-roundtrip \
-        simulated crazyflie tutorials reqs pylib pytest wmm doc doxygen test-asan \
+        simulated crazyflie tutorials reqs pylib pytest wmm udu-vectors doc doxygen test-asan \
         format format-check cppcheck clang-tidy stack readme-stack check-all insrcv \
         test_core test_math test_ahrs test_ahrs_nomag test_baro test_log test_cfg test_yaml \
         replay inspostgui-exe
@@ -462,14 +462,14 @@ endif
 # (never edited here) and the generated WMM lookup tables (make wmm
 # rewrites them, so formatting would just churn).
 #
-# clang-format's verdict depends on its exact version (ci.yml pins
-# ubuntu-22.04 for this reason). If scripts/fetch_ci_clang_format.sh has
-# vendored a copy matching that pinned version, use it instead of whatever
-# is on PATH, so `make format`/`format-check` agree with CI even on a
-# machine whose system clang-format is newer (e.g. Debian, Ubuntu 24.04).
-CLANG_FORMAT := $(if $(wildcard .tools/clang-format-14/bin/clang-format), \
-                 .tools/clang-format-14/bin/clang-format,clang-format)
-FORMAT_SRC   := $(filter-out src/wmm_lut.h src/wmm_test_vectors.h, \
+# clang-format's verdict depends on its exact version, which
+# scripts/fetch_ci_clang_format.sh pins (ci.yml runs it too). If it has
+# vendored that copy, use it instead of whatever is on PATH, so `make
+# format`/`format-check` agree with CI on any machine.
+CLANG_FORMAT_VENDORED := .tools/clang-format/clang_format/data/bin/clang-format
+CLANG_FORMAT := $(if $(wildcard $(CLANG_FORMAT_VENDORED)),$(CLANG_FORMAT_VENDORED),clang-format)
+FORMAT_SRC   := $(filter-out src/wmm_lut.h src/wmm_test_vectors.h \
+                             tests/udu_takasu_vectors.h, \
                 $(wildcard src/*.c src/*.h tests/*.c tests/*.h \
                            datasets/*.c datasets/*.h \
                            python/csrc/*.c python/csrc/*.h))
@@ -542,6 +542,12 @@ doxygen:
 wmm:
 	$(PYTHON) magneticmodel/generate_wmm_grid.py
 	$(PYTHON) magneticmodel/generate_test_vectors.py
+
+# Regenerates the committed tests/udu_takasu_vectors.h (double precision
+# Takasu reference for scenario_udu_vs_takasu, REQ-NAV-002). Needs numpy only
+# and is only necessary when the cases in the generator change.
+udu-vectors:
+	$(PYTHON) scripts/generate_udu_takasu_vectors.py
 
 # --- Real-world replay tests -------------------------------------------------
 # Dataset bundle contract: doc/INSLIB_manual.tex, section "config.yaml"

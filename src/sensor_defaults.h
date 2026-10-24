@@ -220,5 +220,21 @@
  *  tilt-compensated heading instead of the field vector. */
 #define INS_DEFAULT_MAG_STDDEV_UT (20.0f)
 
+/** Largest per-axis gyroscope magnitude a sample may carry [rad/s]. A sample
+ *  beyond it is dropped like a non-finite one (counted in n_invalid_input).
+ *
+ *  This is not a clipping range of the sensor and no sensor this library
+ *  targets comes near it. It exists because a finite but absurd value (a unit
+ *  mix-up, a corrupt frame, an uninitialised float) passes every finiteness
+ *  check and then rotates the attitude by an arbitrary angle within one epoch,
+ *  from which a filter with a small covariance needs minutes to come back.
+ *  Chosen so that the worst rotation one wrong sample can still cause stays
+ *  small. */
+#define INS_IMU_GYR_ABS_MAX_RPS (100.0f)
+/** Largest per-axis accelerometer magnitude a sample may carry [m/s^2], same
+ *  purpose as INS_IMU_GYR_ABS_MAX_RPS. Well above the shock range of the
+ *  high-g MEMS parts. */
+#define INS_IMU_ACC_ABS_MAX_MPS2 (1.0e4f)
+
 #endif /* INS_SENSOR_DEFAULTS_H */
 /** @} */
