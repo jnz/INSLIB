@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.4.2] - 2026-11-01 - Lean
+
+### Fixed
+
+- `DEG2RAD()`/`RAD2DEG()` no longer trip `-Wdouble-promotion` with a
+  double argument (gcc 11 type-checks the unselected `_Generic` branch).
+  Results are unchanged.
+
+### Changed
+
+- AI found a nice optimization case: `ins_t` shrinks from about 52 kB to 10 kB
+  (`nav_suite_t` from 57 kB to 15 kB): the delayed-measurement history no
+  longer saves the covariance matrix. The assumption is that the
+  covariance does not change dramatically over short time periods anyway.
+  The layout of `ins_t` changes, so code built against the 1.4.1 headers has to
+  be recompiled.
+- `ins_matrix_to_quat()` in the geodetic toolbox now computes one reciprocal
+  (`invS`) and multiplies instead of dividing four times. Results agree up
+  to float rounding.
+
 ## [1.4.1] - 2026-10-24 - Tweaks
 
 ### Changed

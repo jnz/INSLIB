@@ -134,11 +134,26 @@ a hard accuracy gate sets opt.gnss_max_* below the caps explicitly.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-001
-- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_moving_delayed
+- **Verification:** Test: tests/test_ins_core.c:scenario_gnss_moving_delayed; Test: tests/test_ins_core.c:scenario_history_valid_flag
 
 The filter shall keep a history of recent states and fuse
 measurements that are up to INS_MAX_DELAY_MS old by anchoring the
 residual at the state valid at the measurement's time of validity.
+
+The residual is formed from the nominal state at the time of validity,
+the update uses the current covariance and corrects the current state:
+Wendel, 2nd ed., ch. 8.4, eq. 8.168 to 8.170 with the approximation
+of eq. 8.171, C_{k,k-n} ~ P_k^- ~ P_{k-n}^- (the estimation error barely changes over
+the delay). The
+history therefore holds the nominal state only, no covariance, and marks
+each written entry with an explicit flag.
+
+Rationale: up to 1.4.1 every history entry also held a copy of the
+covariance factors U and d and of the rotation matrix, written every
+INS_HISTORY_DT_MS and never read, about 42 kB of the 52 kB ins_t. An exact treatment of the delay
+would need the transition from the time of validity to now as well (a
+stored past covariance alone does not give it), which is out of scope
+for a bounded embedded filter at delays up to INS_MAX_DELAY_MS.
 
 ## REQ-NAV-009 — Magnetometer fusion, yaw-only
 

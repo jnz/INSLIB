@@ -1325,3 +1325,38 @@ RMS over the run with RTK (gate 0.015 m) and 18.6 m with SPP (gate
 metre accuracy reported the gate has to stay out of the way of the normal
 error and still remove the blunders. The gates are observed + max(5 %,
 0.003), rounded up, as for the other `datasets/kfgins` replays.
+
+## REQ-VER-051 — Bit-exact regression check against a reference version
+
+- **Status:** verified
+- **Parent:** REQ-VER-003
+- **Verification:** Inspection: tests/r1_baseline/state_dump_shim.c:__wrap_nav_suite_update writes every float of the dump in C99 hex; Demonstration: tests/r1_baseline/r1.sh HEAD before a commit that must not change results, all replays reported "same"
+
+`tests/r1_baseline/r1.sh [REF]` shall build `tools/replay.c` from the
+git reference REF (default HEAD, sources taken with `git archive`
+including the KFCore commit REF pins) and from the working tree, with
+the same compiler and the Makefile's flags, and link
+`tests/r1_baseline/state_dump_shim.c` into both with
+`-Wl,--wrap=nav_suite_update`. The shim shall write, when
+`INSLIB_STATE_DUMP` names a file, one line per epoch with:
+
+- the ins nominal state: absolute and local position, velocity, attitude
+  quaternion, accelerometer, gyroscope and magnetometer bias
+- the diagonal of the ins covariance
+- the suite mode and readiness
+- the suite attitude and height
+
+Every floating-point value shall be written in C99 hexadecimal notation
+(`%a`). The script shall replay every dataset `make test` replays (the
+lists are read from the Makefile) through both binaries and report each
+run whose dump or exit code differs. It shall exit non-zero if any run
+differs.
+
+Rationale: a change that must not alter any result (a refactoring, a
+memory layout change, new opt-in behaviour) has to prove that every
+existing configuration computes exactly what it computed before. The
+replay reports print rounded error statistics, which can hide a changed
+result. The hexadecimal dump makes a change of a single bit visible.
+Building both sides on one machine keeps the comparison valid on any
+toolchain without stored hashes, and the link-time wrap reaches older
+versions without changing their source.

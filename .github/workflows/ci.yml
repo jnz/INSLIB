@@ -18,6 +18,8 @@ jobs:
     # depend on their exact version. clang-format does not come from the
     # runner: scripts/fetch_ci_clang_format.sh pins it (PyPI wheel), the
     # same copy `make format` uses locally.
+    # Public repo only: the private repo would burn Actions quota on every push.
+    if: github.repository == 'jnz/INSLIB'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -74,6 +76,7 @@ jobs:
     # depend on their exact version, and ubuntu-latest silently moves to a
     # newer Ubuntu release over time, which then reports new warnings on
     # unrelated commits. Bump deliberately, not implicitly.
+    if: github.repository == 'jnz/INSLIB'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6

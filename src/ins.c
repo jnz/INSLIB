@@ -1561,7 +1561,7 @@ static bool ins_state_at_tov(const ins_t* f, ins_time_us_t t_now, ins_time_us_t 
     for (i = 0; i < INS_HISTORY_ITEMS_MAX; ++i)
     {
         const ins_history_item_t* h = &f->history[i];
-        if (h->d[0] <= 0.0f) { continue; /* empty (never written) ring buffer slot */ }
+        if (!h->valid) { continue; /* empty (never written or cleared) ring buffer slot */ }
         if (h->time > t_now) { continue; /* stale, from before a backward time jump */ }
         if (h->time <= t_tov)
         {
@@ -2564,12 +2564,29 @@ static void ins_track_gnss_mode_gates(ins_t* f, const ins_measurements_t* m)
 
 /* GNSS position + velocity fusion (with lever arm and measurement delay).
  *
- * The residual is anchored at the state the filter had at the measurement's
- * time-of-validity (from the history ring buffer), the covariance update is
- * applied to the *current* U,d. A good approximation for delayed measurements:
- * the error-state is nearly constant over the delay (Phi ~ I for a few 100 ms).
- * See Zwiener 2019, "Sensorfusionsgleichungen fuer verteilte Sensoren" (GNSS,
- * lever arm) and "Einbeziehung von Messdaten mit verzoegerter Verfuegbarkeit". */
+ * A measurement valid at epoch k-n but available at epoch k is fused after
+ * Wendel, 2nd ed., ch. 8.4, p. 235, eq. 8.168 to 8.170:
+ *
+ *   K*    = C_{k,k-n} H_{k-n}' (H_{k-n} P_{k-n}^- H_{k-n}' + R_{k-n})^-1
+ *   x_k^+ = x_k^- - K* (H_{k-n} x_{k-n}^- - y_k^{k-n})
+ *   P_k^+ = P_k^- - K* H_{k-n} C_{k,k-n}'
+ *
+ * with Wendel's approximation (eq. 8.171) C_{k,k-n} ~ P_k^- ~ P_{k-n}^-, which
+ * holds when the estimation error barely changes between time of validity and
+ * arrival (delays up to INS_MAX_DELAY_MS). With it, this is a plain Kalman update on
+ * the current covariance:
+ *
+ *   K     = P_k^- H_{k-n}' (H_{k-n} P_k^- H_{k-n}' + R_{k-n})^-1
+ *   P_k^+ = P_k^- - K H_{k-n} P_k^-
+ *
+ * So the residual and H_{k-n} (lever-arm attitude coupling) are formed from
+ * the state at the time of validity (ins_state_at_tov, interpolated from the
+ * history ring buffer), while K, the chi2 gate and the covariance update use
+ * the current U,d and the correction goes to the current state. This is why
+ * the history holds no covariance (REQ-NAV-008).
+ * See also Zwiener 2019, "Sensorfusionsgleichungen fuer verteilte Sensoren"
+ * (GNSS, lever arm) and "Einbeziehung von Messdaten mit verzoegerter
+ * Verfuegbarkeit". */
 /* @satisfies REQ-NAV-005 REQ-NAV-006 REQ-NAV-008 REQ-NAV-023 REQ-NAV-024 REQ-NAV-055
  * @satisfies REQ-NAV-079 */
 static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
@@ -3463,10 +3480,8 @@ static void ins_save_state(ins_t* f, ins_time_us_t tnow, bool enforce)
     h->latlonh[0]         = f->latlonh[0];
     h->latlonh[1]         = f->latlonh[1];
     h->latlonh[2]         = f->latlonh[2];
-    memcpy(h->U, f->U, sizeof(h->U));
-    memcpy(h->d, f->d, sizeof(h->d));
+    h->valid              = true;
     vec3_copy(f->last_omega_b_nb, h->omega_b_nb);
-    memcpy(h->R_b_to_n, f->R_b_to_n, sizeof(h->R_b_to_n));
 
     f->history_index = (f->history_index + 1) % INS_HISTORY_ITEMS_MAX;
 }

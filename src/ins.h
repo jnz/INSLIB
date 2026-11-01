@@ -74,7 +74,11 @@
  *  states that are already covered by the IMU columns. */
 #define INS_NOISE_COLS_MAX (12 + INS_UNKNOWNS_MAX - 6)
 
-/** Maximum tolerated measurement delay (history buffer size). */
+/** Maximum tolerated measurement delay (history buffer size). Older
+ *  measurements are dropped. Meant for sensor latency only: the delay
+ *  compensation assumes the estimation error barely changes over the delay
+ *  (Wendel, 2nd ed., ch. 8.4), which does not hold for delays of seconds or
+ *  more, so raising this does not make arbitrarily late data fusable. */
 #define INS_MAX_DELAY_MS 500
 
 /** Consecutive epochs dropped as older than INS_MAX_DELAY_MS that are read as
@@ -92,9 +96,9 @@
 #endif
 
 /** Minimum time between history entries [ms]. The delayed-measurement
- *  anchoring relies on the error-state being ~constant over the delay
- *  (Phi ~ I), so a coarse grid is sufficient: the nearest anchor is at most
- *  INS_HISTORY_DT_MS/2 off the true time of validity. */
+ *  anchoring relies on the estimation error being ~constant over the delay
+ *  (Wendel, 2nd ed., ch. 8.4), so a coarse grid is sufficient: the state at
+ *  the time of validity is interpolated between the two anchors around it. */
 #ifndef INS_HISTORY_DT_MS
 #define INS_HISTORY_DT_MS 20
 #endif
@@ -981,21 +985,30 @@ typedef struct
                              (estimate_mag_bias), zero otherwise. */
 } ins_state_t;
 
-/** @brief History item (for delayed-measurement fusion). */
+/** @brief History item (for delayed-measurement fusion).
+ *
+ *  Only the nominal state is kept. A delayed measurement forms its residual
+ *  from the state at its time of validity and is fused with the CURRENT
+ *  covariance into the current state, assuming the error state stays
+ *  constant over the delay (Phi ~ I, REQ-NAV-008). */
 typedef struct
 {
-    ins_time_us_t time;       /**< epoch timestamp [us] */
-    ins_state_t   state;      /**< nominal state at this epoch */
-    double        latlonh[3]; /**< absolute position anchor at this epoch
-                                   (lat,lon [rad], h [m]), needed to form
-                                   delayed GNSS position residuals. */
-    /* Covariance as UDU factors (saved for history). Sized to the
-       compile-time maximum; the active leading dimension is the
-       instance's runtime state size (ins_t.n). */
-    float U[INS_UNKNOWNS_MAX * INS_UNKNOWNS_MAX]; /**< unit upper triangular factor */
-    float d[INS_UNKNOWNS_MAX];                    /**< diagonal factor */
-    float omega_b_nb[3];                          /**< body rotation rate at this epoch [rad/s] */
-    float R_b_to_n[9]; /**< body-to-NED rotation at this epoch (column-major) */
+    ins_time_us_t time;  /**< epoch timestamp [us] */
+    ins_state_t   state; /**< nominal state at this epoch */
+    bool          valid; /**< slot holds a saved state (false: never
+                              written or cleared). Sits in the padding
+                              before latlonh. */
+    double latlonh[3];   /**< absolute position anchor at this epoch
+                              (lat,lon [rad], h [m]), needed to form
+                              delayed GNSS position residuals. */
+    /* Up to 1.4.1 every entry also held a copy of the covariance factors,
+       U (INS_UNKNOWNS_MAX x INS_UNKNOWNS_MAX) and d (INS_UNKNOWNS_MAX),
+       and the rotation matrix R_b_to_n, all written every INS_HISTORY_DT_MS
+       and never read (see above, the attitude at the time of validity is
+       interpolated from state.qbn), about 42 kB of ins_t in all. Removed
+       after 1.4.1, valid above took over the one use left, the empty-slot
+       test on d[0]. */
+    float omega_b_nb[3]; /**< body rotation rate at this epoch [rad/s] */
 } ins_history_item_t;
 
 /* @satisfies REQ-NAV-019 */
@@ -1160,7 +1173,7 @@ typedef struct
  *
  * The fields are grouped by topic (configuration, covariance, earth model,
  * per-epoch context, auto-init, ...), not by alignment. That leaves 47 bytes of
- * padding in a 51.6 kB struct; packing it out would interleave the groups for a
+ * padding in an 11 kB struct; packing it out would interleave the groups for a
  * negligible gain, so the padding check is switched off for this struct. */
 /* NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding) */
 typedef struct

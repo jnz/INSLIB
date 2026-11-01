@@ -8,7 +8,7 @@ authors:
 repository-code: "https://github.com/jnz/INSLIB"
 url: "https://github.com/jnz/INSLIB"
 license: AGPL-3.0-only
-version: 1.4.1
+version: 1.4.2
 date-released: 2026-10-24
 keywords:
   - "Kalman filter"

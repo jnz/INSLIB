@@ -19,7 +19,7 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.4% (4413/4439) |
+| C0 (Line) | 99.4% (4415/4441) |
 | C1 (Branch) | 92.1% (2935/3187) |
 | MC/DC | 92.0% (2908/3162) |
 <!-- COVERAGE:END -->
@@ -503,6 +503,10 @@ filtering, etc.) has to line up properly. A list of common mistakes:
   during dynamic motion, see [GNSS Latency Estimation](#gnss-latency-estimation).
   Even with a correct timestamp the GNSS solution is typically lagging
   behind due to internal filtering.
+* **Expecting arbitrarily old measurements to be compensated**: delay
+  compensation is a good approximation for sensor latency
+  in the 50-500 ms range, not for data that arrives minutes late.
+  Measurements older than `INS_MAX_DELAY_MS` are dropped.
 * **GNSS antenna lever arm not set**: the offset between IMU and GNSS antenna
   (`gnss: leverarm_frd`) has an impact on position and attitude,
   especially during dynamic turns.

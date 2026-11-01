@@ -1304,6 +1304,75 @@ static void scenario_zero_rotation_bias(void)
 #define S9_STEPS      1000 /* 10 s at 100 Hz */
 #define S9_DELAY_STEP 30   /* 300 ms GNSS latency in steps */
 
+/* History slots carry an explicit valid flag (REQ-NAV-008): a slot is valid
+ * exactly when ins_save_state wrote it, never because of what its other
+ * fields hold, and a cleared filter has none. */
+static void scenario_history_valid_flag(void)
+{
+    printf("\n=== History ring buffer: valid flag marks the written slots ===\n");
+    static ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t opt;
+    fill_default_opt(&opt);
+    opt.auto_zupt_disable = true;
+    if (ins_init(&f, &init, &opt) != 0)
+    {
+        printf("init failed\n");
+        fails++;
+        return;
+    }
+
+    int i, n_valid = 0;
+    for (i = 0; i < INS_HISTORY_ITEMS_MAX; ++i) { n_valid += f.history[i].valid ? 1 : 0; }
+    CHECK_TRUE(n_valid == 0, "no valid slot before the first epoch");
+
+    /* Level and at rest: 0.3 s at 100 Hz, entries every INS_HISTORY_DT_MS. */
+    float g_vec[3];
+    ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+    const float   acc[3] = {-g_vec[0], -g_vec[1], -g_vec[2]};
+    const float   gyr[3] = {0.0f, 0.0f, 0.0f};
+    const float   dt     = 0.01f;
+    ins_time_us_t t      = 0;
+    for (i = 0; i < 30; ++i)
+    {
+        t += us_from_sec(dt);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc, gyr, dt);
+        ins_update(&f, &m);
+    }
+
+    n_valid         = 0;
+    bool consistent = true;
+    for (i = 0; i < INS_HISTORY_ITEMS_MAX; ++i)
+    {
+        const ins_history_item_t* h = &f.history[i];
+        if (h->valid)
+        {
+            ++n_valid;
+            if (h->time <= 0 || h->time > t) { consistent = false; }
+        }
+        else if (h->time != 0) { consistent = false; }
+    }
+    CHECK_TRUE(n_valid > 1 && n_valid < INS_HISTORY_ITEMS_MAX, "a partly filled ring buffer");
+    CHECK_TRUE(consistent, "valid slots hold a past epoch, the others are untouched");
+
+    ins_shutdown(&f);
+    memset(&f, 0, sizeof(f));
+    if (ins_init(&f, &init, &opt) != 0)
+    {
+        printf("re-init failed\n");
+        fails++;
+        return;
+    }
+    n_valid = 0;
+    for (i = 0; i < INS_HISTORY_ITEMS_MAX; ++i) { n_valid += f.history[i].valid ? 1 : 0; }
+    CHECK_TRUE(n_valid == 0, "a re-initialized filter starts with no valid slot");
+}
+
 static void scenario_gnss_moving_delayed(void)
 {
     printf("\n=== Scenario 9: moving vehicle, 300 ms delayed GNSS ===\n");
@@ -15461,6 +15530,7 @@ int main(void)
     scenario_mag_bias_transient_disturbance();
     scenario_zero_rotation_bias();
     scenario_gnss_moving_delayed();
+    scenario_history_valid_flag();
     scenario_subepoch_age();
     scenario_tov_interpolation();
     scenario_gnss_velocity_leverarm();

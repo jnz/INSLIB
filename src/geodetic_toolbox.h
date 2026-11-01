@@ -15,23 +15,6 @@
  *  - All angles in radians unless otherwise noted.
  *  - lat/lon in radians, height in meters above ellipsoid.
  *
- * Name mapping to the Python reference (tools/geodetic_toolbox.py).
- *
- *   Python                        C
- *   quat_from_rpy                 ins_quat_from_rpy
- *   quat_to_matrix                ins_quat_to_rotmat
- *   matrix_to_quat                ins_matrix_to_quat
- *   quat_to_rpy                   (compose quat_to_rotmat + rotmat_to_rpy)
- *   extract_rpy_from_R_b_to_n     ins_rotmat_to_rpy
- *   quat_norm                     ins_quat_normalize
- *   quat_multiply                 ins_quat_multiply
- *   quat_integrate_rotationrate   ins_quat_rotate
- *   quat_invert                   ins_quat_invert
- *   quat_to_axis_angle            ins_quat_to_axis_angle
- *   angle_diff                    ins_angle_diff
- * C-only additions (no Python counterpart): the WGS84 geodesy block,
- * ins_quat_small_angle_correction, ins_cross[_matrix]
- *
  */
 
 /** @addtogroup geodetic
@@ -109,15 +92,19 @@
 /** @copydoc INS_ISA_PRESSURE_MIN_PA */
 #define INS_ISA_PRESSURE_MAX_PA (120000.0f)
 
+// The (float) in the float branch is a no-op for a float argument. It is
+// there because gcc type-checks the branch _Generic does not select as
+// well, and a double argument there is double * float, which
+// -Wdouble-promotion reports (gcc 11).
 // clang-format off
 /** @brief Convert degrees to radians. */
 #define DEG2RAD(x) _Generic((x), \
-    float:       (x) * ((float)M_PI / 180.0f), \
+    float:       (float)(x) * ((float)M_PI / 180.0f), \
     default:     (double)(x) * (M_PI / 180.0) \
 )
 /** @brief Convert radians to degrees. */
 #define RAD2DEG(x) _Generic((x), \
-    float:       (x) * (180.0f / (float)M_PI), \
+    float:       (float)(x) * (180.0f / (float)M_PI), \
     default:     (double)(x) * (180.0 / M_PI) \
 )
 // clang-format on

@@ -172,6 +172,11 @@ FW_RNG_TEST := embedded/tests/test_ranging.c
 # anchor is anchor.c compiled once more under other names.
 FW_RNG_E2E_SRC := $(FW_RNG_SRC) $(FW_DIR)/Src/inslib_sensor/anchor.c                   embedded/tests/anchor_second_instance.c
 FW_RNG_E2E  := embedded/tests/test_ranging_e2e.c
+# Camera trigger and exposure timestamps, plus their UBX frame.
+FW_CAM_SRC  := $(FW_DIR)/Src/inslib_sensor/camsync.c \
+               $(FW_DIR)/Src/inslib_sensor/ubx.c \
+               $(FW_DIR)/Src/inslib_sensor/imu_saturation.c
+FW_CAM_TEST := embedded/tests/test_camsync.c
 
 TEST_CORE := $(BUILD_DIR)/test_core$(EXE)
 TEST_MATH := $(BUILD_DIR)/test_math$(EXE)
@@ -183,6 +188,7 @@ TEST_YAML := $(BUILD_DIR)/test_yaml$(EXE)
 TEST_CFG  := $(BUILD_DIR)/test_cfg$(EXE)
 TEST_RNG  := $(BUILD_DIR)/test_ranging$(EXE)
 TEST_RNG_E2E := $(BUILD_DIR)/test_ranging_e2e$(EXE)
+TEST_CAM  := $(BUILD_DIR)/test_camsync$(EXE)
 REPLAY    := $(BUILD_DIR)/replay$(EXE)
 INSRCV    := $(BUILD_DIR)/insrcv$(EXE)
 
@@ -196,10 +202,11 @@ ifneq ($(HAVE_EMBEDDED),)
 # The reference board's host tools (embedded/tools) are tested next to the
 # public ones by `make pytest`.
 PYTEST_DIRS := python/tests embedded/tests
-ALL_TEST_CFG := $(TEST_CFG) $(TEST_RNG) $(TEST_RNG_E2E)
+ALL_TEST_CFG := $(TEST_CFG) $(TEST_RNG) $(TEST_RNG_E2E) $(TEST_CAM)
 RUN_TEST_CFG := $(RUN)$(TEST_CFG)
 RUN_TEST_RNG := $(RUN)$(TEST_RNG)
 RUN_TEST_RNG_E2E := $(RUN)$(TEST_RNG_E2E)
+RUN_TEST_CAM := $(RUN)$(TEST_CAM)
 else
 PYTEST_DIRS := python/tests
 ALL_TEST_CFG :=
@@ -209,6 +216,7 @@ ALL_TEST_CFG :=
 RUN_TEST_CFG := echo "test_cfg: skipped, embedded/ not present (public repo)"
 RUN_TEST_RNG := echo "test_ranging: skipped, embedded/ not present (public repo)"
 RUN_TEST_RNG_E2E := echo "test_ranging_e2e: skipped, embedded/ not present (public repo)"
+RUN_TEST_CAM := echo "test_camsync: skipped, embedded/ not present (public repo)"
 endif
 
 # --- Toolchain check (Windows) ----------------------------------------------
@@ -358,6 +366,9 @@ $(TEST_RNG): $(FW_RNG_SRC) $(FW_RNG_TEST) $(FW_HDR) | $(BUILD_DIR)
 $(TEST_RNG_E2E): $(FW_RNG_E2E_SRC) $(FW_RNG_E2E) $(FW_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(FW_INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
+$(TEST_CAM): $(FW_CAM_SRC) $(FW_CAM_TEST) $(FW_HDR) | $(BUILD_DIR)
+	$(CC) $(HARNESS_CFLAGS) $(FW_INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
+
 test: all
 	$(RUN)$(TEST_CORE)
 	$(RUN)$(TEST_MATH)
@@ -369,6 +380,7 @@ test: all
 	$(RUN_TEST_CFG)
 	$(RUN_TEST_RNG)
 	$(RUN_TEST_RNG_E2E)
+	$(RUN_TEST_CAM)
 	@$(MAKE) --no-print-directory simulated
 	@$(MAKE) --no-print-directory crazyflie
 	@$(MAKE) --no-print-directory tutorials
@@ -399,6 +411,7 @@ ifneq ($(HAVE_EMBEDDED),)
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_CFG_SRC) tests/test_cfg.c $(LDLIBS) -o $(BUILD_DIR)/test_cfg_asan
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_RNG_SRC) $(FW_RNG_TEST) $(LDLIBS) -o $(BUILD_DIR)/test_ranging_asan
 	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_RNG_E2E_SRC) $(FW_RNG_E2E) $(LDLIBS) -o $(BUILD_DIR)/test_ranging_e2e_asan
+	$(CC) $(HARNESS_CFLAGS) $(SAN_FLAGS) $(FW_INCLUDES) $(FW_CAM_SRC) $(FW_CAM_TEST) $(LDLIBS) -o $(BUILD_DIR)/test_camsync_asan
 endif
 	./$(BUILD_DIR)/test_core_asan
 	./$(BUILD_DIR)/test_math_asan
@@ -410,6 +423,7 @@ ifneq ($(HAVE_EMBEDDED),)
 	./$(BUILD_DIR)/test_cfg_asan
 	./$(BUILD_DIR)/test_ranging_asan
 	./$(BUILD_DIR)/test_ranging_e2e_asan
+	./$(BUILD_DIR)/test_camsync_asan
 else
 	@echo "test_cfg_asan: skipped, embedded/ not present (public repo)"
 endif

@@ -203,7 +203,9 @@ void ins_quat_small_angle_correction(const float q_in[4], const float drpy[3], f
 void ins_matrix_to_quat(const float R[9], float q[4])
 {
     /* Numerically stable trace-based conversion (largest pivot), the
-       inverse of ins_quat_to_rotmat. R is column-major (MAT_ELEM). */
+       inverse of ins_quat_to_rotmat. R is column-major (MAT_ELEM).
+       Reference: Wendel, "Integrierte Navigationssysteme", 2nd ed. p. 41.
+                  equations: (3.67) - (3.86) */
     const float r00 = MAT_ELEM(R, 0, 0, 3, 3);
     const float r11 = MAT_ELEM(R, 1, 1, 3, 3);
     const float r22 = MAT_ELEM(R, 2, 2, 3, 3);
@@ -217,35 +219,43 @@ void ins_matrix_to_quat(const float R[9], float q[4])
 
     if (tr > 0.0f)
     {
-        const float S = 2.0f * SQRTF(tr + 1.0f);
-        q[0]          = 0.25f * S;
-        q[1]          = (r21 - r12) / S;
-        q[2]          = (r02 - r20) / S;
-        q[3]          = (r10 - r01) / S;
+        const float S    = 2.0f * SQRTF(tr + 1.0f);
+        const float invS = 1.0f / S;
+
+        q[0] = 0.25f * S;
+        q[1] = (r21 - r12) * invS;
+        q[2] = (r02 - r20) * invS;
+        q[3] = (r10 - r01) * invS;
     }
     else if (r00 > r11 && r00 > r22)
     {
-        const float S = 2.0f * SQRTF(1.0f + r00 - r11 - r22);
-        q[0]          = (r21 - r12) / S;
-        q[1]          = 0.25f * S;
-        q[2]          = (r01 + r10) / S;
-        q[3]          = (r02 + r20) / S;
+        const float S    = 2.0f * SQRTF(1.0f + r00 - r11 - r22);
+        const float invS = 1.0f / S;
+
+        q[0] = (r21 - r12) * invS;
+        q[1] = 0.25f * S;
+        q[2] = (r01 + r10) * invS;
+        q[3] = (r02 + r20) * invS;
     }
     else if (r11 > r22)
     {
-        const float S = 2.0f * SQRTF(1.0f + r11 - r00 - r22);
-        q[0]          = (r02 - r20) / S;
-        q[1]          = (r01 + r10) / S;
-        q[2]          = 0.25f * S;
-        q[3]          = (r12 + r21) / S;
+        const float S    = 2.0f * SQRTF(1.0f + r11 - r00 - r22);
+        const float invS = 1.0f / S;
+
+        q[0] = (r02 - r20) * invS;
+        q[1] = (r01 + r10) * invS;
+        q[2] = 0.25f * S;
+        q[3] = (r12 + r21) * invS;
     }
     else
     {
-        const float S = 2.0f * SQRTF(1.0f + r22 - r00 - r11);
-        q[0]          = (r10 - r01) / S;
-        q[1]          = (r02 + r20) / S;
-        q[2]          = (r12 + r21) / S;
-        q[3]          = 0.25f * S;
+        const float S    = 2.0f * SQRTF(1.0f + r22 - r00 - r11);
+        const float invS = 1.0f / S;
+
+        q[0] = (r10 - r01) * invS;
+        q[1] = (r02 + r20) * invS;
+        q[2] = (r12 + r21) * invS;
+        q[3] = 0.25f * S;
     }
 
     ins_quat_normalize(q);

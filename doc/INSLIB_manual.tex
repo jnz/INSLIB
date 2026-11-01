@@ -131,7 +131,7 @@
        \large Software Documentation and Mathematical Models\\[1cm]
        \includegraphics[width=0.33\textwidth]{figures/inslib_logo.pdf}
 }
-\newcommand{\inslibversion}{1.4.1}
+\newcommand{\inslibversion}{1.4.2}
 \author{Jan Zwiener \\ \texttt{jan@zwiener.org}}
 \date{Version \inslibversion\\[2mm] \today}
 
@@ -697,12 +697,14 @@ a fix it stays down. A forward time jump is handled the same way, also with
 
 \subsection{Memory and timing design}
 
-Everything is statically sized. The dominating consumer in
-\code{ins\_\allowbreak{}t} is the history ring buffer (30 entries $\times$
-UDU factors). With the default compile-time maximum of 18 states the
-struct is $\approx$\SI{50}{\kibi\byte}, with
+Everything is statically sized. With the default compile-time maximum of
+18 states \code{ins\_\allowbreak{}t} is $\approx$\SI{10}{\kibi\byte}
+(\code{nav\_\allowbreak{}suite\_\allowbreak{}t}
+$\approx$\SI{15}{\kibi\byte}), with
 \code{INS\_\allowbreak{}UNKNOWNS\_\allowbreak{}MAX=15} it is
-$\approx$\SI{38}{\kibi\byte}.
+$\approx$\SI{9}{\kibi\byte}. The history ring buffer holds the nominal
+state only (\S\ref{sec:delayed}), up to 1.4.1 it also copied the UDU
+factors into every entry and made up four fifths of the struct.
 The loops of the per-epoch path are bounded by compile-time constants or by the
 runtime state count $n \le$ \code{INS\_\allowbreak{}UNKNOWNS\_\allowbreak{}MAX}.
 Slowly varying Earth quantities (curvature radii, gravity) are cached
@@ -1617,16 +1619,46 @@ sample (WCET rule).
 GNSS (and optionally local position / yaw) measurements arrive with
 a latency of up to \SI{500}{\milli\second}
 (\code{INS\_\allowbreak{}MAX\_\allowbreak{}DELAY\_\allowbreak{}MS}).
-The filter keeps a ring buffer of recent states (nominal state, UDU
-factors, $(\varphi,\lambda,h)$, $\Rbn$, $\vect{\omega}$; one entry every
-$\geq$\SI{20}{\milli\second}, 30 entries). The residual of a delayed
+The filter keeps a ring buffer of recent states (nominal state,
+$(\varphi,\lambda,h)$, $\vect{\omega}$; one entry every
+$\geq$\SI{20}{\milli\second}, 30 entries), no covariance. The residual of a delayed
 measurement is formed against the state at its time of validity, while the
 covariance update is applied to the \emph{current} $\mat{U}, \vect{d}$.
-This is the standard approximation for short delays \cite{wendel2011,zwiener2019}: the error state is
-nearly constant over a few hundred milliseconds
-($\mat{\Phi} \approx \mat{I}$ for the error dynamics), whereas the
-residual would be grossly wrong if it were formed against the already
-moved on current state. A measurement that cannot
+This follows \cite[Sec.~8.4, eq.~8.168--8.170]{wendel2011} for a measurement
+$\tilde{\vect{y}}_k^{k-n}$ valid at epoch $k-n$ and available at epoch $k$,
+\begin{align*}
+  \mat{K}_k^* &= \mat{C}_{k,k-n} \mat{H}_{k-n}^T
+    \left(\mat{H}_{k-n} \mat{P}_{k-n}^- \mat{H}_{k-n}^T + \mat{R}_{k-n}\right)^{-1},\\
+  \hat{\vect{x}}_k^+ &= \hat{\vect{x}}_k^- - \mat{K}_k^*
+    \left(\mat{H}_{k-n} \hat{\vect{x}}_{k-n}^- - \tilde{\vect{y}}_k^{k-n}\right),\\
+  \mat{P}_k^+ &= \mat{P}_k^- - \mat{K}_k^* \mat{H}_{k-n} \mat{C}_{k,k-n}^T,
+\end{align*}
+with Wendel's approximation \cite[eq.~8.171]{wendel2011} $\mat{C}_{k,k-n} \approx \mat{P}_k^- \approx
+\mat{P}_{k-n}^-$, valid when the estimation error barely changes between
+time of validity and arrival \cite{wendel2011,zwiener2019}. The update is
+then an ordinary Kalman (Bierman) update on the current $\mat{U}, \vect{d}$
+with innovation and $\mat{H}_{k-n}$ (lever-arm attitude coupling) taken from
+the state at the time of validity, which is why the history needs no
+covariance. The residual, in contrast, would be grossly wrong if it were
+formed against the already moved on current state.
+
+The delay compensation is therefore limited to sensor latency, i.e.\ tens to
+hundreds of milliseconds, and cannot reach arbitrarily far into the past.
+Over a long delay the approximation
+$\mat{C}_{k,k-n} \approx \mat{P}_k^- \approx \mat{P}_{k-n}^-$ breaks down: the
+covariance keeps growing with the process noise, and every measurement fused
+between $k-n$ and $k$ changes $\mat{P}_k^-$ and its correlation with the
+state at $k-n$. The old measurement would then be weighted with a gain that no
+longer matches its information, and the filter becomes inconsistent. In
+addition $\mat{H}_{k-n}$ is linearized at an ever older state, and the history
+would have to grow with the delay. Measurements older than
+\code{INS\_\allowbreak{}MAX\_\allowbreak{}DELAY\_\allowbreak{}MS} are thus
+dropped (GNSS: counted in \code{n\_\allowbreak{}gnss\_\allowbreak{}no\_\allowbreak{}anchor}).
+Raising this limit is not a way to fuse data that arrives seconds or minutes
+late. Such data belongs in post-processing (re-running the filter on
+time-ordered data, e.g.\ with \code{replay}), not in the real-time filter.
+
+A measurement that cannot
 be anchored (no history entry within \SI{50}{\milli\second} of the requested
 time) is skipped and counted.
 
