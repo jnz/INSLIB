@@ -98,7 +98,7 @@ jobs:
           - { os: windows-latest, archs: AMD64 }
           - { os: windows-11-arm, archs: ARM64 }
           - { os: macos-15-intel, archs: x86_64 }
-          - { os: macos-14, archs: arm64 }
+          - { os: macos-15, archs: arm64 }
     steps:
       - uses: actions/checkout@v6
         with:
