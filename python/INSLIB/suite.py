@@ -189,6 +189,15 @@ class Navigator(_Base):
         set_baro_acc_bias_drift()."""
         self._c("set_baro_h_process_noise")(self._h, float(density_m_sqrthz))
 
+    def set_baro_ins_acc_bias_disable(self, disable):
+        """Stop (True) or resume (False) handing ins's accelerometer bias
+        estimate to baro_alt. On by default: while ins is ready, its
+        body-frame bias is taken off the sample baro_alt sees, so baro_alt
+        keeps only the rest in its own correction. Costs the independence of
+        baro_alt's vertical velocity as a cross-check of ins's. May be called
+        at any time, the switch is bumpless."""
+        self._c("set_baro_ins_acc_bias_disable")(self._h, 1 if disable else 0)
+
     def set_local_gnss_rw_stddev(self, rw_stddev_mps):
         """Set the local-height/GNSS-ellipsoid offset filter's random walk
         [m/sqrt(s)] (<=0 -> local_gnss_alt's own default 0.03). Raise this

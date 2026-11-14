@@ -302,6 +302,7 @@ def _bind():
     L.ins_suite_set_baro_h_init_stddev.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_baro_v_init_stddev.argtypes = [ctypes.c_void_p, ctypes.c_float]
     L.ins_suite_set_baro_h_process_noise.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    L.ins_suite_set_baro_ins_acc_bias_disable.argtypes = [ctypes.c_void_p, ctypes.c_int]
     # ns adds the local-height/GNSS-ellipsoid offset filter's tuning: no
     # bare-ins equivalent (local_gnss_alt only exists in the suite).
     L.ins_suite_set_local_gnss_rw_stddev.argtypes = [ctypes.c_void_p, ctypes.c_float]

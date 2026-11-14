@@ -19,9 +19,9 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Metric | Coverage |
 |---|---|
-| C0 (Line) | 99.4% (4415/4441) |
-| C1 (Branch) | 92.1% (2935/3187) |
-| MC/DC | 92.0% (2908/3162) |
+| C0 (Line) | 99.4% (4688/4714) |
+| C1 (Branch) | 91.7% (3100/3379) |
+| MC/DC | 91.6% (3073/3354) |
 <!-- COVERAGE:END -->
 
 <!-- STACK:START -->
@@ -29,12 +29,12 @@ In action, fusing IMU measurements with Galileo HAS-corrected GPS/GNSS inputs:
 
 | Entry point | x86_64-linux-gnu, GCC 14.2.0 |
 |---|---:|
-| `nav_suite_update()` | 13264 |
-| `ins_update()` | 11856 |
+| `nav_suite_update()` | 13184 |
+| `ins_update()` | 11776 |
 | `ahrs_update()` | 8240 |
-| `baro_alt_update()` | 7904 |
-| `nav_suite_init()` | 2672 |
-| `ins_init()` | 2656 |
+| `baro_alt_update()` | 7936 |
+| `nav_suite_init()` | 3792 |
+| `ins_init()` | 3776 |
 <!-- STACK:END -->
 
 ## Example Video

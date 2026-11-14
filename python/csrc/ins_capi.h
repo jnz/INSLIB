@@ -458,6 +458,10 @@ extern "C"
      *  margin against discretization/model mismatch, not a primary noise
      *  source. Same timing contract as ins_suite_set_baro_acc_bias_drift. */
     void ins_suite_set_baro_h_process_noise(void* h, float density_m_sqrthz);
+    /** Stop (nonzero) or resume (0) handing ins's accelerometer bias
+     *  estimate to baro_alt (REQ-SUITE-031, on by default). May be called at
+     *  any time, the switch is bumpless. */
+    void ins_suite_set_baro_ins_acc_bias_disable(void* h, int disable);
     /** Set the local-height/GNSS-ellipsoid offset filter's random walk
      *  [m/sqrt(s)] (<=0 -> local_gnss_alt default 0.03, no-op). Raise this
      *  for missions with large altitude excursions (e.g. a soaring glider

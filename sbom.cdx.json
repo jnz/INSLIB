@@ -7,7 +7,7 @@
     "component": {
       "type": "library",
       "name": "INSLIB",
-      "version": "1.4.2",
+      "version": "1.4.3",
       "licenses": [{ "license": { "id": "AGPL-3.0-only" } }],
       "purl": "pkg:github/jnz/INSLIB@v1.4.2"
     }

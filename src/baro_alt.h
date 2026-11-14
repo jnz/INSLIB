@@ -21,7 +21,10 @@
  *
  *   x_k = Phi * x_{k-1} + B * a
  *   Phi = [1 dt 0.5*dt^2; 0 1 dt; 0 0 1],  B = [0.5*dt^2; dt; 0]
- *   Q   = B * sigma_a^2 * B' + diag(0, 0, sigma_b^2)
+ *   Q   = diag(sigma_h^2, sigma_a^2 + sigma_t^2 * |f_hor|^2, sigma_b^2) * dt
+ *
+ * sigma_t is the roll/pitch 1-sigma of the supplied attitude (see
+ * baro_alt_set_tilt_stddev), f_hor the horizontal specific force in NED.
  *
  * The barometer observes only h: pressure is converted to altitude with the
  * international standard atmosphere formula
@@ -167,6 +170,16 @@ typedef struct
         pressure sample minus h_init, so h = isa(p) - h0_baro_m. The
         current barometric ISA altitude estimate is h0_baro_m + x[0]. */
     float h0_baro_m;
+
+    /** Roll/pitch 1-sigma of the attitude handed to the predict step [rad]
+     *  (REQ-BARO-028), set by baro_alt_set_tilt_stddev(). 0 -> no
+     *  attitude-error term in the process noise. */
+    float tilt_stddev_rad;
+
+    /** Body-frame accelerometer bias handed in from outside [m/s^2]
+     *  (REQ-BARO-030), set by baro_alt_set_acc_bias_body(). Subtracted from
+     *  the sample before the rotation to NED. Zero -> no correction. */
+    float acc_bias_b[3];
 
     /* Timing / status */
     baro_alt_time_us_t t_init;          /**< init timestamp (restart warm-up base) */
@@ -364,6 +377,56 @@ extern "C"
      *  @param[in,out] b The filter instance. */
     void baro_alt_correct_step(baro_alt_t* b);
 
+    /** @brief Roll/pitch uncertainty of the attitude passed to the following
+     *  predict steps (REQ-BARO-028).
+     *
+     *  A tilt error turns horizontal specific force into apparent vertical
+     *  acceleration. With a 1-sigma sigma_t set here, every predict step adds
+     *  sigma_t^2 * |f_hor|^2 to the accelerometer noise density sigma_a^2,
+     *  f_hor being the horizontal specific force in NED. The value holds until
+     *  it is changed, baro_alt_init() resets it to 0 (no such term).
+     *
+     *  @param[in,out] b The filter instance.
+     *  @param[in] tilt_stddev_rad Roll/pitch 1-sigma [rad], non-positive or
+     *                             non-finite -> 0. */
+    void baro_alt_set_tilt_stddev(baro_alt_t* b, float tilt_stddev_rad);
+
+    /** @brief Body-frame accelerometer bias known from outside (REQ-BARO-030).
+     *
+     *  The vector is subtracted from every accelerometer sample before the
+     *  sample is rotated to NED, so a body-fixed bias is followed through
+     *  every change of orientation, which a_b as a scalar on the vertical
+     *  cannot do. It holds until it is changed, also while its source is not
+     *  available. baro_alt_init() resets it to zero.
+     *
+     *  With q_bn given, a_b is moved by the up share of the old vector minus
+     *  the up share of the new one at that attitude, so nothing steps. Use it
+     *  where only the owner of the bias changes: the first hand-over, a
+     *  restarted source, taking the vector away again (bias_b all zero).
+     *  With q_bn NULL the change reaches the propagation as it is. Use it
+     *  while one source keeps refining its estimate.
+     *
+     *  No-op if the filter is not initialized or an argument is non-finite.
+     *
+     *  @param[in,out] b The filter instance.
+     *  @param[in] bias_b Accelerometer bias in the body frame [m/s^2], NULL
+     *                    for zero.
+     *  @param[in] q_bn Attitude for the compensation in a_b, or NULL for
+     *                  none. */
+    void baro_alt_set_acc_bias_body(baro_alt_t* b, const float bias_b[3], const float q_bn[4]);
+
+    /** @brief Add a step to the acceleration correction a_b (REQ-BARO-029).
+     *
+     *  For a caller that starts or stops correcting the accelerometer input
+     *  itself (e.g. with the bias estimate of another filter): shifting a_b
+     *  by the opposite of the input change keeps a_up + a_b, and with it the
+     *  propagation, continuous. The covariance is left unchanged. No-op if
+     *  the filter is not initialized or delta_mps2 is non-finite.
+     *
+     *  @param[in,out] b The filter instance.
+     *  @param[in] delta_mps2 Step added to a_b [m/s^2]. */
+    void baro_alt_shift_acc_bias(baro_alt_t* b, float delta_mps2);
+
     /** @brief Fuse a zero-velocity pseudo-measurement (ZUPT) into the vertical
      *  channel: z = 0 observing only v (H = [0 1 0]).
      *
@@ -399,6 +462,12 @@ extern "C"
      *  @param[out] acc_bias_mps2 Acceleration correction [m/s^2].
      *  @return false if the filter is not initialized/healthy. */
     bool baro_alt_get_acc_bias(const baro_alt_t* b, float* acc_bias_mps2);
+
+    /** @brief 1-sigma of the vertical acceleration correction a_b.
+     *  @param[in] b The filter instance.
+     *  @param[out] stddev_mps2 1-sigma of a_b [m/s^2].
+     *  @return false if the filter is not initialized/healthy. */
+    bool baro_alt_get_acc_bias_stddev(const baro_alt_t* b, float* stddev_mps2);
 
     /** @brief Effective up-acceleration input of the last predict step (specific
      *  force rotated to NED, gravity removed, BEFORE the a_b correction is added

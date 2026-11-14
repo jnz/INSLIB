@@ -188,15 +188,21 @@ int nav_suite_init(nav_suite_t* s, const ins_init_t* init, const ins_options_t* 
     s->local_gnss_cfg.chi2_disable = opt->chi2_disable;
 
     /* One IMU loss threshold for every filter (REQ-SUITE-027). */
-    s->ars_cfg.imu_loss_timeout_sec  = opt->imu_loss_timeout_sec;
-    s->ahrs_cfg.imu_loss_timeout_sec = opt->imu_loss_timeout_sec;
-    s->baro_cfg.imu_loss_timeout_sec = opt->imu_loss_timeout_sec;
-    s->have_last_imu                 = false;
-    s->n_imu_loss                    = 0;
-    s->level_win.count               = 0;
-    s->n_att_boot_moving             = 0;
-    s->baro_datum_known              = false;
-    s->mag_model.valid               = false; /* REQ-SUITE-029 */
+    s->ars_cfg.imu_loss_timeout_sec    = opt->imu_loss_timeout_sec;
+    s->ahrs_cfg.imu_loss_timeout_sec   = opt->imu_loss_timeout_sec;
+    s->baro_cfg.imu_loss_timeout_sec   = opt->imu_loss_timeout_sec;
+    s->have_last_imu                   = false;
+    s->n_imu_loss                      = 0;
+    s->level_win.count                 = 0;
+    s->n_att_boot_moving               = 0;
+    s->baro_datum_known                = false;
+    s->mag_model.valid                 = false; /* REQ-SUITE-029 */
+    s->baro_ins_acc_bias_disable       = false; /* REQ-SUITE-031 */
+    s->baro_ins_acc_bias_active        = false;
+    s->baro_ins_acc_bias_up_mps2       = 0.0f;
+    s->baro_ins_acc_bias_ins_start     = 0;
+    s->baro_ins_acc_bias_health_resets = 0;
+    s->baro_ins_acc_bias_b[0] = s->baro_ins_acc_bias_b[1] = s->baro_ins_acc_bias_b[2] = 0.0f;
 
     /* Stillness definition (REQ-SUITE-020): same reasoning as the chi2 flag
        above, for the question "is the platform standing still". ins, the two
@@ -376,12 +382,95 @@ static void nav_suite_check_imu_loss(nav_suite_t* s, ins_time_us_t t)
  * nav_suite_get_rpy (ins if ready, else the magnetometer AHRS, else the ARS).
  * Without nav_suite_get_rpy's heading carry-over (REQ-SUITE-022): the only
  * consumer is baro_alt's vertical channel, whose projection of the
- * accelerometer onto the down axis is yaw-invariant. */
-static bool nav_suite_best_quaternion(const nav_suite_t* s, float q_bn[4])
+ * accelerometer onto the down axis is yaw-invariant. *tilt_stddev_rad is the
+ * larger of roll/pitch 1-sigma of that same source (REQ-SUITE-030). */
+/* @satisfies REQ-SUITE-030 */
+static bool nav_suite_best_quaternion(const nav_suite_t* s, float q_bn[4], float* tilt_stddev_rad)
 {
-    if (ins_is_ready(&s->ins) && ins_get_quaternion(&s->ins, q_bn)) { return true; }
-    if (ahrs_get_quaternion(&s->ahrs, q_bn)) { return true; }
-    return ahrs_get_quaternion(&s->ars, q_bn);
+    float sr = 0.0f, sp = 0.0f, sy = 0.0f;
+    bool  ok;
+    if (ins_is_ready(&s->ins) && ins_get_quaternion(&s->ins, q_bn))
+    {
+        ok = ins_get_rpy_stddev(&s->ins, &sr, &sp, &sy);
+    }
+    else if (ahrs_get_quaternion(&s->ahrs, q_bn))
+    {
+        ok = ahrs_get_rpy_stddev(&s->ahrs, &sr, &sp, &sy);
+    }
+    else if (ahrs_get_quaternion(&s->ars, q_bn))
+    {
+        ok = ahrs_get_rpy_stddev(&s->ars, &sr, &sp, &sy);
+    }
+    else { return false; }
+    *tilt_stddev_rad = ok ? fmaxf(sr, sp) : 0.0f;
+    return true;
+}
+
+/* INS accelerometer bias for the vertical channel (REQ-SUITE-031). While ins is
+ * ready its body-frame bias estimate is handed to baro_alt as a vector, in
+ * every epoch. baro_alt subtracts it before rotating the sample and keeps it
+ * when ins drops out, so the vertical channel has the bias of ins through the
+ * outage, in whatever attitude the platform takes then.
+ *
+ * The hand-over compensates in a_b (an attitude is passed along) where only
+ * the owner of the bias changes: the first hand-over, a new ins instance, the
+ * withdrawal. While one instance keeps supplying the vector, it is passed
+ * without compensation if ins states the bias along the vertical more
+ * precisely than baro_alt states a_b, so the better estimate reaches the
+ * propagation. Otherwise it is compensated and baro_alt keeps its own total:
+ * an ins that has just started still moves its bias from the initial value to
+ * the truth, which a baro_alt running for longer already holds in a_b. */
+/* @satisfies REQ-SUITE-031 */
+static void nav_suite_baro_acc_bias(nav_suite_t* s, const float q_bn[4])
+{
+    float             b_acc[3]      = {0.0f, 0.0f, 0.0f};
+    const ins_diag_t* diag          = ins_get_diag(&s->ins);
+    const uint32_t    health_resets = (diag != NULL) ? diag->n_health_reset : 0u;
+    const bool        fresh         = !s->baro_ins_acc_bias_disable && ins_is_ready(&s->ins) &&
+                       ins_get_bias_acc(&s->ins, b_acc) &&
+                       ins_vec3_within(b_acc, INS_IMU_ACC_ABS_MAX_MPS2);
+
+    if (fresh)
+    {
+        /* ins restamps its start time at every bootstrap, so a changed stamp
+           is a new instance even if no epoch saw the old one go. */
+        const bool same_source =
+            s->baro_ins_acc_bias_active && s->baro_ins_acc_bias_ins_start == s->ins.t_init;
+        bool follow = false;
+        if (same_source)
+        {
+            float R[9], sd_ins = 0.0f, sd_ab = 0.0f;
+            ins_quat_to_rotmat(q_bn, R);
+            const float up_b[3] = {MAT_ELEM(R, 2, 0, 3, 3), MAT_ELEM(R, 2, 1, 3, 3),
+                                   MAT_ELEM(R, 2, 2, 3, 3)};
+            follow              = ins_get_bias_acc_stddev_along(&s->ins, up_b, &sd_ins) &&
+                     baro_alt_get_acc_bias_stddev(&s->baro_alt, &sd_ab) && sd_ins < sd_ab;
+        }
+        baro_alt_set_acc_bias_body(&s->baro_alt, b_acc, follow ? NULL : q_bn);
+        s->baro_ins_acc_bias_active        = true;
+        s->baro_ins_acc_bias_ins_start     = s->ins.t_init;
+        s->baro_ins_acc_bias_health_resets = health_resets;
+        s->baro_ins_acc_bias_b[0]          = b_acc[0];
+        s->baro_ins_acc_bias_b[1]          = b_acc[1];
+        s->baro_ins_acc_bias_b[2]          = b_acc[2];
+    }
+    else if (s->baro_ins_acc_bias_active &&
+             (s->baro_ins_acc_bias_disable || health_resets != s->baro_ins_acc_bias_health_resets))
+    {
+        /* Switched off, or ins failed its own health check: the vector is
+           withdrawn and a_b takes its up share over. Any other way of ins not
+           being ready keeps the vector in baro_alt. */
+        baro_alt_set_acc_bias_body(&s->baro_alt, NULL, q_bn);
+        s->baro_ins_acc_bias_active = false;
+        s->baro_ins_acc_bias_b[0] = s->baro_ins_acc_bias_b[1] = s->baro_ins_acc_bias_b[2] = 0.0f;
+    }
+
+    /* Share of the held vector in the up-acceleration, for telemetry. */
+    float R[9];
+    ins_quat_to_rotmat(q_bn, R);
+    s->baro_ins_acc_bias_up_mps2 = MAT_ELEM(R, 2, 0, 3, 3) * s->baro_ins_acc_bias_b[0] +
+                                   MAT_ELEM(R, 2, 1, 3, 3) * s->baro_ins_acc_bias_b[1] +
+                                   MAT_ELEM(R, 2, 2, 3, 3) * s->baro_ins_acc_bias_b[2];
 }
 
 /* Vertical datum reconciliation for the GNSS/IMU case: if the baro was already
@@ -1123,7 +1212,8 @@ void nav_suite_correct_step(nav_suite_t* s)
        if the filter trips its health check. */
     /* @satisfies REQ-SUITE-006 */
     float q_bn[4];
-    if (nav_suite_best_quaternion(s, q_bn))
+    float tilt_stddev_rad = 0.0f;
+    if (nav_suite_best_quaternion(s, q_bn, &tilt_stddev_rad))
     {
         if (!s->baro_alt.is_initialized)
         {
@@ -1174,6 +1264,14 @@ void nav_suite_correct_step(nav_suite_t* s)
                     {
                         s->baro_boot_count  = 0; /* reset for a future re-bootstrap */
                         s->baro_datum_known = true;
+                        /* A carried a_b is the residual next to the bias
+                           vector of ins held at that time, so the new
+                           instance gets that vector back as it is, without
+                           compensation in a_b (REQ-SUITE-031). */
+                        if (s->baro_ins_acc_bias_active)
+                        {
+                            baro_alt_set_acc_bias_body(&s->baro_alt, s->baro_ins_acc_bias_b, NULL);
+                        }
                     }
                 }
             }
@@ -1181,6 +1279,8 @@ void nav_suite_correct_step(nav_suite_t* s)
         else
         {
             s->baro_boot_count = 0; /* running: keep the accumulator idle */
+            nav_suite_baro_acc_bias(s, q_bn);
+            baro_alt_set_tilt_stddev(&s->baro_alt, tilt_stddev_rad);
             baro_alt_update(&s->baro_alt, m->timestamp, m->acc.data, q_bn, m->baro.pressure_pa,
                             m->baro.stddev_m, m->baro.is_valid);
             /* A zero-rotation update means the platform is standing still, and
@@ -1319,6 +1419,13 @@ void nav_suite_set_auto_zupt_zaru_disable(nav_suite_t* s, bool disable)
        re-initializes. */
     s->ars_cfg.auto_zaru_disable  = disable;
     s->ahrs_cfg.auto_zaru_disable = disable;
+}
+
+/* @satisfies REQ-SUITE-031 */
+void nav_suite_set_baro_ins_acc_bias_disable(nav_suite_t* s, bool disable)
+{
+    if (s == NULL) return;
+    s->baro_ins_acc_bias_disable = disable; /* the next epoch hands over bumplessly */
 }
 
 /* @satisfies REQ-SUITE-005 REQ-SUITE-022 */

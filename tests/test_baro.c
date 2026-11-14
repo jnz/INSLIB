@@ -55,6 +55,7 @@
 #include "geodetic_toolbox.h"
 #include "sensor_defaults.h"
 #include "linalg.h"
+#include "test_imu_dither.h"
 
 #define GRAVITY    INS_GRAVITY_NOMINAL
 #define US_PER_SEC (1000000LL)
@@ -1237,6 +1238,734 @@ static void scenario_baro_h_process_noise(void)
        construction so the v->h Phi coupling contributes nothing here. */
     const float expect_var = h_noise * h_noise * T;
     CHECK_NEAR(var_100hz, expect_var, expect_var * 0.1f, "matches sigma_h^2 * T closed form");
+}
+
+/* ---------------------------------------------------------------------------
+ * Attitude-error share of the process noise (REQ-BARO-028)
+ * ---------------------------------------------------------------------------
+ */
+
+/* Free-coasts baro_alt like baro_alt_free_coast_v_var, but with a constant
+   horizontal specific force f_hor (level body, so f_n = (f_hor, 0, -g)) and
+   the given tilt 1-sigma set before the run. */
+static float baro_alt_free_coast_v_var_tilt(float f_hor, float tilt_stddev_rad, float T_sec)
+{
+    baro_alt_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.acc_noise_mps2_sqrthz      = 1e-9f; /* negligible: isolate the tilt term */
+    cfg.acc_bias_drift_mps2_sqrthz = 1e-9f;
+    cfg.acc_bias_init_stddev_mps2  = 1e-9f;
+    cfg.v_init_stddev_mps          = 1e-9f;
+
+    baro_alt_t         b;
+    baro_alt_time_us_t t = 0;
+    CHECK_TRUE(baro_alt_init(&b, &cfg, t, pressure_from_altitude(0.0f), 0.0f, 1e-9f) == 0,
+               "tilt noise test init");
+    baro_alt_set_tilt_stddev(&b, tilt_stddev_rad);
+
+    const float q[4]   = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float f_b[3] = {f_hor, 0.0f, -GRAVITY};
+    const float dt     = 0.01f;
+    const int   n      = (int)(T_sec / dt + 0.5f);
+    int         i;
+    for (i = 1; i <= n; ++i)
+    {
+        t += (baro_alt_time_us_t)(dt * (float)US_PER_SEC);
+        baro_alt_update(&b, t, f_b, q, pressure_from_altitude(0.0f), 1.0f, false);
+    }
+    return baro_alt_test_state_var(&b, 1);
+}
+
+static void scenario_baro_tilt_process_noise(void)
+{
+    printf("\n-- scenario: tilt error share of the process noise (REQ-BARO-028) --\n");
+
+    const float T     = 10.0f;
+    const float tilt  = DEG2RAD(2.0f);
+    const float f_hor = 3.0f;
+
+    /* sigma_t^2 * |f_hor|^2 acts like an extra accelerometer noise density,
+       so v's variance grows by that times T. */
+    const float var_tilt   = baro_alt_free_coast_v_var_tilt(f_hor, tilt, T);
+    const float expect_var = tilt * tilt * f_hor * f_hor * T;
+    CHECK_NEAR(var_tilt, expect_var, expect_var * 0.05f, "matches sigma_t^2 * f_hor^2 * T");
+
+    /* No horizontal specific force, no tilt term: a level hover gains
+       nothing from an uncertain attitude. */
+    const float var_level = baro_alt_free_coast_v_var_tilt(0.0f, tilt, T);
+    CHECK_TRUE(var_level < expect_var * 0.01f, "no horizontal force: no tilt term");
+
+    /* 0 and invalid input leave the term out. */
+    const float var_off = baro_alt_free_coast_v_var_tilt(f_hor, 0.0f, T);
+    CHECK_TRUE(var_off < expect_var * 0.01f, "tilt stddev 0: no tilt term");
+    const float var_nan = baro_alt_free_coast_v_var_tilt(f_hor, NAN, T);
+    CHECK_TRUE(var_nan < expect_var * 0.01f, "tilt stddev NaN: no tilt term");
+    const float var_neg = baro_alt_free_coast_v_var_tilt(f_hor, -tilt, T);
+    CHECK_TRUE(var_neg < expect_var * 0.01f, "tilt stddev < 0: no tilt term");
+
+    /* baro_alt_init forgets a value set before it. */
+    baro_alt_config_t cfg;
+    baro_alt_t        b;
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&b, 0, sizeof(b));
+    baro_alt_set_tilt_stddev(&b, tilt);
+    CHECK_TRUE(baro_alt_init(&b, &cfg, 0, pressure_from_altitude(0.0f), 0.0f, 0.0f) == 0,
+               "init after a tilt stddev was set");
+    CHECK_TRUE(!(b.tilt_stddev_rad > 0.0f), "init resets the tilt stddev");
+    baro_alt_set_tilt_stddev((baro_alt_t*)0, tilt); /* NULL: no crash */
+}
+
+/* ---------------------------------------------------------------------------
+ * Step on the acceleration correction (REQ-BARO-029)
+ * ---------------------------------------------------------------------------
+ */
+
+static void scenario_baro_shift_acc_bias(void)
+{
+    printf("\n-- scenario: a_b shift (REQ-BARO-029) --\n");
+
+    baro_alt_config_t cfg;
+    baro_alt_t        b;
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&b, 0, sizeof(b));
+
+    /* Not initialized: no effect. */
+    baro_alt_shift_acc_bias(&b, 0.5f);
+    CHECK_TRUE(!(b.x[2] > 0.0f), "uninitialized: a_b untouched");
+    baro_alt_shift_acc_bias((baro_alt_t*)0, 0.5f); /* NULL: no crash */
+
+    cfg.acc_bias_init_mps2 = 0.02f;
+    CHECK_TRUE(baro_alt_init(&b, &cfg, 0, pressure_from_altitude(0.0f), 0.0f, 0.0f) == 0,
+               "shift test init");
+    float U0[BARO_ALT_STATES * BARO_ALT_STATES], d0[BARO_ALT_STATES], ab;
+    memcpy(U0, b.U, sizeof(U0));
+    memcpy(d0, b.d, sizeof(d0));
+
+    baro_alt_shift_acc_bias(&b, -0.07f);
+    CHECK_TRUE(baro_alt_get_acc_bias(&b, &ab), "a_b after the shift");
+    CHECK_NEAR(ab, -0.05, 1e-6, "a_b moved by the step");
+    CHECK_TRUE(memcmp(U0, b.U, sizeof(U0)) == 0 && memcmp(d0, b.d, sizeof(d0)) == 0,
+               "covariance unchanged");
+    CHECK_NEAR(b.x[0], 0.0, 1e-9, "height unchanged");
+    CHECK_NEAR(b.x[1], 0.0, 1e-9, "velocity unchanged");
+
+    baro_alt_shift_acc_bias(&b, NAN);
+    baro_alt_shift_acc_bias(&b, INFINITY);
+    CHECK_TRUE(baro_alt_get_acc_bias(&b, &ab), "a_b after non-finite steps");
+    CHECK_NEAR(ab, -0.05, 1e-6, "non-finite step ignored");
+}
+
+/* ---------------------------------------------------------------------------
+ * The ins accelerometer bias follows the attitude into baro_alt
+ * (REQ-SUITE-031)
+ *
+ * A body-fixed accelerometer bias, 40 s level, then a roll to 60 deg that is
+ * held. The up share of the bias changes with the roll. baro_alt's own a_b
+ * is one scalar and has to relearn it through the barometer, which shows as
+ * a vertical velocity error after the roll. With the ins correction the
+ * share is rotated along and the error stays away. The run with the
+ * correction switched off is the control: it must show the error, otherwise
+ * the scenario proves nothing.
+ * ---------------------------------------------------------------------------
+ */
+static float suite_bias_roll_max_v_before; /* max |v| between ins start and the roll */
+static int   suite_bias_roll_fix_from;     /* first epoch with a position fix */
+
+static void run_suite_bias_roll(bool disable, int fix_until, float* max_v_after, float* ab_change,
+                                bool* engaged, bool* held_at_end, bool* ins_ready_at_end)
+{
+    suite_bias_roll_max_v_before = 0.0f;
+    const float ab_true[3]       = {0.04f, -0.03f, 0.12f}; /* body FRD [m/s^2] */
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ins_time_us_t t                = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
+    init.pos_init_stddev_m         = 1.0f;
+    init.vel_init_stddev_mps       = 0.1f;
+    init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
+    init.rpy_init_stddev_rad[1]    = DEG2RAD(3.0f);
+    init.acc_bias_init_stddev_mps2 = 0.2f;
+    init.gyr_bias_init_stddev_rps  = DEG2RAD(0.05f);
+    init.magnetic_n[0]             = 20.0f;
+    init.magnetic_n[2]             = 44.0f;
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+    nav_suite_set_auto_zupt_zaru_disable(&s, true);
+    nav_suite_set_baro_ins_acc_bias_disable(&s, disable);
+
+    float phi = 0.0f, ab_start = 0.0f;
+    int   i;
+    *max_v_after = 0.0f;
+    *ab_change   = 0.0f;
+    *engaged     = false;
+    for (i = 0; i < 9000; ++i)
+    {
+        t += US_PER_SEC / 100;
+        /* 0..40 s level, 40..43 s roll to 60 deg, then hold. */
+        const float rate = (i >= 4000 && i < 4300) ? DEG2RAD(20.0f) : 0.0f;
+        phi += rate * 0.01f;
+
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp            = t;
+        m.strapdown_dt_sec     = 0.01f;
+        m.acc.is_valid         = true;
+        m.gyr.is_valid         = true;
+        m.gyr.data[0]          = rate + gauss(1e-3f);
+        m.gyr.data[1]          = gauss(1e-3f);
+        m.gyr.data[2]          = gauss(1e-3f);
+        m.acc.data[0]          = ab_true[0] + gauss(0.01f);
+        m.acc.data[1]          = -GRAVITY * sinf(phi) + ab_true[1] + gauss(0.01f);
+        m.acc.data[2]          = -GRAVITY * cosf(phi) + ab_true[2] + gauss(0.01f);
+        m.local_pos.is_valid   = (i >= suite_bias_roll_fix_from && i < fix_until);
+        m.local_pos.Qll_ned[0] = m.local_pos.Qll_ned[4] = m.local_pos.Qll_ned[8] = 0.0025f;
+        m.baro.is_valid                                                          = true;
+        m.baro.pressure_pa = pressure_from_altitude(300.0f + gauss(0.1f));
+        nav_suite_update(&s, &m);
+
+        float v = 0.0f, ab = 0.0f;
+        if (i >= 4000 && nav_suite_get_baro_alt(&s, (float*)0, &v))
+        {
+            if (fabsf(v) > *max_v_after) { *max_v_after = fabsf(v); }
+        }
+        /* From 5 s on: baro_alt's own start-up transient is over by then. */
+        if (i >= 500 && i >= suite_bias_roll_fix_from && i < 4000 &&
+            nav_suite_get_baro_alt(&s, (float*)0, &v))
+        {
+            if (fabsf(v) > suite_bias_roll_max_v_before)
+            {
+                suite_bias_roll_max_v_before = fabsf(v);
+            }
+        }
+        /* While the correction runs, a_b is only moved by the filter itself:
+           the roll must not show up in it as a hand-over. */
+        if (baro_alt_get_acc_bias(&s.baro_alt, &ab))
+        {
+            if (i == 3999) { ab_start = ab; }
+            if (i == 4299) { *ab_change = fabsf(ab - ab_start); }
+        }
+        *engaged = *engaged || s.baro_ins_acc_bias_active;
+    }
+    *held_at_end      = s.baro_ins_acc_bias_active;
+    *ins_ready_at_end = ins_is_ready(&s.ins);
+}
+
+static void scenario_suite_ins_acc_bias_attitude(void)
+{
+    printf("\n-- scenario: ins accel bias follows the attitude into baro_alt "
+           "(REQ-SUITE-031) --\n");
+
+    float v_on = 0.0f, v_off = 0.0f, step_on = 0.0f, step_off = 0.0f;
+    bool  eng_on = false, eng_off = false, held = false, ready = false;
+    run_suite_bias_roll(false, 9000, &v_on, &step_on, &eng_on, &held, &ready);
+    CHECK_TRUE(ready, "ins ready throughout");
+    run_suite_bias_roll(true, 9000, &v_off, &step_off, &eng_off, &held, &ready);
+    printf("  max |v| after the roll: correction on %.4f m/s, off %.4f m/s\n", (double)v_on,
+           (double)v_off);
+    printf("  a_b change over the roll: correction on %.4f m/s^2, off %.4f m/s^2\n",
+           (double)step_on, (double)step_off);
+
+    CHECK_TRUE(eng_on, "correction engaged");
+    CHECK_TRUE(!eng_off, "control: correction stays off");
+    CHECK_TRUE(v_off > 0.15f, "control: the roll shows in baro_alt's velocity without it");
+    CHECK_TRUE(v_on < 0.05f, "with it the velocity stays put through the roll");
+    CHECK_TRUE(v_on < 0.25f * v_off, "and clearly better than the control");
+    /* The up share of the bias changes by about 0.09 m/s^2 over the roll.
+       Handed to a_b, a_b would move by that much. */
+    CHECK_TRUE(step_on < 0.02f, "the share is not handed to a_b while the correction runs");
+}
+
+/* ---------------------------------------------------------------------------
+ * An ins that is still converging does not disturb baro_alt (REQ-SUITE-031)
+ *
+ * baro_alt runs alone for 30 s and learns the bias in a_b. Then ins gets its
+ * first fixes, starts with a zero bias and finds the 0.12 m/s^2 within
+ * seconds. Followed blindly, that movement adds to what a_b already holds and
+ * shows as a vertical velocity error until a_b has unlearnt its share. ins is
+ * the less precise of the two at that time, so its movement is compensated
+ * and the velocity stays where it is without the correction.
+ * ---------------------------------------------------------------------------
+ */
+static void scenario_suite_ins_acc_bias_converging(void)
+{
+    printf("\n-- scenario: a converging ins does not disturb baro_alt (REQ-SUITE-031) --\n");
+
+    float v_on = 0.0f, v_off = 0.0f, step_on = 0.0f, step_off = 0.0f;
+    bool  eng_on = false, eng_off = false, held = false, ready = false;
+    suite_bias_roll_fix_from = 3000;
+    run_suite_bias_roll(false, 9000, &v_on, &step_on, &eng_on, &held, &ready);
+    const float v_conv_on = suite_bias_roll_max_v_before;
+    run_suite_bias_roll(true, 9000, &v_off, &step_off, &eng_off, &held, &ready);
+    const float v_conv_off   = suite_bias_roll_max_v_before;
+    suite_bias_roll_fix_from = 0;
+    printf("  max |v| while ins converges its bias: correction on %.4f m/s, off %.4f m/s\n",
+           (double)v_conv_on, (double)v_conv_off);
+    printf("  max |v| after the roll: correction on %.4f m/s, off %.4f m/s\n", (double)v_on,
+           (double)v_off);
+
+    CHECK_TRUE(eng_on, "correction engaged");
+    CHECK_TRUE(v_conv_on < v_conv_off + 0.01f, "the start of ins leaves the velocity alone");
+    CHECK_TRUE(v_on < 0.5f * v_off, "and the vector still carries baro_alt through the roll");
+}
+
+/* ---------------------------------------------------------------------------
+ * The ins accelerometer bias carries baro_alt through an ins outage
+ * (REQ-SUITE-031)
+ *
+ * The case the vector exists for: ins knows the bias, its aiding drops out
+ * and the height comes from baro_alt alone. The fixes stop after 35 s, the
+ * coasting window runs out, and only then does the platform roll to 60 deg.
+ * baro_alt has to keep the vector it was handed last and rotate it with the
+ * attitude the ARS supplies now. The control without the correction shows
+ * the velocity error of an a_b that has to relearn its share.
+ * ---------------------------------------------------------------------------
+ */
+static void scenario_suite_ins_acc_bias_outage(void)
+{
+    printf("\n-- scenario: ins accel bias carries baro_alt through an ins outage "
+           "(REQ-SUITE-031) --\n");
+
+    float v_on = 0.0f, v_off = 0.0f, step_on = 0.0f, step_off = 0.0f;
+    bool  eng_on = false, eng_off = false, held_on = false, held_off = false;
+    bool  ready_on = true, ready_off = true;
+    run_suite_bias_roll(false, 3500, &v_on, &step_on, &eng_on, &held_on, &ready_on);
+    run_suite_bias_roll(true, 3500, &v_off, &step_off, &eng_off, &held_off, &ready_off);
+    printf("  max |v| after the roll: correction on %.4f m/s, off %.4f m/s\n", (double)v_on,
+           (double)v_off);
+    printf("  a_b change over the roll: correction on %.4f m/s^2, off %.4f m/s^2\n",
+           (double)step_on, (double)step_off);
+
+    CHECK_TRUE(eng_on, "correction engaged before the outage");
+    CHECK_TRUE(!ready_on && !ready_off, "ins is not ready at the end of the outage");
+    CHECK_TRUE(held_on, "baro_alt still holds the vector of ins");
+    CHECK_TRUE(!held_off, "control: nothing held");
+    CHECK_TRUE(v_off > 0.15f, "control: the roll shows in baro_alt's velocity without it");
+    CHECK_TRUE(v_on < 0.5f * v_off, "with the held vector the roll costs far less");
+}
+
+/* ---------------------------------------------------------------------------
+ * GNSS/INS learns a large 3D accelerometer bias in flight-like attitude
+ * dynamics and carries baro_alt through a GNSS outage with it (REQ-SUITE-031)
+ *
+ * The case the interface exists for, end to end. A platform holds its
+ * position and rocks in roll and pitch, GNSS position and velocity aid ins,
+ * and the accelerometer has a large bias on all three axes. The rocking is
+ * what makes all three components observable for ins: each of them points
+ * up for part of the time. Then GNSS drops out, the coasting window of ins
+ * runs out, and the platform keeps manoeuvring. baro_alt is on its own now,
+ * with the bias vector ins handed it last.
+ *
+ * Without the vector, a_b has to follow the up share of the bias as it
+ * swings with the attitude, which a slow random walk observed through a
+ * barometer cannot do. With it, the bias comes off in the body frame and a_b
+ * only keeps the residual.
+ * ---------------------------------------------------------------------------
+ */
+typedef struct
+{
+    float bias_err_at_outage[3]; /* ins bias minus truth when GNSS stops [m/s^2] */
+    float v_rms, v_max;          /* baro_alt vertical velocity error in the outage [m/s] */
+    float h_rms, h_max;          /* baro_alt height error in the outage [m] */
+    float ab_swing;              /* max - min of a_b in the outage [m/s^2] */
+    bool  ready_before, ready_at_end, held_at_end;
+} gnss_bias_result_t;
+
+static void run_suite_gnss_bias_outage(bool disable, gnss_bias_result_t* out)
+{
+    const float ab_true[3] = {0.30f, -0.25f, 0.30f}; /* body FRD [m/s^2] */
+    const int   n_gnss_end = 6000;                   /* GNSS until 60 s */
+    const int   n_score    = 7000;                   /* scored from 70 s */
+    const int   n_end      = 11000;                  /* 110 s */
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ins_time_us_t t                = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
+    init.pos_init_stddev_m         = 1.0f;
+    init.vel_init_stddev_mps       = 0.1f;
+    init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
+    init.rpy_init_stddev_rad[1]    = DEG2RAD(3.0f);
+    init.acc_bias_init_stddev_mps2 = 0.5f;
+    init.gyr_bias_init_stddev_rps  = DEG2RAD(0.05f);
+    init.magnetic_n[0]             = 20.0f;
+    init.magnetic_n[2]             = 44.0f;
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.gnss_init_dwell_disable = true;
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+    nav_suite_set_auto_zupt_zaru_disable(&s, true);
+    nav_suite_set_baro_ins_acc_bias_disable(&s, disable);
+
+    float g_vec[3];
+    ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+    const float g = g_vec[2];
+
+    memset(out, 0, sizeof(*out));
+    double sum_v2 = 0.0, sum_h2 = 0.0;
+    float  h_ref = 0.0f, ab_min = 1e9f, ab_max = -1e9f;
+    bool   have_h_ref = false;
+    int    n_scored   = 0, i;
+    for (i = 0; i < n_end; ++i)
+    {
+        t += US_PER_SEC / 100;
+        const float tt = (float)i * 0.01f;
+        /* Level for 10 s, then rocking: two periods that do not share a
+           multiple, so the attitude does not repeat within the run. Larger
+           amplitudes once GNSS is gone. */
+        const float amp_r = (i < 1000) ? 0.0f : ((i < n_gnss_end) ? 30.0f : 40.0f);
+        const float amp_p = (i < 1000) ? 0.0f : ((i < n_gnss_end) ? 20.0f : 25.0f);
+        const float wr = 2.0f * (float)M_PI / 7.0f, wp = 2.0f * (float)M_PI / 11.0f;
+        const float ts      = tt - 10.0f;
+        const float phi     = DEG2RAD(amp_r) * sinf(wr * ts);
+        const float theta   = DEG2RAD(amp_p) * sinf(wp * ts);
+        const float phi_d   = DEG2RAD(amp_r) * wr * cosf(wr * ts);
+        const float theta_d = DEG2RAD(amp_p) * wp * cosf(wp * ts);
+
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp        = t;
+        m.strapdown_dt_sec = 0.01f;
+        m.acc.is_valid     = true;
+        m.gyr.is_valid     = true;
+        /* Body rates of a ZYX attitude with constant yaw. */
+        m.gyr.data[0] = phi_d + gauss(1e-3f);
+        m.gyr.data[1] = theta_d * cosf(phi) + gauss(1e-3f);
+        m.gyr.data[2] = -theta_d * sinf(phi) + gauss(1e-3f);
+        /* Specific force of a platform at rest: minus gravity in the body. */
+        m.acc.data[0] = g * sinf(theta) + ab_true[0] + gauss(0.01f);
+        m.acc.data[1] = -g * sinf(phi) * cosf(theta) + ab_true[1] + gauss(0.01f);
+        m.acc.data[2] = -g * cosf(phi) * cosf(theta) + ab_true[2] + gauss(0.01f);
+        if (i < n_gnss_end && (i % 20) == 0) /* 5 Hz */
+        {
+            m.gnss_pos.llh[0]     = init.llh[0];
+            m.gnss_pos.llh[1]     = init.llh[1];
+            m.gnss_pos.llh[2]     = init.llh[2] + (double)gauss(0.05f);
+            m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = 0.01f;
+            m.gnss_pos.Qll_ned[8]                         = 0.04f;
+            m.gnss_pos.is_valid                           = true;
+            m.gnss_vel.vel_ned[0]                         = gauss(0.02f);
+            m.gnss_vel.vel_ned[1]                         = gauss(0.02f);
+            m.gnss_vel.vel_ned[2]                         = gauss(0.02f);
+            m.gnss_vel.Qll_ned[0] = m.gnss_vel.Qll_ned[4] = m.gnss_vel.Qll_ned[8] = 0.0025f;
+            m.gnss_vel.is_valid                                                   = true;
+        }
+        m.baro.is_valid    = true;
+        m.baro.pressure_pa = pressure_from_altitude(300.0f + gauss(0.1f));
+        nav_suite_update(&s, &m);
+
+        if (i == n_gnss_end - 1)
+        {
+            float b[3]                 = {0.0f, 0.0f, 0.0f};
+            out->ready_before          = ins_is_ready(&s.ins) && ins_get_bias_acc(&s.ins, b);
+            out->bias_err_at_outage[0] = b[0] - ab_true[0];
+            out->bias_err_at_outage[1] = b[1] - ab_true[1];
+            out->bias_err_at_outage[2] = b[2] - ab_true[2];
+        }
+        float h = 0.0f, v = 0.0f, ab = 0.0f;
+        if (i == n_score - 1 && nav_suite_get_baro_alt(&s, &h, &v))
+        {
+            h_ref      = h;
+            have_h_ref = true;
+        }
+        if (i >= n_score && have_h_ref && nav_suite_get_baro_alt(&s, &h, &v))
+        {
+            /* The platform neither climbs nor sinks. */
+            const float he = h - h_ref;
+            sum_v2 += (double)v * (double)v;
+            sum_h2 += (double)he * (double)he;
+            if (fabsf(v) > out->v_max) { out->v_max = fabsf(v); }
+            if (fabsf(he) > out->h_max) { out->h_max = fabsf(he); }
+            ++n_scored;
+            if (baro_alt_get_acc_bias(&s.baro_alt, &ab))
+            {
+                if (ab < ab_min) { ab_min = ab; }
+                if (ab > ab_max) { ab_max = ab; }
+            }
+        }
+    }
+    if (n_scored > 0)
+    {
+        out->v_rms = (float)sqrt(sum_v2 / (double)n_scored);
+        out->h_rms = (float)sqrt(sum_h2 / (double)n_scored);
+    }
+    out->ab_swing     = (ab_max > ab_min) ? (ab_max - ab_min) : 0.0f;
+    out->ready_at_end = ins_is_ready(&s.ins);
+    out->held_at_end  = s.baro_ins_acc_bias_active;
+}
+
+static void scenario_suite_gnss_bias_outage_dynamic(void)
+{
+    printf("\n-- scenario: GNSS/INS bias carries baro_alt through an outage under attitude "
+           "dynamics (REQ-SUITE-031) --\n");
+
+    gnss_bias_result_t on, off;
+    run_suite_gnss_bias_outage(false, &on);
+    run_suite_gnss_bias_outage(true, &off);
+    printf("  ins bias error when GNSS stops: %+.3f %+.3f %+.3f m/s^2\n",
+           (double)on.bias_err_at_outage[0], (double)on.bias_err_at_outage[1],
+           (double)on.bias_err_at_outage[2]);
+    printf("  outage, vertical velocity error: with vector rms %.3f max %.3f, without rms %.3f "
+           "max %.3f m/s\n",
+           (double)on.v_rms, (double)on.v_max, (double)off.v_rms, (double)off.v_max);
+    printf("  outage, height error:            with vector rms %.3f max %.3f, without rms %.3f "
+           "max %.3f m\n",
+           (double)on.h_rms, (double)on.h_max, (double)off.h_rms, (double)off.h_max);
+    printf("  outage, swing of a_b:            with vector %.3f, without %.3f m/s^2\n",
+           (double)on.ab_swing, (double)off.ab_swing);
+
+    CHECK_TRUE(on.ready_before, "ins ready on GNSS before the outage");
+    CHECK_TRUE(fabsf(on.bias_err_at_outage[0]) < 0.05f, "ins found the x bias");
+    CHECK_TRUE(fabsf(on.bias_err_at_outage[1]) < 0.05f, "ins found the y bias");
+    CHECK_TRUE(fabsf(on.bias_err_at_outage[2]) < 0.05f, "ins found the z bias");
+    CHECK_TRUE(!on.ready_at_end && !off.ready_at_end, "ins is not ready in the outage");
+    CHECK_TRUE(on.held_at_end, "baro_alt still holds the vector of ins");
+    CHECK_TRUE(!off.held_at_end, "control: nothing held");
+    CHECK_TRUE(off.v_rms > 0.10f, "control: the manoeuvres show in baro_alt's velocity");
+    CHECK_TRUE(on.v_rms < 0.5f * off.v_rms, "vector: velocity error at most half the control");
+    CHECK_TRUE(on.h_max < off.h_max, "vector: largest height error below the control");
+}
+
+/* ---------------------------------------------------------------------------
+ * Body-frame accelerometer bias handed to baro_alt (REQ-BARO-030)
+ *
+ * Standalone baro_alt, a body-fixed bias on a static platform. The vector is
+ * handed over with an attitude (a_b gives the up share away, nothing steps),
+ * then the platform is rolled to 60 deg: with the vector the velocity stays
+ * put, since the bias is taken off before the rotation. Also the edges: a
+ * refined vector without an attitude leaves a_b alone, NULL means zero,
+ * non-finite and uninitialized are ignored, init resets it.
+ * ---------------------------------------------------------------------------
+ */
+static void scenario_baro_body_acc_bias(void)
+{
+    printf("\n-- scenario: body-frame accel bias handed to baro_alt (REQ-BARO-030) --\n");
+
+    const float       base_alt   = 300.0f;
+    const float       bias_b[3]  = {0.04f, -0.03f, 0.12f};
+    const float       q_level[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    baro_alt_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int c;
+    for (c = 0; c < 2; ++c)
+    {
+        const bool         with_vec = (c == 0);
+        baro_alt_t         b;
+        baro_alt_time_us_t t = 1000000;
+        CHECK_TRUE(baro_alt_init(&b, &cfg, t, pressure_from_altitude(base_alt), 0.0f, 0.0f) == 0,
+                   "init");
+        CHECK_TRUE(fabsf(b.acc_bias_b[0]) + fabsf(b.acc_bias_b[1]) + fabsf(b.acc_bias_b[2]) <= 0.0f,
+                   "init: no vector");
+
+        float phi = 0.0f, max_v = 0.0f, v = 0.0f, ab = 0.0f, ab_before = 0.0f, v_before = 0.0f;
+        int   i;
+        for (i = 0; i < 9000; ++i)
+        {
+            t += 10000;
+            const float rate = (i >= 4000 && i < 4300) ? DEG2RAD(20.0f) : 0.0f;
+            phi += rate * 0.01f;
+            const float q[4]   = {cosf(0.5f * phi), sinf(0.5f * phi), 0.0f, 0.0f};
+            const float acc[3] = {bias_b[0], -GRAVITY * sinf(phi) + bias_b[1],
+                                  -GRAVITY * cosf(phi) + bias_b[2]};
+            if (with_vec && i == 3000)
+            {
+                /* Hand-over after a_b has learnt the level share on its own. */
+                (void)baro_alt_get_acc_bias(&b, &ab_before);
+                (void)baro_alt_get_velocity(&b, &v_before);
+                baro_alt_set_acc_bias_body(&b, bias_b, q_level);
+                (void)baro_alt_get_acc_bias(&b, &ab);
+                /* a_up moves by +(R b)_z = +0.12, a_b by the opposite. */
+                CHECK_NEAR(ab, ab_before - bias_b[2], 1e-5,
+                           "hand-over: a_b gives the up share away");
+            }
+            baro_alt_update(&b, t, acc, q, pressure_from_altitude(base_alt + gauss(0.1f)), 0.0f,
+                            true);
+            if (with_vec && i == 3000)
+            {
+                (void)baro_alt_get_velocity(&b, &v);
+                CHECK_TRUE(fabsf(v - v_before) < 0.005f, "hand-over: no velocity step");
+            }
+            if (i >= 4000 && baro_alt_get_velocity(&b, &v) && fabsf(v) > max_v)
+            {
+                max_v = fabsf(v);
+            }
+        }
+        printf("  %s: max |v| after the roll %.4f m/s\n", with_vec ? "with vector" : "a_b alone  ",
+               (double)max_v);
+        if (with_vec) { CHECK_TRUE(max_v < 0.03f, "vector: velocity stays put through the roll"); }
+        else { CHECK_TRUE(max_v > 0.15f, "control: a_b alone shows the roll in the velocity"); }
+
+        if (with_vec)
+        {
+            /* A refined vector without an attitude: a_b untouched. */
+            const float refined[3] = {0.05f, -0.03f, 0.10f};
+            (void)baro_alt_get_acc_bias(&b, &ab_before);
+            baro_alt_set_acc_bias_body(&b, refined, (const float*)0);
+            (void)baro_alt_get_acc_bias(&b, &ab);
+            CHECK_NEAR(ab, ab_before, 1e-9, "no attitude: a_b left alone");
+            CHECK_NEAR(b.acc_bias_b[2], 0.10, 1e-6, "no attitude: vector replaced");
+
+            /* Non-finite arguments are ignored. */
+            const float bad[3]   = {0.0f, NAN, 0.0f};
+            const float q_bad[4] = {1.0f, 0.0f, INFINITY, 0.0f};
+            baro_alt_set_acc_bias_body(&b, bad, q_level);
+            baro_alt_set_acc_bias_body(&b, bias_b, q_bad);
+            (void)baro_alt_get_acc_bias(&b, &ab);
+            CHECK_NEAR(b.acc_bias_b[2], 0.10, 1e-6, "non-finite arguments: vector kept");
+            CHECK_NEAR(ab, ab_before, 1e-9, "non-finite arguments: a_b kept");
+
+            /* NULL takes the vector away, with the compensation in a_b. */
+            baro_alt_set_acc_bias_body(&b, (const float*)0, q_level);
+            (void)baro_alt_get_acc_bias(&b, &ab);
+            CHECK_NEAR(b.acc_bias_b[2], 0.0, 1e-9, "NULL: vector zero");
+            CHECK_NEAR(ab, ab_before + 0.10f, 1e-5, "NULL with attitude: a_b takes the share back");
+        }
+    }
+
+    /* NULL instance and an uninitialized one: no effect, no crash. */
+    baro_alt_t dead;
+    memset(&dead, 0, sizeof(dead));
+    baro_alt_set_acc_bias_body((baro_alt_t*)0, bias_b, q_level);
+    baro_alt_set_acc_bias_body(&dead, bias_b, q_level);
+    CHECK_TRUE(fabsf(dead.acc_bias_b[2]) <= 0.0f, "uninitialized: ignored");
+}
+
+/* ---------------------------------------------------------------------------
+ * nav_suite hands ins's accelerometer bias and attitude uncertainty to
+ * baro_alt (REQ-SUITE-030, REQ-SUITE-031)
+ *
+ * Level and static, local-position aiding and a barometer from the start,
+ * a body-frame accelerometer bias on the IMU. Once ins is ready its bias
+ * estimate is taken off the sample baro_alt sees, without a step in the
+ * vertical propagation, and switching it off and on again at runtime is
+ * bumpless as well.
+ * ---------------------------------------------------------------------------
+ */
+
+static void scenario_suite_ins_acc_bias_to_baro(void)
+{
+    printf("\n-- scenario: ins accel bias and tilt stddev reach baro_alt "
+           "(REQ-SUITE-030, REQ-SUITE-031) --\n");
+
+    const float ab_true[3] = {0.04f, -0.03f, 0.12f}; /* body FRD [m/s^2] */
+
+    ins_init_t init;
+    memset(&init, 0, sizeof(init));
+    ins_time_us_t t                = 1000000;
+    init.time                      = t;
+    init.llh[0]                    = 48.783 * M_PI / 180.0;
+    init.llh[1]                    = 9.181 * M_PI / 180.0;
+    init.llh[2]                    = 300.0;
+    init.pos_init_stddev_m         = 1.0f;
+    init.vel_init_stddev_mps       = 0.1f;
+    init.rpy_init_stddev_rad[0]    = DEG2RAD(3.0f);
+    init.rpy_init_stddev_rad[1]    = DEG2RAD(3.0f);
+    init.acc_bias_init_stddev_mps2 = 0.2f;
+    init.gyr_bias_init_stddev_rps  = DEG2RAD(0.05f);
+    init.pos_pred_stddev_m_sqrts   = 0.01f;
+    init.vel_pred_stddev_mps_sqrts = 0.05f;
+    init.rpy_pred_stddev_rad_sqrts = DEG2RAD(0.01f);
+    init.zero_vel_stddev_mps       = 0.01f;
+    init.zero_rot_stddev_rps       = DEG2RAD(0.001f);
+    init.magnetic_n[0]             = 20.0f;
+    init.magnetic_n[2]             = 44.0f;
+
+    ins_options_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.kalman_update_dt_sec               = 0.01f;
+    opt.max_prediction_time_sec            = 0.5f;
+    opt.gnss_max_horizontal_pos_stddev_m   = 10.0f;
+    opt.gnss_max_vertical_pos_stddev_m     = 20.0f;
+    opt.gnss_max_horizontal_vel_stddev_mps = 1.0f;
+    opt.gnss_max_vertical_vel_stddev_mps   = 2.0f;
+    opt.magnetometer_min_delay_ms          = 200;
+
+    static nav_suite_t s;
+    memset(&s, 0, sizeof(s));
+    CHECK_TRUE(nav_suite_init(&s, &init, &opt) == 0, "nav_suite_init");
+    nav_suite_set_auto_zupt_zaru_disable(&s, true);
+
+    ins_measurements_t m;
+    int                i;
+    float              ab, v, v_prev = 0.0f, max_dv = 0.0f;
+    bool               engaged_seen = false;
+    for (i = 1; i <= 3000; ++i)
+    {
+        t += US_PER_SEC / 100;
+        memset(&m, 0, sizeof(m));
+        m.timestamp            = t;
+        m.strapdown_dt_sec     = 0.01f;
+        m.acc.is_valid         = true;
+        m.gyr.is_valid         = true;
+        m.acc.data[0]          = ab_true[0];
+        m.acc.data[1]          = ab_true[1];
+        m.acc.data[2]          = -GRAVITY + ab_true[2];
+        m.local_pos.is_valid   = true;
+        m.local_pos.Qll_ned[0] = m.local_pos.Qll_ned[4] = m.local_pos.Qll_ned[8] = 0.0025f;
+        m.baro.is_valid                                                          = true;
+        m.baro.pressure_pa = pressure_from_altitude(300.0f + gauss(0.1f));
+        nav_suite_update(&s, &m);
+        /* The epoch the correction engages must not kick the velocity. */
+        if (nav_suite_get_baro_alt(&s, (float*)0, &v))
+        {
+            if (s.baro_ins_acc_bias_active && !engaged_seen)
+            {
+                engaged_seen = true;
+                max_dv       = fabsf(v - v_prev);
+            }
+            v_prev = v;
+        }
+    }
+    CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL, "ins ready");
+    CHECK_TRUE(engaged_seen && s.baro_ins_acc_bias_active, "correction engaged");
+    CHECK_TRUE(max_dv < 0.01f, "no velocity step when it engages");
+
+    /* Level body: the up share is the z component of ins's bias, and the
+       total correction (a_b + up share) is the true vertical bias. */
+    CHECK_NEAR(s.baro_ins_acc_bias_up_mps2, ab_true[2], 0.02, "up share = ins z bias");
+    CHECK_TRUE(baro_alt_get_acc_bias(&s.baro_alt, &ab), "a_b available");
+    CHECK_NEAR(ab + s.baro_ins_acc_bias_up_mps2, ab_true[2], 0.03, "total vertical correction");
+
+    /* Tilt stddev: the larger roll/pitch 1-sigma of ins, the attitude source. */
+    float sr, sp, sy;
+    CHECK_TRUE(ins_get_rpy_stddev(&s.ins, &sr, &sp, &sy), "ins rpy stddev");
+    CHECK_NEAR(s.baro_alt.tilt_stddev_rad, fmaxf(sr, sp), 1e-6, "tilt stddev from ins");
+
+    /* Switch off: a_b takes the up share over in the same epoch. */
+    const float up_before = s.baro_ins_acc_bias_up_mps2;
+    float       ab_before;
+    (void)baro_alt_get_acc_bias(&s.baro_alt, &ab_before);
+    nav_suite_set_baro_ins_acc_bias_disable(&s, true);
+    nav_suite_update(&s, &m);
+    CHECK_TRUE(!s.baro_ins_acc_bias_active, "disabled: correction off");
+    (void)baro_alt_get_acc_bias(&s.baro_alt, &ab);
+    CHECK_NEAR(ab, ab_before + up_before, 0.002, "disabled: a_b took the up share over");
+
+    /* And on again. */
+    nav_suite_set_baro_ins_acc_bias_disable(&s, false);
+    nav_suite_update(&s, &m);
+    CHECK_TRUE(s.baro_ins_acc_bias_active, "re-enabled: correction on");
+    (void)baro_alt_get_acc_bias(&s.baro_alt, &ab);
+    CHECK_NEAR(ab, ab_before, 0.002, "re-enabled: a_b back to the residual");
+    CHECK_TRUE(nav_suite_get_baro_alt(&s, (float*)0, &v), "baro running");
+    CHECK_NEAR(v, 0.0, 0.02, "velocity unaffected by the switching");
+    nav_suite_set_baro_ins_acc_bias_disable((nav_suite_t*)0, true); /* NULL: no crash */
 }
 
 /* ---------------------------------------------------------------------------
@@ -4496,6 +5225,45 @@ static void scenario_nav_suite_mcdc_guards(void)
     }
 }
 
+/* NULL arguments at the step API (REQ-BARO-026): dropped, nothing touched. */
+static void scenario_step_null_args(void)
+{
+    printf("\n=== Scenario: NULL arguments at the step API (REQ-BARO-026) ===\n");
+
+    const float       base_alt = 300.0f;
+    baro_alt_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    baro_alt_t         b;
+    baro_alt_time_us_t t = 1000000;
+    CHECK_TRUE(baro_alt_init(&b, &cfg, t, pressure_from_altitude(base_alt), 0.0f, 0.0f) == 0,
+               "init");
+
+    const float acc[3]  = {0.0f, 0.0f, -INS_GRAVITY_NOMINAL};
+    const float q_bn[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    const float p       = pressure_from_altitude(base_alt);
+    t += 10000;
+    baro_alt_update(&b, t, acc, q_bn, p, 0.0f, true);
+    float h_before = 0.0f, h_after = 0.0f;
+    CHECK_TRUE(baro_alt_get_height(&b, &h_before), "height before");
+
+    t += 10000;
+    CHECK_TRUE(baro_alt_predict_step((baro_alt_t*)0, t, acc, q_bn, p, 0.0f, true, (float*)0) ==
+                   BARO_ALT_EPOCH_DROPPED,
+               "predict_step(NULL instance) drops the epoch");
+    CHECK_TRUE(baro_alt_predict_step(&b, t, (const float*)0, q_bn, p, 0.0f, true, (float*)0) ==
+                   BARO_ALT_EPOCH_DROPPED,
+               "predict_step(NULL accel) drops the epoch");
+    CHECK_TRUE(baro_alt_predict_step(&b, t, acc, (const float*)0, p, 0.0f, true, (float*)0) ==
+                   BARO_ALT_EPOCH_DROPPED,
+               "predict_step(NULL attitude) drops the epoch");
+    baro_alt_correct_step((baro_alt_t*)0);
+    baro_alt_update((baro_alt_t*)0, t, acc, q_bn, p, 0.0f, true);
+    local_gnss_alt_update((local_gnss_alt_t*)0, t, 0.0f, 1.0f, 0.0f, 1.0f);
+    CHECK_TRUE(b.is_initialized, "filter still running");
+    CHECK_TRUE(baro_alt_get_height(&b, &h_after), "height after");
+    CHECK_NEAR(h_after, h_before, 1e-9, "the dropped epochs left the state alone");
+}
+
 static void scenario_predict_correct_equivalence(void)
 {
     printf("\n-- scenario: baro_alt_update() == "
@@ -4623,6 +5391,8 @@ int main(void)
     scenario_baro_h_init();
     scenario_baro_rate_invariant_process_noise();
     scenario_baro_h_process_noise();
+    scenario_baro_tilt_process_noise();
+    scenario_baro_shift_acc_bias();
     scenario_baro_datum_shift();
     scenario_offset_filter();
     scenario_offset_drift_tracking();
@@ -4631,6 +5401,20 @@ int main(void)
     scenario_offset_low_rate_default();
     scenario_chi2_disable();
     scenario_baro_anchor_from_ins();
+    scenario_suite_ins_acc_bias_to_baro();
+    {
+        /* These scenarios run on a noise sequence of their own and hand the
+           shared generator back as they found it, so the scenarios after
+           them see the same noise whether or not these exist. */
+        const uint32_t rng_keep = g_rng;
+        g_rng                   = 90210u;
+        scenario_suite_ins_acc_bias_attitude();
+        scenario_suite_ins_acc_bias_outage();
+        scenario_suite_ins_acc_bias_converging();
+        scenario_suite_gnss_bias_outage_dynamic();
+        scenario_baro_body_acc_bias();
+        g_rng = rng_keep;
+    }
     scenario_baro_anchor_during_warmup();
     scenario_datum_gnss_then_baro();
     scenario_datum_baro_then_lighthouse();
@@ -4652,6 +5436,7 @@ int main(void)
     scenario_baro_measurement_accessors();
     scenario_nav_suite_mcdc_guards();
     scenario_predict_correct_equivalence();
+    scenario_step_null_args();
     printf("\n==== %d failures ====\n", fails);
     return fails == 0 ? 0 : 1;
 }

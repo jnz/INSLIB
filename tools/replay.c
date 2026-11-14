@@ -328,6 +328,8 @@ typedef struct
                                     (0 -> baro_alt default) */
     float baro_h_process_noise;       /* baro_alt direct height process-noise
                                        density [m/sqrt(Hz)] (0 -> baro_alt default) */
+    int   baro_ins_acc_bias_disable;  /* 1 -> baro_alt does not get ins's
+                                         accel bias (REQ-SUITE-031) */
     float baro_acc_noise_mps2_sqrthz; /* baro_alt's own direct accel-noise
                                  density [m/s^2/sqrt(Hz)] (0 -> baro_alt default) */
     /* local-height/GNSS-ellipsoid offset filter tuning (all 0 ->
@@ -691,6 +693,10 @@ static int cfg_set(replay_cfg_t* c, const char* sec, const char* key, const char
     else if (!strcmp(full, "baro.acc_bias_rw")) { c->baro_acc_bias_rw = (float)d; }
     else if (!strcmp(full, "baro.acc_bias_init_mps2")) { c->baro_acc_bias_init_mps2 = (float)d; }
     else if (!strcmp(full, "baro.h_process_noise")) { c->baro_h_process_noise = (float)d; }
+    else if (!strcmp(full, "baro.ins_acc_bias_disable"))
+    {
+        c->baro_ins_acc_bias_disable = (int)d;
+    }
     else if (!strcmp(full, "baro.acc_noise_mps2_sqrthz"))
     {
         c->baro_acc_noise_mps2_sqrthz = (float)d;
@@ -2119,6 +2125,7 @@ int main(int argc, char** argv)
     {
         g_suite.baro_cfg.acc_noise_mps2_sqrthz = cfg.baro_acc_noise_mps2_sqrthz;
     }
+    nav_suite_set_baro_ins_acc_bias_disable(&g_suite, cfg.baro_ins_acc_bias_disable != 0);
 
     /* local-height/GNSS-ellipsoid offset filter tuning (0 ->
        local_gnss_alt's own defaults). Same latch-before-first-pair timing

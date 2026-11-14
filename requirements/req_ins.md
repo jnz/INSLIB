@@ -210,7 +210,7 @@ the body frame), each rate-limited to one fusion per Kalman period.
 
 - **Status:** verified
 - **Parent:** REQ-NAV-012
-- **Verification:** Test: tests/test_ins_core.c:scenario_auto_zupt; Test: tests/test_ins_core.c:scenario_static_variance_gate; Test: tests/test_ins_core.c:scenario_auto_zupt_gnss_vel_while_moving
+- **Verification:** Test: tests/test_ins_core.c:scenario_auto_zupt; Test: tests/test_ins_core.c:scenario_static_variance_gate; Test: tests/test_ins_core.c:scenario_static_variance_frozen_imu; Test: tests/test_ins_core.c:scenario_auto_zupt_gnss_vel_while_moving
 
 The filter shall detect stillness autonomously and inject
 zero-velocity/zero-rotation updates without an external trigger,
@@ -236,6 +236,39 @@ single sample. An epoch carrying no IMU sample shall leave the window
 and the latched verdict untouched: absence of evidence is not evidence
 of motion, and clearing the verdict there would let every interleaved
 sensor epoch of a mixed-rate stream veto the detector.
+
+A completed window in which the accelerometer shows exactly zero spread
+on all three axes shall be judged "not still" and counted
+(ins_diag_t.n_imu_frozen), with a rate-limited warning. The same shall
+hold for the gyro once it has shown exactly zero spread on all three axes
+over a run of consecutive completed windows (ten of them, about two
+seconds at the window length above), and from then on for every further
+window of that run. Before the run is that long, a gyro window without
+spread shall be judged by the ordinary criteria. A real sensor does not
+repeat itself bit for bit that long, so this is a frozen driver or bus
+replaying its last value: the opposite of evidence of standstill.
+Accepting it would let ZUPT/ZARU pin velocity and gyro bias to dead data
+and shrink the covariance while doing so, masking the very drift that
+would otherwise reveal the fault. Only the all-axes case counts: a single
+coarsely quantized axis can legitimately hold one value over a short
+window.
+
+Rationale for treating the two sensors differently: a gyro on a coarse
+range behind a narrow low-pass filter has noise well below one LSB and
+legitimately reads one code on all three axes for many windows on end
+while standing still, so vetoing its first window without spread would
+take the zero-rotation update away from exactly the sensor that needs it
+most. Waiting costs little there, because the dangerous case is a frozen
+stream on a MOVING platform, and a live accelerometer on a moving
+platform fails the variance bound on its own. The accelerometer has no
+such second witness (a frozen accelerometer reads as perfectly smooth
+travel), and its noise sits near or above one LSB in every common
+configuration, hence the immediate veto.
+
+The frozen-sensor verdict shall not depend on the detector being enabled:
+the window shall be fed and judged, counted and warned about with the
+detector disabled (opt.auto_zupt_disable) and while the filter is still
+collecting for its bootstrap, where it merely triggers no update.
 
 Rationale for variance rather than magnitude: a constant sensor bias
 shifts the sample mean but not its spread. A magnitude-only gate
@@ -982,12 +1015,12 @@ gates keep grading the reported vertical accuracy.
 
 - **Status:** implemented
 - **Parent:** REQ-SYS-005
-- **Verification:** Test: tests/test_ins_core.c:scenario_auto_reacquire_after_health_fail; Test: tests/test_ins_core.c:scenario_time_jump_reset_reacquires
+- **Verification:** Test: tests/test_ins_core.c:scenario_auto_reacquire_after_health_fail; Test: tests/test_ins_core.c:scenario_time_jump_reset_reacquires; Test: tests/test_ins_core.c:scenario_nonfinite_bias_health
 
 Unless opt.auto_reacquire_disable is set, AND provided auto-init is enabled
 (opt.auto_init), a health-check shutdown (a non-finite or negative
-covariance factor, or a non-finite nominal position/velocity/attitude
-state) shall not leave the filter permanently dead: the filter shall
+covariance factor, or a non-finite nominal position, velocity, attitude
+or accelerometer, gyro or magnetometer bias state) shall not leave the filter permanently dead: the filter shall
 return to the collecting state (is_initialized false, is_collecting true)
 and re-bootstrap autonomously from the next temporally-coherent IMU+fix
 window via the normal auto-init path (REQ-NAV-033), without an external
@@ -1120,7 +1153,7 @@ datasets/ does.
 
 - **Status:** implemented
 - **Parent:** REQ-NAV-015
-- **Verification:** Test: tests/test_ins_core.c:scenario_autoinit_mag_yaw_cached
+- **Verification:** Test: tests/test_ins_core.c:scenario_autoinit_mag_yaw_cached; Test: tests/test_ins_core.c:scenario_autoinit_mag_yaw_bias_carry
 
 The magnetometer-derived heading of the auto-init bootstrap (REQ-NAV-015,
 priority 2) shall not require a magnetometer sample in the same
@@ -1136,7 +1169,12 @@ carries no concurrent mag, use that cached sample for the tilt-compensated
 heading provided it is no older than opt.max_prediction_time_sec (the
 static gate that admits the bootstrap already guarantees the platform is
 near-stationary, so a heading that recent still holds). A staler cache, or
-none at all, falls back to "unknown" as before. The cache is cleared on
+none at all, falls back to "unknown" as before. Where a magnetometer
+hard-iron bias is carried into the bootstrap (REQ-NAV-061), the heading
+shall be computed from the sample less that bias: the filter subtracts it
+from the first fused sample on, and a heading taken from the raw sample
+would start the yaw off by the very error the carried bias had already
+removed. The cache is cleared on
 ins_init and on an autonomous re-acquisition (REQ-NAV-042) so a
 pre-failure heading is never reused. Rationale: co-timestamped
 GNSS+mag+IMU is an artifact of some replay converters, not how real
@@ -2437,14 +2475,30 @@ initialised is unaffected.
 - **Parent:** REQ-SYS-006
 - **Verification:** Test: tests/test_ins_core.c:scenario_gnss_rate_limit
 
-The filter shall not fuse two GNSS epochs closer together in time than
-opt.gnss_min_delay_ms. A usable fix arriving sooner than that after the
-last fix the filter actually spent shall be skipped whole -- both the
-position and the velocity block, unlike the decimation of REQ-NAV-063,
-which withholds one of the two -- and counted in
-ins_diag_t.n_gnss_rate_limited. A value of 0 shall resolve to the
-built-in default (100 ms, i.e. 10 Hz), a negative value shall disable
-the limit, the same convention opt.magnetometer_min_delay_ms uses.
+The filter shall not fuse GNSS epochs at a higher average rate than one
+per opt.gnss_min_delay_ms. A usable fix arriving ahead of the schedule
+shall be skipped whole -- both the position and the velocity block,
+unlike the decimation of REQ-NAV-063, which withholds one of the two --
+and counted in ins_diag_t.n_gnss_rate_limited. A value of 0 shall resolve
+to the built-in default (100 ms, i.e. 10 Hz), a negative value shall
+disable the limit, the same convention opt.magnetometer_min_delay_ms uses.
+
+The schedule shall be a due time that advances by one interval per spent
+fix, starting from the later of the previous due time and the epoch of
+that fix. A fix shall count as due when it arrives no more than a quarter
+of the interval ahead of the due time. A stream running at the configured
+rate shall therefore pass in full however its epochs jitter within that
+quarter: a fix that came early does not pull the schedule forward, so the
+earliness never accumulates into a higher rate, and one that came late
+does not push the following fix out of its slot.
+
+Rationale for the tolerance: fix epochs reach the filter stamped with the
+IMU epoch they were attached to, so a 10 Hz receiver shows spacings that
+scatter around 100 ms by up to an IMU period, and a receiver clock running
+marginally fast shows 99.9 ms throughout. A bare comparison against the
+interval skips every such fix and then waits for the next one, which
+halves the rate of exactly the receiver the default is meant to leave
+alone.
 
 The limit shall be suspended while the coasting window has expired
 (REQ-NAV-023): the next usable fix is then a re-acquisition anchor rather
@@ -3178,3 +3232,25 @@ the cached values change by only about 1.6e-5 relative per 100 m. The
 forced refresh bounds the staleness for a configuration that never leaves
 a free epoch (a covariance prediction at the IMU rate, say). That
 configuration gets the old behaviour back, at a ten times lower rate.
+
+## REQ-NAV-095 — A non-finite configuration is refused
+
+- **Status:** verified
+- **Parent:** REQ-SYS-007
+- **Verification:** Test: tests/test_ins_core.c:scenario_init_validation; Test: tests/test_ins_core.c:scenario_set_world_model
+
+ins_init() shall fail if any floating-point field of ins_init_t or
+ins_options_t is not finite, whether it is a noise density, a threshold,
+an initial state, a reference vector or a calibration matrix.
+ins_set_world_model() shall ignore a gravity or magnetic vector with a
+non-finite component, the way it ignores a NULL one, and leave the
+reference it replaces in place.
+
+Rationale: the measurements are sanitized at every epoch (REQ-NAV-018),
+the configuration was not. Most fields resolve "0 -> default" with a
+comparison a NaN answers like a valid setting, and an initial state or a
+reference vector is copied as it stands, so one non-finite value reached
+the nominal state or the covariance and the health check (REQ-NAV-042)
+then restarted the filter on every bootstrap, with the same
+configuration. Refusing the init reports the cause where it is, instead
+of a filter that never becomes ready.

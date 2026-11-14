@@ -253,6 +253,18 @@ typedef struct
     bool               baro_datum_known; /**< baro_alt has run: a re-bootstrap keeps its datum
                                               (baro_alt.h0_baro_m, REQ-SUITE-027) */
 
+    /* INS accelerometer bias forwarded to baro_alt (REQ-SUITE-031), see
+       nav_suite_set_baro_ins_acc_bias_disable(). */
+    bool  baro_ins_acc_bias_disable;           /**< true -> baro_alt gets the plain sample */
+    bool  baro_ins_acc_bias_active;            /**< baro_alt holds a bias vector from ins */
+    float baro_ins_acc_bias_up_mps2;           /**< its share of the up-acceleration in the
+                                                    last epoch [m/s^2] */
+    float         baro_ins_acc_bias_b[3];      /**< that vector, body frame [m/s^2] */
+    ins_time_us_t baro_ins_acc_bias_ins_start; /**< start time of the ins instance
+                                                    it came from */
+    uint32_t baro_ins_acc_bias_health_resets;  /**< ins health shutdowns seen when
+                                                    it was handed over */
+
     /* IMU loss (REQ-SUITE-027): the suite sees the epochs without IMU that the
        ARS/AHRS and baro_alt never get, so it stops them itself. */
     bool          have_last_imu; /**< t_last_imu is set */
@@ -467,6 +479,19 @@ extern "C"
      *  @param[in] disable true -> no automatic source can arm until called
      *      again with false. */
     void nav_suite_set_auto_zupt_zaru_disable(nav_suite_t* s, bool disable);
+
+    /** @brief Stop (or resume) handing ins's accelerometer bias estimate to
+     *  baro_alt (REQ-SUITE-031).
+     *
+     *  Enabled by default: while ins is ready the suite takes its body-frame
+     *  accelerometer bias off the sample it feeds baro_alt, whose own a_b then
+     *  only carries the rest. The price is independence: baro_alt then leans on
+     *  an ins estimate, so its vertical velocity is no longer a fully separate
+     *  cross-check of ins's. Switching in either direction is bumpless, the
+     *  change is handed to baro_alt's a_b. nav_suite_init() enables it again.
+     *  @param[in,out] s The suite instance.
+     *  @param[in] disable true -> baro_alt runs on its own a_b alone. */
+    void nav_suite_set_baro_ins_acc_bias_disable(nav_suite_t* s, bool disable);
 
     /** @brief Roll/pitch/yaw from the best available source: INS if
      *  ready, else the magnetometer AHRS, else the ARS.

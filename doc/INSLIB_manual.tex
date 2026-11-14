@@ -131,7 +131,7 @@
        \large Software Documentation and Mathematical Models\\[1cm]
        \includegraphics[width=0.33\textwidth]{figures/inslib_logo.pdf}
 }
-\newcommand{\inslibversion}{1.4.2}
+\newcommand{\inslibversion}{1.4.3}
 \author{Jan Zwiener \\ \texttt{jan@zwiener.org}}
 \date{Version \inslibversion\\[2mm] \today}
 
@@ -435,7 +435,11 @@ two estimators has to read.
 \paragraph{IMU loss.}
 \label{sec:suite_imu_loss}
 An IMU gap of \code{imu\_\allowbreak{}loss\_\allowbreak{}timeout\_\allowbreak{}sec}
-(\SI{0.2}{\second}) breaks every filter of the suite. On the first epoch that
+(\SI{0.2}{\second}) breaks every filter of the suite. This is also the lower
+bound on the IMU rate: two samples that far apart are a loss by definition,
+so the IMU has to deliver faster than the reciprocal of the timeout (more
+than \SI{5}{\hertz} at the default), with margin for jitter. A slower IMU
+needs a larger timeout. On the first epoch that
 finds the IMU stale the wrapper stops the ARS, the AHRS and
 \code{baro\_\allowbreak{}alt}, \code{ins} stops itself (\S\ref{sec:robust}).
 The mode becomes \code{NONE} and the heading carry-over is dropped. When the
@@ -638,6 +642,12 @@ following common best practices of navigation filters \cite{carpenter2018}:
         Such a value is finite and passes every finiteness test, but a single one
         rotates the attitude by an arbitrary angle within one epoch, from which a
         filter with a small covariance needs minutes to recover.
+        The configuration is screened the same way, once:
+        \code{ins\_\allowbreak{}init()} and \code{ahrs\_\allowbreak{}init()} return
+        $-1$ if any floating-point field of their configuration is NaN or Inf,
+        and \code{ins\_\allowbreak{}set\_\allowbreak{}world\_\allowbreak{}model()}
+        ignores a non-finite reference vector. A filter that started has
+        therefore never seen a non-finite setting.
   \item Statistical screening with two policies: each scalar measurement row is
         tested with a Mahalanobis (chi-square) gate inside the UDU update
         (\S\ref{sec:robust-udu}). \emph{Persistent absolute references} (GNSS,
@@ -1788,6 +1798,30 @@ must all hold:
     criterion, which a platform whose standstill is inherently noisy
     needs (a station-keeping multicopter puts more spread on the IMU
     from its rotors than handheld motion does).
+    There is a lower limit as well: a sensor that shows \emph{exactly}
+    zero spread on all three axes counts as a frozen sensor or bus
+    replaying its last sample, not as a standstill. For the
+    accelerometer a single such window is enough. The gyro has to stay
+    without spread for ten windows in a row (about \SI{2}{\second}):
+    on a coarse range behind a narrow low-pass filter its noise is well
+    below one LSB, and it legitimately holds one code for many windows
+    while standing still. The wait costs little, because a frozen stream
+    is dangerous on a \emph{moving} platform, where the live
+    accelerometer fails the variance bound on its own. A frozen window
+    is judged ``not still'', counted
+    (\code{ins\_\allowbreak{}diag\_\allowbreak{}t.n\_\allowbreak{}imu\_\allowbreak{}frozen}, and
+    \code{n\_\allowbreak{}imu\_\allowbreak{}frozen} of the ARS/AHRS fallback) and
+    reported by a rate-limited warning. Otherwise ZUPT/ZARU would pin
+    velocity and gyro bias to dead data and shrink the covariance doing
+    so, masking the drift that would reveal the fault. A single
+    coarsely quantized axis holding one value does not trigger it.
+    The verdict does not depend on the detector: it is also reached
+    with the detector switched off and while \code{ins} is still
+    collecting for its bootstrap. Noise-free synthetic data is vetoed
+    the same way, so test streams need a small dither. A gyro whose
+    noise stays below roughly a fifth of an LSB can still read as frozen
+    now and then. The warning names the sensor, and a finer range or a
+    wider filter bandwidth removes the cause.
   \item[Magnitude bounds.] $\|\vect{\omega}\| \le \omega_{\max}$,
     $\big|\|\vect{f}\| - g\big| \le a_{\max}$, applied to the
     bias-\emph{corrected} sample. It is retained alongside the variance
@@ -1851,8 +1885,8 @@ Consequently there are two opt-outs and not one:
 while \code{auto\_\allowbreak{}zupt\_\allowbreak{}velocity\_\allowbreak{}blind\_\allowbreak{}disable} removes only this
 velocity-blind fallback and leaves ins deciding for everyone. The
 latter is for a profile that the IMU alone cannot tell from a standstill (in
-particular a noiseless synthetic constant-rate climb or constant-velocity leg:
-zero sample variance and a gravity-only specific force
+particular a constant-rate climb or constant-velocity leg: barely any
+sample variance and a gravity-only specific force
 flatten exactly the trajectory under test). It has the same runtime switch as
 the own detector of ins
 (\code{ahrs\_\allowbreak{}set\_\allowbreak{}auto\_\allowbreak{}zaru\_\allowbreak{}disable}), and
@@ -2462,6 +2496,69 @@ under-inject noise at other rates. The accelerometer is a control input and
 \emph{not} a measurement: between barometer samples the filter dead-reckons on
 it.
 
+\paragraph{Attitude uncertainty.} The supplied attitude is not exact. Small
+tilt errors $\delta\theta_N, \delta\theta_E$ move the up component of the rotated
+specific force by $\delta\theta_N f_E - \delta\theta_E f_N$, so the error grows
+with the horizontal specific force, while the gravity share only enters at
+second order. With the roll/pitch 1-sigma $\sigma_t$ of the attitude source
+(\code{baro\_\allowbreak{}alt\_\allowbreak{}set\_\allowbreak{}tilt\_\allowbreak{}stddev}) each prediction
+step adds this share to the accelerometer noise density:
+\begin{equation}
+  \sigma_a^2 \;\rightarrow\; \sigma_a^2 + \sigma_t^2\left(f_N^2 + f_E^2\right) T,
+  \qquad T = \SI{1}{\second}.
+\end{equation}
+The factor $T$ is what makes the sum consistent: $\sigma_a^2$ is a noise
+density in $(\si{\metre\per\second\squared})^2/\si{\hertz}$, the tilt share a
+variance in $(\si{\metre\per\second\squared})^2$. The attitude error is not
+white, it wanders with the corrections of the attitude filter. A first-order
+process of variance $s^2$ and correlation time $\tau$ has the low-frequency
+density $2 s^2 \tau$, so $T = 2\tau$ and the value used models an attitude
+error that decorrelates within half a second
+(\code{BARO\_ALT\_TILT\_VAR\_TO\_PSD\_SEC} in \code{baro\_alt.c}).
+At rest and in a level hover the term vanishes, in turns and under strong
+horizontal acceleration it takes over. \code{nav\_\allowbreak{}suite} hands over the
+larger of the roll and pitch 1-sigma of the source it takes the attitude from
+in every epoch. A standalone caller that never sets it gets the plain
+$\sigma_a$ model above.
+
+\paragraph{Accelerometer bias from ins.} \code{ins} observes the full 3D
+accelerometer bias $\vect{b}_a$, $a_b$ only its projection on the vertical,
+through a random walk that cannot follow a body-fixed bias through a change of
+orientation. While \code{ins} is ready, \code{nav\_\allowbreak{}suite} therefore hands
+$\vect{b}_a$ to \code{baro\_\allowbreak{}alt} as a vector in every epoch
+(\code{baro\_\allowbreak{}alt\_\allowbreak{}set\_\allowbreak{}acc\_\allowbreak{}bias\_\allowbreak{}body}).
+\code{baro\_\allowbreak{}alt} subtracts it from the sample \emph{before} the
+rotation to NED, which shifts $a_{\text{up}}$ by $[\Rbn\vect{b}_a]_z$ and lets
+the correction follow every change of orientation, and $a_b$ only keeps the
+residual.
+
+\code{baro\_\allowbreak{}alt} keeps the vector when \code{ins} is no longer ready.
+This is the case it exists for: GNSS drops out, the height comes from
+\code{baro\_\allowbreak{}alt} alone, and the bias knowledge of \code{ins} carries
+it through the outage in whatever attitude the platform takes, for as long as
+the bias itself holds. Only a health-check shutdown of \code{ins} withdraws the
+vector.
+
+Where only the owner of the bias changes (the first hand-over, a new
+\code{ins} instance, the withdrawal), the difference of the up share is
+handed to $a_b$ with the opposite sign, so $a_{\text{up}} + a_b$ does not step.
+While one instance keeps supplying the vector, the two filters' own
+uncertainties decide. If \code{ins} states the bias along the vertical more
+precisely than \code{baro\_\allowbreak{}alt} states $a_b$, nothing is
+compensated and the refined estimate reaches the propagation as it is.
+Otherwise the change is compensated: \code{baro\_\allowbreak{}alt} keeps its own
+total and takes only the distribution of the bias over the body axes from
+\code{ins}. This matters right after a start of \code{ins}, which moves its
+bias from the initial value to the truth within seconds while a
+\code{baro\_\allowbreak{}alt} that has been running for longer already holds that
+truth in $a_b$. Followed blindly, the two add up until $a_b$ has unlearnt its
+share. The price
+is independence: with the correction active the vertical velocity of
+\code{baro\_\allowbreak{}alt} is no longer a fully separate cross-check of the one
+of \code{ins}. \code{baro: ins\_\allowbreak{}acc\_\allowbreak{}bias\_\allowbreak{}disable: 1}
+(\code{nav\_\allowbreak{}suite\_\allowbreak{}set\_\allowbreak{}baro\_\allowbreak{}ins\_\allowbreak{}acc\_\allowbreak{}bias\_\allowbreak{}disable})
+switches it off.
+
 \paragraph{Barometer measurement.} Pressure is converted with the
 International Standard Atmosphere:
 \begin{equation}
@@ -3058,10 +3155,16 @@ gnss:
   stop_max_vertical_vel_stddev_mps:   0.0   # [m/s]
   stop_dwell_sec: 0.0       # bad-fix run before the 3D solution is left
   stop_disable: 0           # 1: never leave 3D on GNSS quality alone
-  min_delay_ms: 0           # fusion rate limit: minimum time between two
-                            # fixes the filter actually spends. A fix
-                            # arriving sooner is skipped whole (both blocks)
-                            # and counted in n_gnss_rate_limited; suspended
+  min_delay_ms: 0           # fusion rate limit: interval the fixes the
+                            # filter actually spends are paced to. A fix
+                            # arriving ahead of the schedule is skipped
+                            # whole (both blocks) and counted in
+                            # n_gnss_rate_limited. A fix up to a quarter
+                            # of the interval early still passes, and the
+                            # schedule moves on by whole intervals, so a
+                            # receiver running AT this rate is fused in
+                            # full however its epochs jitter, while the
+                            # average rate stays bounded. Suspended
                             # while the coasting window is expired, so a
                             # tunnel exit is never paced. A GNSS error
                             # decorrelates over seconds, not over the fix
@@ -3234,6 +3337,7 @@ baro:
   acc_bias_init_mps2: 0.0   # INITIAL accel-bias stddev [m/s^2], 0 -> default
   acc_noise_mps2_sqrthz: 0.0 # accel-noise density [m/s^2/sqrt(Hz)]
   h_process_noise: 0.0      # direct height process noise [m/sqrt(Hz)], 0 -> default
+  ins_acc_bias_disable: 0   # 1 -> baro_alt does not get the ins accel bias
   # local-height/GNSS-ellipsoid offset filter tuning (all 0 -> built-in
   # defaults). Raise local_gnss_rw_stddev_mps further for missions with
   # extreme altitude excursions (e.g. a soaring glider gaining kilometres

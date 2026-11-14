@@ -38,7 +38,7 @@ def main():
     t, dt = 0, 0.01
     for _ in range(200):
         t += int(dt * 1e6)
-        # Tiny alternating rate: a constant one trips the stuck-sensor warning.
+        # Tiny alternating rate: a constant one reads as a frozen sensor.
         w = 1e-5 if (t // 10000) % 2 else -1e-5
         nav.imu(t, dt, (0.0, 0.0, -_G), (0.0, 0.0, w))
         nav.update()

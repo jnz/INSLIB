@@ -268,9 +268,13 @@ A few things the filter does for you, so you do not have to:
 
 * **Bad data is dropped.** A NaN or Inf in the gyro or accelerometer drops
   that epoch (counted in `ahrs.n_invalid_input`).
+* **The configuration is checked.** `ahrs_init()` returns -1 if any float in
+  `ahrs_config_t` is NaN or Inf, also in a field the selected mode does not
+  use.
 * **Time stays honest.** A timestamp that goes backwards is ignored. A gap
   of 0.2 s or more between two samples (`imu_loss_timeout_sec`) is an IMU
-  loss: whatever the platform turned in it is unknown, so the filter stops
+  loss, so the IMU has to deliver faster than 5 Hz unless you raise that
+  timeout: whatever the platform turned in it is unknown, so the filter stops
   (`ahrs_get_rpy()` returns false) instead of carrying on with a wrong
   attitude. Restart it with `ahrs_init()`, seeding `gyr_bias_init_rps` and
   `gyr_bias_init_stddev_rps` from `ahrs_get_bias_carry()` so the gyro bias

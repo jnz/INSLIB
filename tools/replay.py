@@ -345,6 +345,10 @@ DEFAULTS = {
              # (Navigator.set_baro_h_process_noise()), schema shared with
              # tools/replay.c.
              "h_process_noise": 0.0,
+             # 1 -> baro_alt does not get ins's accelerometer bias
+             # (Navigator.set_baro_ins_acc_bias_disable()), schema shared
+             # with tools/replay.c.
+             "ins_acc_bias_disable": 0,
              # local-height/GNSS-ellipsoid offset filter tuning (all 0 ->
              # local_gnss_alt's own defaults). Raise local_gnss_rw_stddev_mps
              # further for missions with extreme altitude excursions (e.g. a

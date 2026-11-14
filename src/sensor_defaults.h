@@ -138,6 +138,13 @@
 #define INS_DEFAULT_STATIC_VAR_WINDOW_SEC (0.2f)
 /** Minimum samples in one variance window. */
 #define INS_DEFAULT_STATIC_VAR_MIN_SAMPLES (8u)
+
+/** Consecutive completed stillness windows without any spread on all three
+ *  gyro axes after which the gyro counts as frozen (REQ-NAV-013,
+ *  REQ-AHRS-017). Not a single window as for the accelerometer: a gyro on a
+ *  coarse range behind a narrow low-pass filter has noise well below one LSB
+ *  and legitimately holds one code for many windows while standing still. */
+#define INS_DEFAULT_FROZEN_GYR_WINDOWS (10u)
 /** Required dwell time before a stillness detector arms: ins.c's
  *  auto-ZUPT/ZARU and ahrs.c's auto-ZARU fallback (NOT ins.c's unrelated
  *  auto-init leveling *window*, which is a one-shot bootstrap sample and

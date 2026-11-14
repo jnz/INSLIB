@@ -851,3 +851,76 @@ forgets it when it restarts. A caller that sets the position once, the
 natural place being right after nav_suite_init, would otherwise get a
 heading on magnetic north, off by the local declination, without any
 warning.
+
+## REQ-SUITE-030 — Attitude uncertainty reaches the vertical channel
+
+- **Status:** verified
+- **Parent:** REQ-BARO-028
+- **Verification:** Test: tests/test_baro.c:scenario_suite_ins_acc_bias_to_baro
+
+On every epoch the wrapper feeds baro_alt, it shall hand baro_alt the
+roll/pitch uncertainty of the attitude it feeds it with (REQ-BARO-028):
+the larger of the roll and pitch 1-sigma of that same source, ins while
+it is ready, else the magnetometer AHRS, else the ARS.
+
+## REQ-SUITE-031 — ins accelerometer bias reaches the vertical channel
+
+- **Status:** verified
+- **Parent:** REQ-SUITE-006
+- **Verification:** Test: tests/test_baro.c:scenario_suite_ins_acc_bias_to_baro; Test: tests/test_baro.c:scenario_suite_ins_acc_bias_attitude; Test: tests/test_baro.c:scenario_suite_ins_acc_bias_outage; Test: tests/test_baro.c:scenario_suite_ins_acc_bias_converging; Test: tests/test_baro.c:scenario_suite_gnss_bias_outage_dynamic; Test: tests/test_ahrs.c:scenario_imu_outage_700ms
+
+While ins is ready, the wrapper shall hand ins' body-frame
+accelerometer bias estimate to baro_alt in every epoch, as a vector
+(REQ-BARO-030). The correction shall be on by default;
+nav_suite_set_baro_ins_acc_bias_disable() shall switch it off and on at
+runtime, and nav_suite_init() shall switch it on.
+
+When ins is no longer ready, baro_alt shall keep the vector it was handed
+last, so the bias knowledge of ins carries the vertical channel through
+the outage, rotated with the attitude of whichever filter supplies it
+then. Only a health-check shutdown of ins (REQ-NAV-042) shall withdraw
+the vector, since an estimate from a filter that just failed its own
+health check is not to be relied on.
+
+The hand-over shall leave the vertical propagation without a step
+(REQ-BARO-030, with an attitude) when the vector reaches baro_alt for
+the first time, when it is withdrawn or switched off, and when the ins
+instance it comes from has been replaced by a new one. While one ins
+instance keeps supplying it, the vector shall be handed over without
+that compensation as long as ins states the bias along the vertical more
+precisely than baro_alt states a_b (the 1-sigma of the ins bias
+estimate along the up direction below the 1-sigma of a_b): the estimate
+of ins then is the better one, and its movement shall reach the vertical
+propagation as it is. Where ins is the less precise of the two, the
+hand-over shall be compensated, so baro_alt keeps its own total and only
+takes the distribution of the bias over the body axes from ins. When
+baro_alt
+restarts (REQ-SUITE-027) while a vector is held, the vector shall be
+handed to the new instance without compensation, because the bias carry
+it restarts from is the residual next to that vector.
+
+Rationale: ins observes the full 3D accelerometer bias, baro_alt only
+its projection on the vertical, through a random walk that cannot follow
+a body-fixed bias through a change of orientation. The case that matters
+is the outage: a platform navigates with GNSS, ins knows the bias well,
+GNSS drops out and the height comes from baro_alt alone. A scalar handed
+over at that moment is right for the attitude of that moment only. The
+vector stays right through every manoeuvre of the outage, for as long as
+the bias itself holds, which is minutes. Compensating a change of the
+vector in a_b states that the total correction has not changed. That is
+true where only the owner of the bias changes, and false while ins
+refines an estimate that is better than baro_alt's own. Compensating
+that as well, in every epoch, keeps the sum constant throughout and
+thereby cancels the correction altogether. Never compensating is wrong
+the other way round: right after its start ins moves its bias estimate
+from the initial value to the truth within seconds, while a baro_alt
+that has been running for a while already holds that truth in a_b. The
+two then add up until a_b has unlearnt its share, which on a simulated
+multicopter showed as a vertical velocity error of 0.2 m/s for some 15 s
+after every start of ins. Each filter's own 1-sigma says which of the
+two knows the bias better at that moment, so that is what decides. The
+price is independence: with the correction active
+baro_alt's vertical velocity is no longer a fully separate cross-check
+of ins'. Taking the vector only from a ready ins keeps a diverged or
+unconverged one out of the vertical channel, and a_b stays a state that
+takes up whatever the ins estimate leaves.

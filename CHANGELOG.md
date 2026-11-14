@@ -1,5 +1,46 @@
 # Changelog
 
+## [1.4.3] - 2026-11-14 - Baro Alt Improvements
+
+### Added
+
+- `baro_alt` now considers the roll/pitch uncertainty of the supplied
+  attitude instead of a fixed constant uncertainty.
+- `baro_alt` takes a body-frame accelerometer bias vector from outside
+  and subtracts it before rotating the sample.
+  So `baro_alt` can benefit from an up-to-date accelerometer bias
+  estimation from `ins.c`.
+- Frozen-IMU veto for the stillness detectors improved: a sensor that repeats
+  itself bit for bit on all three axes is a frozen sensor or bus, not a
+  standstill, so it no longer arms ZUPT/ZARU.
+  Noise-free synthetic IMU streams now need a small dither to arm the
+  detectors.
+- `ins_init()` and `ahrs_init()` return -1 if any float of their
+  configuration is NaN or Inf, and `ins_set_world_model()` ignores a
+  non-finite vector.
+
+### Changed
+
+- The 3x3 rotation helpers in `ins.c` are unrolled instead of going
+  through the generic `matmul`/`sgemm_`.
+- The layout of `baro_alt_t`, `nav_suite_t`, `ins_t` and `ahrs_t` changes, code
+  built against the 1.4.2 headers has to be recompiled.
+
+### Fixed
+
+- The GNSS fusion rate limit (`gnss.min_delay_ms`) dropped fixes of a
+  receiver running exactly at the limit: a fix stamped 99.9 ms after the
+  last one was skipped and the next one came 200 ms later.
+- The health check of `INS` did not look at the bias states. A non-finite
+  accelerometer, gyro or magnetometer bias now shuts the filter down.
+- The magnetometer heading of the `INS` bootstrap ignored a hard-iron
+  bias carried over from the previous instance and started the yaw off
+  by the error that bias had already removed.
+- `baro_alt_predict_step()`, `baro_alt_correct_step()`,
+  `baro_alt_update()`, `local_gnss_alt_update()`, `ahrs_predict_step()`
+  and `ahrs_correct_step()` dereferenced a NULL instance. They now return
+  without effect.
+
 ## [1.4.2] - 2026-11-01 - Lean
 
 ### Fixed

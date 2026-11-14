@@ -781,6 +781,13 @@ void ins_suite_set_baro_acc_bias_drift(void* h, float density_mps2_sqrthz)
     if (c && density_mps2_sqrthz > 0.0f)
         c->suite.baro_cfg.acc_bias_drift_mps2_sqrthz = density_mps2_sqrthz;
 }
+/* Stop (nonzero) or resume handing ins's accelerometer bias to baro_alt
+   (REQ-SUITE-031). May be called at any time, the switch is bumpless. */
+void ins_suite_set_baro_ins_acc_bias_disable(void* h, int disable)
+{
+    ins_suite_ctx_t* c = (ins_suite_ctx_t*)h;
+    if (c) nav_suite_set_baro_ins_acc_bias_disable(&c->suite, disable != 0);
+}
 /* baro_alt's own direct accel-noise density [m/s^2/sqrt(Hz)] (<=0 ->
    baro_alt default). Same latch-on-first-baro-sample timing as
    ins_suite_set_baro_acc_bias_drift(). */

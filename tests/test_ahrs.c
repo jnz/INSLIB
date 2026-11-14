@@ -28,6 +28,7 @@
 #include "magnetic_model.h"
 #include "sensor_defaults.h"
 #include "linalg.h"
+#include "test_imu_dither.h"
 
 #define GRAVITY    INS_GRAVITY_NOMINAL
 #define US_PER_SEC (1000000LL)
@@ -2574,6 +2575,114 @@ static void scenario_auto_zaru_fallback(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Scenario: frozen IMU vetoes the auto-ZARU fallback (REQ-AHRS-017). A
+ * sensor repeating its last sample bit for bit has zero spread, which
+ * passes any upper variance bound. The fallback must read it as a frozen
+ * driver/bus and count it, the accelerometer from its first window on and
+ * the gyro once the run of windows without spread is long enough, with the
+ * fallback disabled as well, and arm again once live samples return. The undithered stream is fed
+ * through (ahrs_update), the dithered control through the wrapped ahrs_update.
+ * ---------------------------------------------------------------------------
+ */
+
+static void scenario_auto_zaru_frozen_imu(void)
+{
+    printf("\n-- scenario: frozen IMU vetoes the auto-ZARU fallback --\n");
+
+    float f_b[3];
+    body_meas_from_rpy(0.0f, 0.0f, 0.0f, f_b, (const float*)0, (float*)0);
+    const float gyr[3] = {0.0f, 0.0f, DEG2RAD(0.5f)};
+
+    ahrs_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode                   = AHRS_MODE_ARS;
+    cfg.rpy_init_stddev_rad[0] = DEG2RAD(3.0f);
+    cfg.rpy_init_stddev_rad[1] = DEG2RAD(3.0f);
+
+    int c, i;
+    for (c = 0; c < 3; ++c)
+    {
+        const bool     frozen_gyr = (c == 1);
+        const bool     frozen_acc = (c == 2);
+        ahrs_t         a;
+        ahrs_time_us_t t = 1000000;
+        CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "init");
+        bool     ever_applied = false, applied_1s = false, applied_late = false;
+        uint32_t n_frozen_1s = 0;
+        for (i = 0; i < 800; ++i) /* 8 s, far past the dwell */
+        {
+            t += US_PER_SEC / 100;
+            /* Freeze one sensor only, the other keeps its dither. */
+            const float s    = test_dither_sign(t);
+            float       g[3] = {gyr[0], gyr[1], gyr[2]};
+            float       f[3] = {f_b[0], f_b[1], f_b[2]};
+            if (!frozen_gyr) { test_dither3(gyr, g, TEST_IMU_DITHER_GYR_RPS, s); }
+            if (!frozen_acc) { test_dither3(f_b, f, TEST_IMU_DITHER_ACC_MPS2, s); }
+            (ahrs_update)(&a, t, g, f, (const float*)0, false);
+            ever_applied = ever_applied || ahrs_zaru_applied(&a);
+            if (i < 100) { applied_1s = applied_1s || ahrs_zaru_applied(&a); }
+            if (i == 99) { n_frozen_1s = a.n_imu_frozen; }
+            if (i >= 400) { applied_late = applied_late || ahrs_zaru_applied(&a); }
+        }
+        if (c == 0)
+        {
+            CHECK_TRUE(ever_applied, "control: dithered standstill arms the fallback");
+            CHECK_TRUE(a.n_imu_frozen == 0, "control: no frozen window counted");
+        }
+        else if (frozen_gyr)
+        {
+            /* A short run of gyro windows without spread is no verdict yet. */
+            CHECK_TRUE(applied_1s, "gyro without spread: fallback armed in the first second");
+            CHECK_TRUE(n_frozen_1s == 0, "gyro without spread: not frozen after one second");
+            CHECK_TRUE(!applied_late, "frozen gyro: nothing fused once the run is long");
+            CHECK_TRUE(a.n_imu_frozen > 0, "frozen gyro: windows counted");
+        }
+        else
+        {
+            CHECK_TRUE(!ever_applied, "frozen accel never arms the fallback");
+            CHECK_TRUE(a.n_imu_frozen > 0, "frozen windows counted");
+        }
+    }
+
+    /* The verdict does not depend on the fallback being enabled. */
+    {
+        ahrs_config_t off     = cfg;
+        off.auto_zaru_disable = true;
+        ahrs_t         a;
+        ahrs_time_us_t t = 1000000;
+        CHECK_TRUE(ahrs_init(&a, &off, t) == 0, "init (fallback off)");
+        bool applied = false;
+        for (i = 0; i < 300; ++i)
+        {
+            t += US_PER_SEC / 100;
+            (ahrs_update)(&a, t, gyr, f_b, (const float*)0, false);
+            applied = applied || ahrs_zaru_applied(&a);
+        }
+        CHECK_TRUE(a.n_imu_frozen > 0, "fallback off: frozen windows still counted");
+        CHECK_TRUE(!applied, "fallback off: nothing fused");
+    }
+
+    /* Recovery: live samples after a frozen stretch arm it again. */
+    ahrs_t         a;
+    ahrs_time_us_t t = 1000000;
+    CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "init (recovery)");
+    bool applied_frozen = false;
+    for (i = 0; i < 300; ++i)
+    {
+        t += US_PER_SEC / 100;
+        (ahrs_update)(&a, t, gyr, f_b, (const float*)0, false);
+        applied_frozen = applied_frozen || ahrs_zaru_applied(&a);
+    }
+    CHECK_TRUE(!applied_frozen, "nothing fused while frozen");
+    for (i = 0; i < 300; ++i)
+    {
+        t += US_PER_SEC / 100;
+        ahrs_update(&a, t, gyr, f_b, (const float*)0, false);
+    }
+    CHECK_TRUE(ahrs_zaru_applied(&a), "fallback arms again after recovery");
+}
+
+/* ---------------------------------------------------------------------------
  * Scenario: velocity-blind auto-ZARU fallback averages out vibration
  * (REQ-AHRS-016, REQ-AHRS-017). Mirrors test_ins_core.c's
  * scenario_auto_zaru_vibration: zaru_gyr_sum/count is filled by
@@ -4474,6 +4583,141 @@ static void scenario_precision_restart(void)
    bit-for-bit. Also checks that phi_out is filled with a non-trivial
    (non-identity) transition matrix whenever the covariance is actually
    propagated. */
+/* ---------------------------------------------------------------------------
+ * Scenario: a timestamp running backwards discards the stillness window and
+ * its latched verdict (REQ-AHRS-017). The fallback is armed, the clock is set
+ * back, and the verdict from before the jump must be gone at once instead of
+ * arming the fallback on the new clock. A still stream then arms it again.
+ * ---------------------------------------------------------------------------
+ */
+static void scenario_auto_zaru_time_jump_back(void)
+{
+    printf("\n-- scenario: backward time jump discards the stillness verdict --\n");
+
+    float f_b[3];
+    body_meas_from_rpy(0.0f, 0.0f, 0.0f, f_b, (const float*)0, (float*)0);
+    const float gyr[3] = {0.0f, 0.0f, DEG2RAD(0.5f)};
+
+    ahrs_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode                   = AHRS_MODE_ARS;
+    cfg.rpy_init_stddev_rad[0] = DEG2RAD(3.0f);
+    cfg.rpy_init_stddev_rad[1] = DEG2RAD(3.0f);
+
+    ahrs_t         a;
+    ahrs_time_us_t t = 10000000;
+    int            i;
+    CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "init");
+    for (i = 0; i < 200; ++i)
+    {
+        t += US_PER_SEC / 100;
+        ahrs_update(&a, t, gyr, f_b, (const float*)0, false);
+    }
+    CHECK_TRUE(ahrs_zaru_applied(&a), "fusing before the jump");
+
+    t -= 5 * US_PER_SEC;
+    ahrs_update(&a, t, gyr, f_b, (const float*)0, false);
+    CHECK_TRUE(!ahrs_zaru_applied(&a), "nothing fused in the jump epoch");
+    CHECK_TRUE(!a.static_var_ok, "latched verdict discarded");
+    CHECK_TRUE(a.static_var_count == 0, "window discarded");
+
+    /* The epochs right after the jump have no completed window to stand on. */
+    bool applied_early = false;
+    for (i = 0; i < 10; ++i)
+    {
+        t += US_PER_SEC / 100;
+        ahrs_update(&a, t, gyr, f_b, (const float*)0, false);
+        applied_early = applied_early || ahrs_zaru_applied(&a);
+    }
+    CHECK_TRUE(!applied_early, "nothing fused off the old verdict");
+    for (i = 0; i < 200; ++i)
+    {
+        t += US_PER_SEC / 100;
+        ahrs_update(&a, t, gyr, f_b, (const float*)0, false);
+    }
+    CHECK_TRUE(ahrs_zaru_applied(&a), "fusing again on the new clock");
+}
+
+/* ---------------------------------------------------------------------------
+ * Scenario: a non-finite value in any float of the configuration is rejected
+ * (REQ-AHRS-008). One field of each kind: a tuning value that resolves
+ * "0 -> default", an initial state, an optional threshold.
+ * ---------------------------------------------------------------------------
+ */
+static void scenario_init_nonfinite_config(void)
+{
+    printf("\n-- scenario: non-finite configuration is rejected --\n");
+
+    ahrs_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode                   = AHRS_MODE_ARS;
+    cfg.rpy_init_stddev_rad[0] = DEG2RAD(3.0f);
+    cfg.rpy_init_stddev_rad[1] = DEG2RAD(3.0f);
+
+    ahrs_t a;
+    CHECK_TRUE(ahrs_init(&a, &cfg, 1000000) == 0, "control: the unmodified configuration starts");
+
+    ahrs_config_t bad = cfg;
+    bad.gyr_noise_psd = NAN;
+    CHECK_TRUE(ahrs_init(&a, &bad, 1000000) == -1, "NaN gyro noise rejected");
+    bad             = cfg;
+    bad.acc_freq_hz = INFINITY;
+    CHECK_TRUE(ahrs_init(&a, &bad, 1000000) == -1, "infinite accel rate rejected");
+    bad                      = cfg;
+    bad.gyr_bias_init_rps[1] = NAN;
+    CHECK_TRUE(ahrs_init(&a, &bad, 1000000) == -1, "NaN initial gyro bias rejected");
+    bad                           = cfg;
+    bad.restart_att_stddev_rad[2] = NAN;
+    CHECK_TRUE(ahrs_init(&a, &bad, 1000000) == -1, "NaN restart threshold rejected");
+    bad                      = cfg;
+    bad.imu_loss_timeout_sec = -INFINITY;
+    CHECK_TRUE(ahrs_init(&a, &bad, 1000000) == -1, "infinite IMU loss timeout rejected");
+    /* The yaw stddev is unused in ARS mode, non-finite is refused all the same. */
+    bad                        = cfg;
+    bad.rpy_init_stddev_rad[2] = NAN;
+    CHECK_TRUE(ahrs_init(&a, &bad, 1000000) == -1, "NaN in an unused field rejected");
+}
+
+/* ---------------------------------------------------------------------------
+ * Scenario: NULL arguments at the step API (REQ-AHRS-025).
+ * ---------------------------------------------------------------------------
+ */
+static void scenario_step_null_args(void)
+{
+    printf("\n-- scenario: NULL arguments at the step API --\n");
+
+    float f_b[3];
+    body_meas_from_rpy(0.0f, 0.0f, 0.0f, f_b, (const float*)0, (float*)0);
+    const float gyr[3] = {0.0f, 0.0f, 0.0f};
+
+    ahrs_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode                   = AHRS_MODE_ARS;
+    cfg.rpy_init_stddev_rad[0] = DEG2RAD(3.0f);
+    cfg.rpy_init_stddev_rad[1] = DEG2RAD(3.0f);
+    ahrs_t         a;
+    ahrs_time_us_t t = 1000000;
+    CHECK_TRUE(ahrs_init(&a, &cfg, t) == 0, "init");
+    t += US_PER_SEC / 100;
+    ahrs_update(&a, t, gyr, f_b, (const float*)0, false);
+    const uint32_t epoch_before = a.epoch;
+
+    t += US_PER_SEC / 100;
+    CHECK_TRUE((ahrs_predict_step)((ahrs_t*)0, t, gyr, f_b, (const float*)0, false, (float*)0) ==
+                   AHRS_EPOCH_DROPPED,
+               "predict_step(NULL instance) drops the epoch");
+    CHECK_TRUE((ahrs_predict_step)(&a, t, (const float*)0, f_b, (const float*)0, false,
+                                   (float*)0) == AHRS_EPOCH_DROPPED,
+               "predict_step(NULL gyro) drops the epoch");
+    CHECK_TRUE((ahrs_predict_step)(&a, t, gyr, (const float*)0, (const float*)0, false,
+                                   (float*)0) == AHRS_EPOCH_DROPPED,
+               "predict_step(NULL accel) drops the epoch");
+    ahrs_correct_step((ahrs_t*)0);
+    (ahrs_update)((ahrs_t*)0, t, gyr, f_b, (const float*)0, false);
+    CHECK_TRUE(a.epoch == epoch_before, "the dropped epochs left the filter alone");
+    CHECK_TRUE(a.is_initialized, "filter still running");
+}
+
 static void scenario_predict_correct_equivalence(void)
 {
     printf("\n-- scenario: ahrs_update() == ahrs_predict_step()+ahrs_correct_step() --\n");
@@ -5054,6 +5298,9 @@ static void gapscn_run(bool aiding_in_gap, gapscn_result_t* res)
     CHECK_TRUE(nav_suite_get_mode(&s) == NAV_SUITE_MODE_FULL, "suite in FULL before the outage");
     CHECK_TRUE(nav_suite_get_baro_alt(&s, &h_before, &v_tmp), "baro_alt running before the outage");
     CHECK_TRUE(baro_alt_get_acc_bias(&s.baro_alt, &ab_before), "baro_alt acc bias available");
+    /* Total vertical correction: a_b plus the share of ins's accelerometer
+       bias the suite already took off the sample (REQ-SUITE-031). */
+    if (s.baro_ins_acc_bias_active) { ab_before += s.baro_ins_acc_bias_up_mps2; }
     CHECK_TRUE(ahrs_get_bias_gyr(&s.ars, gyr_bias_before), "ars gyro bias available");
     memcpy(ins_ab_before, s.ins.state.acc_bias, sizeof(ins_ab_before));
     gapscn_report(&s, (double)(t - t0) * 1e-6, "before");
@@ -5136,6 +5383,7 @@ static void gapscn_run(bool aiding_in_gap, gapscn_result_t* res)
 
         if (nav_suite_get_baro_alt(&s, &h, &v) && baro_alt_get_acc_bias(&s.baro_alt, &ab))
         {
+            if (s.baro_ins_acc_bias_active) { ab += s.baro_ins_acc_bias_up_mps2; }
             res->max_dab = gapscn_max(res->max_dab, fabs((double)ab - (double)ab_before));
             res->max_dh  = gapscn_max(res->max_dh, fabs((double)h - (double)h_before));
             res->max_v   = gapscn_max(res->max_v, fabs((double)v));
@@ -5989,6 +6237,10 @@ int main(void)
     scenario_mag_edge_cases();
     scenario_zaru();
     scenario_auto_zaru_fallback();
+    scenario_auto_zaru_frozen_imu();
+    scenario_auto_zaru_time_jump_back();
+    scenario_init_nonfinite_config();
+    scenario_step_null_args();
     scenario_auto_zaru_vibration();
     scenario_auto_zaru_disable_runtime();
     scenario_zaru_applied_accessor();

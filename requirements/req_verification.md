@@ -300,9 +300,10 @@ and pins agreement with an independent textbook filter.
 
 `make simulated` shall additionally gate the C harness alone on
 `datasets/simulated/A_ideal`, a noise-free flight whose config opts out of
-the auto-ZUPT/ZARU (its slow phases have zero sample variance and would
-otherwise read as a standstill, pinning the velocity and absorbing the turn
-rate into the gyro bias) and carries tight `score:` limits on ins attitude
+the auto-ZUPT/ZARU (its slow phases have zero sample variance, which the
+frozen-sensor veto of REQ-NAV-013 already rejects, but the gate shall not
+rest on that: read as a standstill they would pin the velocity and absorb
+the turn rate into the gyro bias) and carries tight `score:` limits on ins attitude
 and position, the height channels and the ARS, so such a fault fails the
 run instead of passing unnoticed, and on both configs of
 `datasets/simulated/B_drone`, a UAV flight with a GNSS outage. Its own

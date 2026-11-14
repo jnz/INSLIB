@@ -82,13 +82,13 @@ deadlock the filter.
 
 - **Status:** implemented
 - **Parent:** REQ-SYS-002
-- **Verification:** Inspection: ahrs_resolve_config, defaults match pyahrs.py constructor defaults
+- **Verification:** Inspection: ahrs_resolve_config, defaults match pyahrs.py constructor defaults; Test: tests/test_ahrs.c:scenario_init_nonfinite_config
 
 Every noise/tuning configuration field left at 0 shall be replaced by
 a documented default (taken from the pyahrs.py reference); only the
 initial attitude and its standard deviation are mandatory. Invalid
-configurations (non-positive or non-finite mandatory fields) shall be
-rejected at init.
+configurations (non-positive mandatory fields, or a non-finite value in
+any floating-point field) shall be rejected at init.
 
 ## REQ-AHRS-009 — Python reference equivalence
 
@@ -243,7 +243,7 @@ from outside; see REQ-SUITE-009 for how nav_suite supplies one.
 
 - **Status:** verified
 - **Parent:** REQ-AHRS-016
-- **Verification:** Test: tests/test_ahrs.c:scenario_auto_zaru_fallback
+- **Verification:** Test: tests/test_ahrs.c:scenario_auto_zaru_fallback; Test: tests/test_ahrs.c:scenario_auto_zaru_frozen_imu; Test: tests/test_ahrs.c:scenario_auto_zaru_time_jump_back
 
 The filter shall provide a fallback stillness detector
 (opt-out via ahrs_config_t.auto_zaru_disable, ARMED by default -- the
@@ -265,7 +265,15 @@ an IMU alone, at any threshold, so a platform whose profile is dominated
 by such cruise should opt out. The variance criterion matters more here than
 in ins: this filter has no accelerometer bias state at all, so a
 magnitude-only accelerometer gate tripped by a biased sensor could
-never be escaped. It shall stay armed for the whole stillness run once dwelled
+never be escaped. A window with exactly zero spread on all three
+accelerometer axes, or a run of consecutive windows with exactly zero
+spread on all three gyro axes, is a frozen sensor, not a
+standstill, and shall veto the fallback and be counted (n_imu_frozen)
+with a rate-limited warning, on the same terms as REQ-NAV-013 (same run
+length, and judged with the fallback disabled as well). A timestamp
+running backwards shall discard the window and its latched verdict along
+with the dwell timers, so that a verdict from before the jump cannot arm
+the fallback after it. It shall stay armed for the whole stillness run once dwelled
 (not fire once and drop), and a public accessor
 (ahrs_auto_zaru_active) shall report whether it is currently armed.
 Rationale: when no external trigger is available at all (e.g. ins
@@ -425,7 +433,11 @@ covers neither the external trigger nor the dwell gate.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-017
-- **Verification:** Test: tests/test_ahrs.c:scenario_predict_correct_equivalence
+- **Verification:** Test: tests/test_ahrs.c:scenario_predict_correct_equivalence; Test: tests/test_ahrs.c:scenario_step_null_args
+
+A NULL instance, gyro or accelerometer pointer shall drop the epoch in
+ahrs_predict_step(), and a NULL instance shall make ahrs_correct_step()
+and ahrs_update() return without effect.
 
 ahrs_predict_step() and ahrs_correct_step() shall together be exactly
 equivalent to ahrs_update(): ahrs_update() is implemented as

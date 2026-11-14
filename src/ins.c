@@ -40,11 +40,7 @@
  * ============================================================================
  */
 
-/* Compile-time maximum error-state size.
-   The ACTIVE size is the runtime f->n: INS_UNKNOWNS (15) or
-   INS_UNKNOWNS_MAG (18 with estimate_mag_bias).
-   Loops are bounded by f->n <= INS_UNKNOWNS_MAX, so
-   execution time stays bounded (REQ-SYS-004). */
+/* Time unit conversions for ins_time_us_t. */
 #define INS_US_PER_SEC (1000000LL)
 #define INS_US_PER_MS  (1000LL)
 
@@ -89,11 +85,9 @@ _Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
 #define INS_LOG_YAW_AID_GAP_WARN_SEC   (2.0f)
 #define INS_LOG_YAW_AID_GAP_REPEAT_SEC (120.0f)
 
-/* Diagnostics: a raw gyro sample bit-identical to the previous epoch's,
-   repeated this many times in a row, indicates a frozen/stuck sensor bus
-   replaying the last register value. */
-#define INS_LOG_STUCK_GYR_EPOCHS (50)
-#define INS_LOG_STUCK_REPEAT_SEC (240.0f)
+/* Diagnostics: repeat interval of the frozen-IMU warning (a stillness
+   variance window with zero spread, see ins_static_variance_update). */
+#define INS_LOG_FROZEN_IMU_REPEAT_SEC (240.0f)
 
 /* Diagnostics: the magnetometer field-strength check
    (mag_field_expected_uT) tripping ONCE is a transient disturbance (motor
@@ -421,6 +415,14 @@ _Static_assert(KALMAN_MAX_NOISE_SIZE >= INS_NOISE_COLS_MAX,
    answers by driving its covariance below what the measurements support. */
 #define INS_DEFAULT_GNSS_MIN_DELAY_MS (100)
 
+/* Share of the rate limit interval a fix may arrive ahead of its due time and
+   still be spent (REQ-NAV-074), as a divisor. Fix epochs carry the stamp of
+   the IMU epoch they were attached to, so a receiver running at exactly the
+   configured rate shows spacings that scatter around the interval. The due
+   time itself advances by whole intervals, so the earliness of one fix is not
+   handed on to the next and the average rate stays bounded. */
+#define INS_GNSS_RATE_LIMIT_EARLY_DIV (4)
+
 /* Mode-transition quality gates around the 3D solution (REQ-NAV-051,
    REQ-NAV-052), deliberately separate from the fusion gates above: entering
    demands a clearly better fix than merely fusing one, leaving demands a
@@ -542,17 +544,23 @@ static inline void vec3_copy(const float src[3], float dst[3])
 
 static inline void vec3_zero(float v[3]) { v[0] = v[1] = v[2] = 0.0f; }
 
-/* y = R * x  (R is 3x3 column-major). Delegates to KFCore's matmul (linalg.h),
- * which is backed by sgemm_. */
+/* y = R * x  (R is 3x3 column-major). Unrolled instead of KFCore's matmul,
+ * same summation order as sgemm_. x is read first, so y may alias x. */
 static inline void mat3_mul_vec3(const float R[9], const float x[3], float y[3])
 {
-    matmul("N", "N", 3, 1, 3, 1.0f, R, x, 0.0f, y);
+    const float x0 = x[0], x1 = x[1], x2 = x[2];
+    y[0] = R[0] * x0 + R[3] * x1 + R[6] * x2;
+    y[1] = R[1] * x0 + R[4] * x1 + R[7] * x2;
+    y[2] = R[2] * x0 + R[5] * x1 + R[8] * x2;
 }
 
-/* y = R' * x  (R is 3x3 column-major). */
+/* y = R' * x  (R is 3x3 column-major). Same conventions as above. */
 static inline void mat3t_mul_vec3(const float R[9], const float x[3], float y[3])
 {
-    matmul("T", "N", 3, 1, 3, 1.0f, R, x, 0.0f, y);
+    const float x0 = x[0], x1 = x[1], x2 = x[2];
+    y[0] = R[0] * x0 + R[1] * x1 + R[2] * x2;
+    y[1] = R[3] * x0 + R[4] * x1 + R[5] * x2;
+    y[2] = R[6] * x0 + R[7] * x1 + R[8] * x2;
 }
 
 static inline float qsquare(float x) { return x * x; }
@@ -1190,7 +1198,7 @@ static void ins_compute_Phi(float dt_sec, const float f_b_ib[3], const float R[9
     /* Convert specific force into n-frame: f_n = R * f_b_ib (NED components).
      */
     float f_n[3];
-    matmul("N", "N", 3, 1, 3, 1.0f, R, f_b_ib, 0.0f, f_n);
+    mat3_mul_vec3(R, f_b_ib, f_n);
     const float fnN = f_n[0];
     const float fnE = f_n[1];
     const float fnD = f_n[2];
@@ -1393,6 +1401,9 @@ static int ins_fuse(ins_t* f, float* z, float* R, float* Ht, int m_count, float 
     bool correlated = false;
     for (j = 0; j < m_count; ++j)
     {
+        /* cppcheck-suppress objectIndex
+         * False positive: the scalar callers (&R) pass m_count == 1, so
+         * only index 0 is ever read. */
         if (MAT_ELEM(R, j, j, m_count, m_count) <= 0.0f)
         {
             f->diag.n_fuse_fail++;
@@ -2587,6 +2598,29 @@ static void ins_track_gnss_mode_gates(ins_t* f, const ins_measurements_t* m)
  * See also Zwiener 2019, "Sensorfusionsgleichungen fuer verteilte Sensoren"
  * (GNSS, lever arm) and "Einbeziehung von Messdaten mit verzoegerter
  * Verfuegbarkeit". */
+
+/* Is a GNSS fix at time t due under the fusion rate limit (REQ-NAV-074)?
+   A schedule further ahead than one interval cannot come from the regular
+   flow (a clock set back), it must not hold the fixes off until the clock
+   has caught up. */
+static bool ins_gnss_fusion_due(const ins_t* f, ins_time_us_t t)
+{
+    const ins_time_us_t interval = (ins_time_us_t)f->opt.gnss_min_delay_ms * INS_US_PER_MS;
+    const ins_time_us_t ahead    = f->t_gnss_fusion_due - t;
+    return ahead <= interval / INS_GNSS_RATE_LIMIT_EARLY_DIV || ahead > interval;
+}
+
+/* Book a spent GNSS fix: the next one is due one interval after the later of
+   the schedule and this fix (REQ-NAV-074). */
+static void ins_gnss_fusion_spent(ins_t* f, ins_time_us_t t)
+{
+    const ins_time_us_t interval = (ins_time_us_t)f->opt.gnss_min_delay_ms * INS_US_PER_MS;
+    const bool          on_time  = (f->t_last_gnss_fused != 0) && (f->t_gnss_fusion_due > t) &&
+                         (f->t_gnss_fusion_due - t <= interval);
+    f->t_gnss_fusion_due = (on_time ? f->t_gnss_fusion_due : t) + interval;
+    f->t_last_gnss_fused = t;
+}
+
 /* @satisfies REQ-NAV-005 REQ-NAV-006 REQ-NAV-008 REQ-NAV-023 REQ-NAV-024 REQ-NAV-055
  * @satisfies REQ-NAV-079 */
 static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
@@ -2631,17 +2665,15 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
        not the filter chose to spend it. */
     const bool pos_aiding = use_pos;
 
-    /* GNSS fusion rate limit (REQ-NAV-074). A fix arriving less than
-       gnss_min_delay_ms after the last one this filter actually spent is
-       skipped whole: both blocks, not just the position the decimation thins.
-       Suppressed while the coasting window is expired, where the next usable
-       fix is a re-anchor. Like the decimation it leaves the coasting window
-       alone: the fix carried a usable position, the filter merely chose not to
-       spend it (REQ-NAV-023).
+    /* GNSS fusion rate limit (REQ-NAV-074). A fix arriving ahead of the
+       schedule is skipped whole: both blocks, not just the position the
+       decimation thins. Suppressed while the coasting window is expired, where
+       the next usable fix is a re-anchor. Like the decimation it leaves the
+       coasting window alone: the fix carried a usable position, the filter
+       merely chose not to spend it (REQ-NAV-023).
        @satisfies REQ-NAV-074 */
     if (f->opt.gnss_min_delay_ms > 0 && (use_pos || use_vel) && f->t_last_gnss_fused != 0 &&
-        !ins_dr_expired(f, m->timestamp) &&
-        time_diff_ms(m->timestamp, f->t_last_gnss_fused) < f->opt.gnss_min_delay_ms)
+        !ins_dr_expired(f, m->timestamp) && !ins_gnss_fusion_due(f, m->timestamp))
     {
         if (pos_aiding) { f->t_last_pos_aiding = m->timestamp; }
         f->diag.n_gnss_rate_limited++;
@@ -2769,7 +2801,7 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
         ins_reacquire(f, m, pos_new, anchor_llh, use_vel ? vel_imu : NULL, pos_var, vel_var);
         f->diag.n_gnss_used++;
         f->diag.t_last_gnss_fusion = m->timestamp;
-        f->t_last_gnss_fused       = m->timestamp;
+        ins_gnss_fusion_spent(f, m->timestamp);
         return;
     }
 
@@ -2977,7 +3009,7 @@ static void ins_fuse_gnss(ins_t* f, const ins_measurements_t* m)
     {
         f->diag.n_gnss_used++;
         f->diag.t_last_gnss_fusion = m->timestamp;
-        f->t_last_gnss_fused       = m->timestamp;
+        ins_gnss_fusion_spent(f, m->timestamp);
         /* REQ-NAV-023: only a fix that actually carried a usable POSITION
            may un-expire the coasting window (REQ-NAV-063). */
         if (pos_aiding) { f->t_last_pos_aiding = m->timestamp; }
@@ -3686,7 +3718,9 @@ static void ins_check_health(ins_t* f)
     /* Check state health. */
     for (i = 0; i < 3; ++i)
     {
-        if (!isfinite(f->state.vel_ned[i]) || !isfinite(f->state.pos_local[i]))
+        if (!isfinite(f->state.vel_ned[i]) || !isfinite(f->state.pos_local[i]) ||
+            !isfinite(f->state.acc_bias[i]) || !isfinite(f->state.gyr_bias[i]) ||
+            !isfinite(f->state.mag_bias[i]))
         {
             ins_fail_health(f);
             return;
@@ -3896,6 +3930,12 @@ static void ins_finalize_init(ins_t* f, const float rpy[3], const double origin_
     f->gnss_bad_accum_sec = 0.0f;
     f->bias_carry.valid   = false; /* consumed (REQ-NAV-061) */
     f->origin_carry.valid = false; /* consumed (REQ-NAV-062) */
+    /* The stillness window ran for the frozen-sensor verdict while collecting
+       (REQ-NAV-013). The detector starts from a fresh one: a verdict from
+       before the bootstrap must not arm it. The run of gyro windows without
+       spread is kept, it is about the sensor and not about the platform. */
+    f->static_var_count = 0;
+    f->static_var_ok    = false;
     if (carry)
     {
         LOG_INFO("ins: imu biases carried over from the previous instance, acc=[%.4f %.4f %.4f] "
@@ -4120,6 +4160,120 @@ static void ins_log_effective_config(const ins_t* f)
 #endif
 }
 
+/* One float field of the configuration, or a vector of them. */
+typedef struct
+{
+    const float* v;
+    int          n;
+} ins_cfg_field_t;
+
+static bool ins_cfg_fields_finite(const ins_cfg_field_t* fld, int count)
+{
+    int i, k;
+    for (i = 0; i < count; ++i)
+    {
+        for (k = 0; k < fld[i].n; ++k)
+        {
+            if (!isfinite(fld[i].v[k])) { return false; }
+        }
+    }
+    return true;
+}
+
+/* Is every float of the configuration finite (REQ-NAV-095)? The default
+   resolution in ins_init tests "<= 0" or "> 0", which a NaN answers either
+   way depending on how the test is written, and an initial state or a
+   reference vector is copied as it stands. Lists every float field of both
+   structs: a new one has to be added here. */
+/* @satisfies REQ-NAV-095 */
+static bool ins_config_finite(const ins_init_t* init, const ins_options_t* opt)
+{
+    const ins_cfg_field_t fi[] = {{init->vel_ned, 3},
+                                  {init->rpy_init_rad, 3},
+                                  {init->acc_bias_init_mps2, 3},
+                                  {init->gyr_bias_init_rps, 3},
+                                  {&init->pos_init_stddev_m, 1},
+                                  {&init->vel_init_stddev_mps, 1},
+                                  {init->rpy_init_stddev_rad, 3},
+                                  {&init->acc_bias_init_stddev_mps2, 1},
+                                  {&init->gyr_bias_init_stddev_rps, 1},
+                                  {&init->pos_pred_stddev_m_sqrts, 1},
+                                  {&init->vel_pred_stddev_mps_sqrts, 1},
+                                  {&init->rpy_pred_stddev_rad_sqrts, 1},
+                                  {&init->acc_bias_pred_stddev_mps2_sqrts, 1},
+                                  {&init->gyr_bias_pred_stddev_rps_sqrts, 1},
+                                  {&init->zero_vel_stddev_mps, 1},
+                                  {&init->zero_rot_stddev_rps, 1},
+                                  {init->gravity_n, 3},
+                                  {init->magnetic_n, 3},
+                                  {&init->mag_bias_init_stddev_ut, 1},
+                                  {&init->mag_bias_pred_stddev_ut_sqrts, 1}};
+    const ins_cfg_field_t fo[] = {{&opt->kalman_update_dt_sec, 1},
+                                  {&opt->max_prediction_time_sec, 1},
+                                  {&opt->gnss_max_horizontal_pos_stddev_m, 1},
+                                  {&opt->gnss_max_vertical_pos_stddev_m, 1},
+                                  {&opt->gnss_max_horizontal_vel_stddev_mps, 1},
+                                  {&opt->gnss_max_vertical_vel_stddev_mps, 1},
+                                  {&opt->max_deadreckoning_sec, 1},
+                                  {&opt->auto_init_window_sec, 1},
+                                  {&opt->auto_init_static_gyr_rps, 1},
+                                  {&opt->auto_init_static_acc_mps2, 1},
+                                  {&opt->auto_init_moving_rpy_stddev_rad, 1},
+                                  {&opt->gnss_init_dwell_sec, 1},
+                                  {&opt->auto_zupt_static_gyr_rps, 1},
+                                  {&opt->auto_zupt_static_acc_mps2, 1},
+                                  {&opt->auto_zupt_max_vel_mps, 1},
+                                  {&opt->auto_zupt_dwell_sec, 1},
+                                  {&opt->auto_zupt_min_interval_sec, 1},
+                                  {&opt->mag_field_tolerance, 1},
+                                  {&opt->automotive_min_speed_mps, 1},
+                                  {&opt->automotive_min_yaw_stddev, 1},
+                                  {&opt->automotive_lateral_stddev_mps, 1},
+                                  {&opt->automotive_lateral_max_yaw_rate, 1},
+                                  {&opt->automotive_lateral_after_sec, 1},
+                                  {opt->imu_acc_misalignment, 9},
+                                  {opt->imu_gyr_misalignment, 9},
+                                  {opt->imu_acc_fixed_bias, 3},
+                                  {opt->imu_gyr_fixed_bias, 3},
+                                  {&opt->gnss_pos_cov_scale, 1},
+                                  {&opt->gnss_vel_cov_scale, 1},
+                                  {&opt->gnss_pos_stddev_floor_hor_m, 1},
+                                  {&opt->gnss_pos_stddev_floor_ver_m, 1},
+                                  {&opt->gnss_vel_stddev_floor_hor_mps, 1},
+                                  {&opt->gnss_vel_stddev_floor_ver_mps, 1},
+                                  {opt->mag_misalignment, 9},
+                                  {opt->mag_fixed_bias, 3},
+                                  {&opt->gnss_pos_cov_scale_height, 1},
+                                  {&opt->chi2_reject_alpha, 1},
+                                  {&opt->auto_zupt_static_gyr_stddev_rps, 1},
+                                  {&opt->auto_zupt_static_acc_stddev_mps2, 1},
+                                  {&opt->gnss_start_max_horizontal_pos_stddev_m, 1},
+                                  {&opt->gnss_start_max_vertical_pos_stddev_m, 1},
+                                  {&opt->gnss_start_max_horizontal_vel_stddev_mps, 1},
+                                  {&opt->gnss_start_max_vertical_vel_stddev_mps, 1},
+                                  {&opt->gnss_stop_max_horizontal_pos_stddev_m, 1},
+                                  {&opt->gnss_stop_max_vertical_pos_stddev_m, 1},
+                                  {&opt->gnss_stop_max_horizontal_vel_stddev_mps, 1},
+                                  {&opt->gnss_stop_max_vertical_vel_stddev_mps, 1},
+                                  {&opt->gnss_stop_dwell_sec, 1},
+                                  {&opt->auto_zupt_max_vel_stddev_mps, 1},
+                                  {&opt->speed_scale, 1},
+                                  {&opt->speed_stddev_rel, 1},
+                                  {&opt->speed_min_mps, 1},
+                                  {&opt->gnss_pos_stddev_cap_hor_m, 1},
+                                  {&opt->gnss_pos_stddev_cap_ver_m, 1},
+                                  {&opt->gnss_vel_stddev_cap_hor_mps, 1},
+                                  {&opt->gnss_vel_stddev_cap_ver_mps, 1},
+                                  {&opt->gnss_acc_envelope_tau_sec, 1},
+                                  {&opt->gnss_vel_noise_acc_scale_hor, 1},
+                                  {&opt->gnss_vel_noise_acc_scale_ver, 1},
+                                  {&opt->gnss_vel_noise_acc_window_sec, 1},
+                                  {&opt->range_aiding_max_hpos_stddev_m, 1},
+                                  {&opt->imu_loss_timeout_sec, 1}};
+    return ins_cfg_fields_finite(fi, (int)(sizeof(fi) / sizeof(fi[0]))) &&
+           ins_cfg_fields_finite(fo, (int)(sizeof(fo) / sizeof(fo[0])));
+}
+
 /* @satisfies REQ-NAV-081 */
 int ins_init(ins_t* f, const ins_init_t* init, const ins_options_t* opt)
 {
@@ -4130,6 +4284,11 @@ int ins_init(ins_t* f, const ins_init_t* init, const ins_options_t* opt)
     if (!vec3d_finite(init->llh) || fabs(init->llh[0]) > (0.5 * M_PI) ||
         fabs(init->llh[1]) > (2.0 * M_PI))
     {
+        return -1;
+    }
+    if (!ins_config_finite(init, opt))
+    {
+        LOG_ERROR("ins: non-finite value in the configuration, init refused");
         return -1;
     }
 
@@ -4509,12 +4668,14 @@ void ins_set_world_model(ins_t* f, const float gravity_n[3], const float magneti
     if (f == NULL) return;
     /* The caller's vectors stay the caller's: the Earth refresh leaves them
        alone (REQ-NAV-094), and a magnetic one ends the WMM tracking. */
-    if (gravity_n != NULL)
+    /* A non-finite vector is ignored like a NULL one (REQ-NAV-095): it would
+       reach the strapdown respectively the magnetometer residual as it is. */
+    if (gravity_n != NULL && ins_vec3_finite(gravity_n))
     {
         vec3_copy(gravity_n, f->gravity_n);
         f->gravity_user = true;
     }
-    if (magnetic_n != NULL)
+    if (magnetic_n != NULL && ins_vec3_finite(magnetic_n))
     {
         vec3_copy(magnetic_n, f->magnetic_n);
         f->mag_model_tracked = false;
@@ -4807,10 +4968,20 @@ static float ins_autoinit_yaw(const ins_t* f, const ins_measurements_t* m, float
     }
     else if (mag_data != NULL && mh > 1e-6f)
     {
-        float q0[4], R0[9], m_l[3];
+        float q0[4], R0[9], m_l[3], mag_c[3];
         ins_quat_from_rpy(roll, pitch, 0.0f, q0);
         ins_quat_to_rotmat(q0, R0);
-        mat3_mul_vec3(R0, mag_data, m_l);
+        /* A hard-iron bias carried into this bootstrap (REQ-NAV-061) is what
+           the filter will subtract from the first fused sample on, so the
+           heading it starts from has to be taken from the same field. */
+        vec3_copy(mag_data, mag_c);
+        if (f->bias_carry.valid)
+        {
+            mag_c[0] -= f->bias_carry.mag_bias[0];
+            mag_c[1] -= f->bias_carry.mag_bias[1];
+            mag_c[2] -= f->bias_carry.mag_bias[2];
+        }
+        mat3_mul_vec3(R0, mag_c, m_l);
 
         const float meas_hdg  = atan2f(m_l[1], m_l[0]);
         const float model_hdg = atan2f(f->init.magnetic_n[1], f->init.magnetic_n[0]);
@@ -5188,12 +5359,6 @@ static void ins_auto_zupt_record_ext_vel(ins_t* f, const ins_measurements_t* m,
     }
 }
 
-/* Decide whether this epoch should arm a synthetic zero_velocity_update /
- * zero_rotation_update. IMU-only static gate, plus a requirement that the
- * platform's velocity is already small when a recent GNSS observation of it
- * exists (see ins_auto_zupt_velocity_gate_ok). Rate-limited by
- * opt.auto_zupt_min_interval_sec once armed. */
-/* @satisfies REQ-NAV-013 REQ-NAV-014 */
 /* Primary stillness criterion of the auto-ZUPT/ZARU detector (REQ-NAV-013):
  * the per-axis sample variance of the RAW IMU over a short tumbling window.
  * Bias-invariant by construction (see sensor_defaults.h). Raw, not
@@ -5208,16 +5373,21 @@ static void ins_auto_zupt_record_ext_vel(ins_t* f, const ins_measurements_t* m,
  *
  * The window tumbles: it accumulates unconditionally, and on completion latches
  * a verdict and starts over. Before the first completed window the verdict is
- * "not still".
+ * "not still". A window with zero spread on every accelerometer axis, or a
+ * long enough run of windows with zero spread on every gyro axis, is a frozen
+ * sensor and also "not still" (counted in n_imu_frozen).
  *
  * @return true if the most recently completed window looked stationary. */
+/* @satisfies REQ-NAV-013 */
 static bool ins_static_variance_update(ins_t* f, const ins_measurements_t* m)
 {
     const float x[6] = {m->gyr.data[0], m->gyr.data[1], m->gyr.data[2],
                         m->acc.data[0], m->acc.data[1], m->acc.data[2]};
     int         i;
 
-    if (f->static_var_count == 0)
+    /* A sample older than the window start (clock set back) restarts the
+       window: it could otherwise not complete before the clock caught up. */
+    if (f->static_var_count == 0 || m->timestamp < f->static_var_window_since)
     {
         for (i = 0; i < 6; ++i)
         {
@@ -5253,12 +5423,40 @@ static bool ins_static_variance_update(ins_t* f, const ins_measurements_t* m)
     /* Window complete: latch the verdict from the per-axis RMS stddev
        (the three axes pooled, so a single moving axis still shows up). */
     const float inv_dof = 1.0f / (3.0f * (float)(f->static_var_count - 1u));
-    const float gyr_rms =
-        SQRTF((f->static_var_m2[0] + f->static_var_m2[1] + f->static_var_m2[2]) * inv_dof);
-    const float acc_rms =
-        SQRTF((f->static_var_m2[3] + f->static_var_m2[4] + f->static_var_m2[5]) * inv_dof);
-    f->static_var_ok    = (gyr_rms <= max_gyr_rms) && (acc_rms <= max_acc_rms);
+    const float gyr_m2  = f->static_var_m2[0] + f->static_var_m2[1] + f->static_var_m2[2];
+    const float acc_m2  = f->static_var_m2[3] + f->static_var_m2[4] + f->static_var_m2[5];
+    /* Zero spread on all three axes of a sensor is a frozen driver or bus
+       replaying its last sample, not a standstill. Welford keeps m2 at exactly
+       0 for a constant input, so no epsilon is needed. The accelerometer is
+       judged on a single window. The gyro needs a run of them: a coarse range
+       behind a narrow low-pass filter legitimately holds one code that long,
+       and a live accelerometer covers the wait (REQ-NAV-013). */
+    const bool acc_frozen = !(acc_m2 > 0.0f);
+    if (gyr_m2 > 0.0f) { f->static_gyr_const_windows = 0; }
+    else if (f->static_gyr_const_windows < INS_DEFAULT_FROZEN_GYR_WINDOWS)
+    {
+        f->static_gyr_const_windows++;
+    }
+    const bool gyr_frozen = (f->static_gyr_const_windows >= INS_DEFAULT_FROZEN_GYR_WINDOWS);
+    const bool frozen     = acc_frozen || gyr_frozen;
+    f->static_var_ok      = !frozen && (SQRTF(gyr_m2 * inv_dof) <= max_gyr_rms) &&
+                       (SQRTF(acc_m2 * inv_dof) <= max_acc_rms);
     f->static_var_count = 0; /* start the next window */
+
+    if (frozen)
+    {
+        f->diag.n_imu_frozen++;
+        const bool  first_warn = (f->log_state.t_last_frozen_imu_warn == 0);
+        const float since_warn_sec =
+            first_warn ? 0.0f : time_diff_sec(m->timestamp, f->log_state.t_last_frozen_imu_warn);
+        if (first_warn || since_warn_sec >= INS_LOG_FROZEN_IMU_REPEAT_SEC)
+        {
+            LOG_WARN("ins: %s repeats the same sample bit for bit - frozen sensor or bus "
+                     "(or noise far below one LSB), ZUPT/ZARU vetoed (%u windows since init)",
+                     acc_frozen ? "accelerometer" : "gyro", (unsigned int)f->diag.n_imu_frozen);
+            f->log_state.t_last_frozen_imu_warn = m->timestamp;
+        }
+    }
     return f->static_var_ok;
 }
 
@@ -5325,6 +5523,12 @@ static void ins_check_bias_prior(ins_t* f, const ins_measurements_t* m)
     }
 }
 
+/* Decide whether this epoch should arm a synthetic zero_velocity_update /
+ * zero_rotation_update. IMU-only static gate, plus a requirement that the
+ * platform's velocity is already small when a recent GNSS observation of it
+ * exists (see ins_auto_zupt_velocity_gate_ok). Rate-limited by
+ * opt.auto_zupt_min_interval_sec once armed. */
+/* @satisfies REQ-NAV-013 REQ-NAV-014 */
 static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
 {
     /* First, ahead of every early return below: the velocity evidence does
@@ -5346,8 +5550,11 @@ static bool ins_auto_zupt_detect(ins_t* f, const ins_measurements_t* m)
         f->auto_zupt_dwelled      = false;
         f->auto_zupt_gyr_count    = 0;
         f->bias_prior_count       = 0;
-        f->static_var_count       = 0;
-        f->static_var_ok          = false;
+        /* The window keeps running for the frozen-sensor verdict, which does
+           not depend on the detector (REQ-NAV-013). Only its stillness verdict
+           is discarded. */
+        if (m->acc.is_valid && m->gyr.is_valid) { (void)ins_static_variance_update(f, m); }
+        f->static_var_ok = false;
         return false;
     }
     if (!m->acc.is_valid || !m->gyr.is_valid)
@@ -5943,6 +6150,9 @@ int ins_predict_step(ins_t* f, const ins_measurements_t* m_in, float* phi_out)
             {
                 f->t_pending_imu    = m->timestamp;
                 f->have_pending_imu = true;
+                /* Frozen-sensor verdict while collecting (REQ-NAV-013): the
+                   stillness verdict itself is not used before the bootstrap. */
+                (void)ins_static_variance_update(f, m);
             }
             if (ins_gnss_pos_usable(f, &m->gnss_pos) || m->local_pos.is_valid)
             {
@@ -6355,43 +6565,6 @@ void ins_correct_step(ins_t* f)
             }
         }
     }
-
-    /* Stuck-sensor diagnostics: a gyro sample bit-identical to the previous
-       epoch's, several times in a row, flags a frozen bus (stale cached
-       register value) that passes every finite/range check silently. */
-    if (m->gyr.is_valid)
-    {
-        /* Exact equality is the correct test here, not an epsilon: this asks
-           "did the driver hand back the exact same value again", not "are
-           these two readings close". */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wfloat-equal"
-        if (f->log_state.last_gyr_raw_valid && f->log_state.last_gyr_raw[0] == m->gyr.data[0] &&
-            f->log_state.last_gyr_raw[1] == m->gyr.data[1] &&
-            f->log_state.last_gyr_raw[2] == m->gyr.data[2])
-        {
-            f->log_state.stuck_gyr_count++;
-        }
-        else { f->log_state.stuck_gyr_count = 0; }
-#pragma GCC diagnostic pop
-        vec3_copy(m->gyr.data, f->log_state.last_gyr_raw);
-        f->log_state.last_gyr_raw_valid = true;
-
-        if (f->log_state.stuck_gyr_count >= INS_LOG_STUCK_GYR_EPOCHS)
-        {
-            const bool  first_warn = (f->log_state.t_last_stuck_warn == 0);
-            const float since_warn_sec =
-                first_warn ? 0.0f : time_diff_sec(m->timestamp, f->log_state.t_last_stuck_warn);
-            if (first_warn || since_warn_sec >= INS_LOG_STUCK_REPEAT_SEC)
-            {
-                LOG_WARN("ins: gyro sample identical for %u consecutive epochs - likely a "
-                         "frozen/stuck sensor bus, not real data (or a synthetic/noise-free "
-                         "test input)",
-                         (unsigned int)f->log_state.stuck_gyr_count);
-                f->log_state.t_last_stuck_warn = m->timestamp;
-            }
-        }
-    }
 }
 
 /* @satisfies REQ-NAV-069 */
@@ -6491,6 +6664,29 @@ bool ins_get_bias_acc(const ins_t* f, float b[3])
 {
     if (!f || !f->is_initialized) return false;
     vec3_copy(f->state.acc_bias, b);
+    return true;
+}
+
+/* var = r' P r over the accelerometer bias block of P = U diag(d) U', with
+   (r' U)_k = sum_i r_i U(i,k), U unit upper triangular. */
+bool ins_get_bias_acc_stddev_along(const ins_t* f, const float dir_b[3], float* stddev_mps2)
+{
+    if (!f || !f->is_initialized || dir_b == NULL || stddev_mps2 == NULL) return false;
+    float var = 0.0f;
+    int   i, k;
+    for (k = INS_IDX_ACC; k < f->n; ++k)
+    {
+        float w = 0.0f;
+        for (i = 0; i < 3; ++i)
+        {
+            const int row = INS_IDX_ACC + i;
+            if (row == k) { w += dir_b[i]; }
+            else if (row < k) { w += dir_b[i] * MAT_ELEM(f->U, row, k, f->n, f->n); }
+        }
+        var += w * w * f->d[k];
+    }
+    if (!isfinite(var) || var < 0.0f) return false;
+    *stddev_mps2 = SQRTF(var);
     return true;
 }
 

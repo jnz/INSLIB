@@ -1347,6 +1347,8 @@ typedef struct
     float ahrs_mag_chi2_threshold;
     float baro_stddev_m;
     float baro_acc_bias_init_stddev_mps2; /* 0 -> baro_alt's own default */
+    bool  baro_ins_acc_bias_disable;      /* true -> baro_alt does not get
+                                             ins's accel bias (REQ-SUITE-031) */
     float leverarm_frd[3];
     float pos_fallback_m, vel_fallback_mps;
     float gate_hpos_m, gate_vpos_m, gate_hvel_mps, gate_vvel_mps;
@@ -1713,6 +1715,10 @@ static int config_set(insrcv_t* r, const char* sec, const char* key, const char*
     else if (!strcmp(full, "baro.acc_bias_init_mps2"))
     {
         if (d > 0.0) { r->baro_acc_bias_init_stddev_mps2 = (float)d; }
+    }
+    else if (!strcmp(full, "baro.ins_acc_bias_disable"))
+    {
+        r->baro_ins_acc_bias_disable = ((int)d != 0);
     }
     else if (!strcmp(full, "gnss.leverarm_frd")) { if (mini_yaml_list(val, r->leverarm_frd, 3) != 0) return -2; }
     else if (!strcmp(full, "gnss.pos_stddev_fallback_m"))
@@ -2993,6 +2999,7 @@ static void suite_bootstrap(insrcv_t* r, int64_t t_us)
     {
         r->suite.baro_cfg.acc_bias_init_stddev_mps2 = r->baro_acc_bias_init_stddev_mps2;
     }
+    nav_suite_set_baro_ins_acc_bias_disable(&r->suite, r->baro_ins_acc_bias_disable);
     r->suite_ready = true;
 }
 

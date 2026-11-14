@@ -299,6 +299,7 @@ def make_navigator(spec, inp, log=print):
     nav.set_baro_acc_noise(float(baro_cfg.get("acc_noise_mps2_sqrthz", 0.0)))
     nav.set_baro_acc_bias_init_stddev(float(baro_cfg.get("acc_bias_init_mps2", 0.0)))
     nav.set_baro_h_process_noise(float(baro_cfg.get("h_process_noise", 0.0)))
+    nav.set_baro_ins_acc_bias_disable(bool(int(baro_cfg.get("ins_acc_bias_disable", 0))))
     nav.set_local_gnss_rw_stddev(float(baro_cfg.get("local_gnss_rw_stddev_mps", 0.0)))
     nav.set_local_gnss_chi2_threshold(float(baro_cfg.get("local_gnss_chi2_threshold", 0.0)))
     nav.set_local_gnss_min_update_interval(

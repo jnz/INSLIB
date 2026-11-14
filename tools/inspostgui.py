@@ -613,6 +613,11 @@ CONFIG_SECTIONS = [
         (("baro", "h_process_noise"), "h_process_noise [m/√Hz]", FLOAT, None,
          "Small process noise on baro_alt's height state, a margin against "
          "discretization and model errors. 0 → default"),
+        (("baro", "ins_acc_bias_disable"), "Don't use the ins accel bias",
+         BOOL, None,
+         "By default baro_alt gets the accelerometer bias of ins while ins "
+         "is ready and keeps only the rest in its own correction. Tick to "
+         "keep baro_alt independent of ins, e.g. as a cross-check."),
     ]),
     ("Baro/GNSS offset filter (optional, 0 = local_gnss_alt.c default)", [
         (("baro", "local_gnss_rw_stddev_mps"), "rw_stddev [m/√s]", FLOAT, None,

@@ -63,8 +63,16 @@
        accelerometer noise to average well below the threshold.
      - MAX_GAP_SEC: a pause this long in the zero-velocity feed means the
        platform may have moved, so the running window is discarded. */
-#define BARO_ALT_BIAS_PRIOR_SIGMA_FACTOR   (3.0f)
-#define BARO_ALT_BIAS_PRIOR_MIN_DWELL_SEC  (5.0f)
+#define BARO_ALT_BIAS_PRIOR_SIGMA_FACTOR  (3.0f)
+#define BARO_ALT_BIAS_PRIOR_MIN_DWELL_SEC (5.0f)
+
+/* Turns the tilt share of the up-acceleration error, a variance in
+   (m/s^2)^2, into the noise density in (m/s^2)^2/Hz the prediction adds to
+   sigma_a^2 (REQ-BARO-028). The attitude error is not white: it wanders with
+   the attitude filter's own corrections. A first-order process of variance
+   s^2 and correlation time tau has the low-frequency density 2 * s^2 * tau,
+   so this factor is 2 * tau, a correlation time of half a second. */
+#define BARO_ALT_TILT_VAR_TO_PSD_SEC       (1.0f)
 #define BARO_ALT_BIAS_PRIOR_MIN_SAMPLES    (50u)
 #define BARO_ALT_BIAS_PRIOR_MAX_GAP_SEC    (1.0f)
 #define BARO_ALT_LOG_BIAS_PRIOR_REPEAT_SEC (60.0f)
@@ -311,7 +319,6 @@ int baro_alt_init(baro_alt_t* b, const baro_alt_config_t* cfg, baro_alt_time_us_
  * ============================================================================
  */
 
-/* @satisfies REQ-BARO-002 REQ-BARO-003 */
 /* Hold the averaged up-acceleration of the current stillness window against the
    configured initial accel-bias prior (see BARO_ALT_BIAS_PRIOR_* above).
    Diagnostic only: counts and warns, never touches the filter state. Called
@@ -357,7 +364,9 @@ static void baro_alt_check_bias_prior(baro_alt_t* b, baro_alt_time_us_t t, float
     }
 }
 
-static void baro_alt_predict(baro_alt_t* b, float a_up_mps2, float dt_sec, float* phi_out)
+/* @satisfies REQ-BARO-002 REQ-BARO-003 */
+static void baro_alt_predict(baro_alt_t* b, float a_up_mps2, float tilt_var_mps4, float dt_sec,
+                             float* phi_out)
 {
     const int   n    = BARO_ALT_STATES;
     const float dt   = dt_sec;
@@ -390,7 +399,11 @@ static void baro_alt_predict(baro_alt_t* b, float a_up_mps2, float dt_sec, float
     MAT_ELEM(G, 2, 2, n, 3) = 1.0f; /* bias drift on a_b */
 
     Q[0] = bsquare(b->cfg.h_process_noise_m_sqrthz) * dt;
-    Q[1] = bsquare(b->cfg.acc_noise_mps2_sqrthz) * dt;
+    /* tilt_var_mps4 is the attitude-error share of the up-acceleration
+       VARIANCE (REQ-BARO-028), turned into a density next to sigma_a^2 by
+       BARO_ALT_TILT_VAR_TO_PSD_SEC. */
+    Q[1] =
+        (bsquare(b->cfg.acc_noise_mps2_sqrthz) + tilt_var_mps4 * BARO_ALT_TILT_VAR_TO_PSD_SEC) * dt;
     Q[2] = bsquare(b->cfg.acc_bias_drift_mps2_sqrthz) * dt;
 
     if (phi_out != NULL) { memcpy(phi_out, Phi, sizeof(Phi[0]) * (size_t)(n * n)); }
@@ -522,12 +535,15 @@ void baro_alt_stop_imu_loss(baro_alt_t* b)
  * ============================================================================
  */
 
-/* @satisfies REQ-BARO-007 REQ-BARO-026 */
+/* @satisfies REQ-BARO-007 REQ-BARO-026 REQ-BARO-028 */
 int baro_alt_predict_step(baro_alt_t* b, baro_alt_time_us_t t, const float acc_mps2[3],
                           const float q_bn[4], float pressure_pa, float baro_stddev_m,
                           bool baro_valid, float* phi_out)
 {
-    if (!b->is_initialized) { return BARO_ALT_EPOCH_DROPPED; }
+    if (b == NULL || acc_mps2 == NULL || q_bn == NULL || !b->is_initialized)
+    {
+        return BARO_ALT_EPOCH_DROPPED;
+    }
 
     /* Non-finite inputs (NaN/Inf) must not reach the math (a NaN passes every
        chi2/variance gate because NaN comparisons are false). Drop the epoch;
@@ -598,14 +614,29 @@ int baro_alt_predict_step(baro_alt_t* b, baro_alt_time_us_t t, const float acc_m
     if (dt_sec > 0.0f)
     {
         float R_b_to_n[9];
+        float f_n[3];
+        int   i;
         ins_quat_to_rotmat(q_bn, R_b_to_n);
-        const float f_n_z = MAT_ELEM(R_b_to_n, 2, 0, 3, 3) * acc_mps2[0] +
-                            MAT_ELEM(R_b_to_n, 2, 1, 3, 3) * acc_mps2[1] +
-                            MAT_ELEM(R_b_to_n, 2, 2, 3, 3) * acc_mps2[2];
-        const float a_up  = -(f_n_z + BARO_ALT_GRAVITY);
-        b->last_a_up_mps2 = a_up;
-        b->have_last_a_up = true;
-        baro_alt_predict(b, a_up, dt_sec, phi_out);
+        /* The bias known from outside comes off in the body frame, before
+           the rotation: that is what lets it follow the attitude
+           (REQ-BARO-030). */
+        const float f_b[3] = {acc_mps2[0] - b->acc_bias_b[0], acc_mps2[1] - b->acc_bias_b[1],
+                              acc_mps2[2] - b->acc_bias_b[2]};
+        for (i = 0; i < 3; ++i)
+        {
+            f_n[i] = MAT_ELEM(R_b_to_n, i, 0, 3, 3) * f_b[0] +
+                     MAT_ELEM(R_b_to_n, i, 1, 3, 3) * f_b[1] +
+                     MAT_ELEM(R_b_to_n, i, 2, 3, 3) * f_b[2];
+        }
+        const float a_up = -(f_n[2] + BARO_ALT_GRAVITY);
+        /* Small tilt errors dtheta_N, dtheta_E move the up component of
+           R * f by dtheta_N * f_E - dtheta_E * f_N, so a tilt 1-sigma
+           sigma_t per axis adds sigma_t^2 * (f_N^2 + f_E^2) of variance
+           (REQ-BARO-028). The gravity share only enters at second order. */
+        const float tilt_var = bsquare(b->tilt_stddev_rad) * (bsquare(f_n[0]) + bsquare(f_n[1]));
+        b->last_a_up_mps2    = a_up;
+        b->have_last_a_up    = true;
+        baro_alt_predict(b, a_up, tilt_var, dt_sec, phi_out);
         baro_alt_check_bias_prior(b, t, a_up);
         status |= BARO_ALT_EPOCH_COV_PROPAGATED;
     }
@@ -622,7 +653,7 @@ int baro_alt_predict_step(baro_alt_t* b, baro_alt_time_us_t t, const float acc_m
 /* @satisfies REQ-BARO-008 REQ-BARO-026 */
 void baro_alt_correct_step(baro_alt_t* b)
 {
-    if (!b->step_ctx.active) return;
+    if (b == NULL || !b->step_ctx.active) return;
     b->step_ctx.active = false;
 
     const baro_alt_time_us_t t             = b->t_last;
@@ -655,8 +686,56 @@ void baro_alt_correct_step(baro_alt_t* b)
 void baro_alt_update(baro_alt_t* b, baro_alt_time_us_t t, const float acc_mps2[3],
                      const float q_bn[4], float pressure_pa, float baro_stddev_m, bool baro_valid)
 {
+    if (b == NULL) { return; }
     baro_alt_predict_step(b, t, acc_mps2, q_bn, pressure_pa, baro_stddev_m, baro_valid, NULL);
     baro_alt_correct_step(b);
+}
+
+/* @satisfies REQ-BARO-028 */
+void baro_alt_set_tilt_stddev(baro_alt_t* b, float tilt_stddev_rad)
+{
+    if (b == NULL) { return; }
+    b->tilt_stddev_rad =
+        (tilt_stddev_rad > 0.0f && isfinite(tilt_stddev_rad)) ? tilt_stddev_rad : 0.0f;
+}
+
+/* a_up = -(f_n_z + g), so taking a bias b off f moves a_up by +(R b)_z. With
+ * an attitude the difference of that share between the old and the new vector
+ * goes into a_b, so a_up + a_b is the same before and after. */
+/* @satisfies REQ-BARO-030 */
+void baro_alt_set_acc_bias_body(baro_alt_t* b, const float bias_b[3], const float q_bn[4])
+{
+    const float  zero[3] = {0.0f, 0.0f, 0.0f};
+    const float* v       = (bias_b != NULL) ? bias_b : zero;
+    if (b == NULL || !b->is_initialized || !ins_vec3_within(v, INS_IMU_ACC_ABS_MAX_MPS2))
+    {
+        return;
+    }
+    if (q_bn != NULL)
+    {
+        if (!isfinite(q_bn[0]) || !isfinite(q_bn[1]) || !isfinite(q_bn[2]) || !isfinite(q_bn[3]))
+        {
+            return;
+        }
+        float R[9];
+        ins_quat_to_rotmat(q_bn, R);
+        const float d[3] = {b->acc_bias_b[0] - v[0], b->acc_bias_b[1] - v[1],
+                            b->acc_bias_b[2] - v[2]};
+        baro_alt_shift_acc_bias(b, MAT_ELEM(R, 2, 0, 3, 3) * d[0] + MAT_ELEM(R, 2, 1, 3, 3) * d[1] +
+                                       MAT_ELEM(R, 2, 2, 3, 3) * d[2]);
+    }
+    b->acc_bias_b[0] = v[0];
+    b->acc_bias_b[1] = v[1];
+    b->acc_bias_b[2] = v[2];
+}
+
+/* Only the state moves: the shift is a known input change, not new
+ * information, so the covariance stays as it is. */
+/* @satisfies REQ-BARO-029 */
+void baro_alt_shift_acc_bias(baro_alt_t* b, float delta_mps2)
+{
+    if (b == NULL || !b->is_initialized || !isfinite(delta_mps2)) { return; }
+    b->x[2] += delta_mps2;
 }
 
 /* Scalar zero-velocity measurement z = 0 observing only v (H = [0 1 0]).
@@ -745,6 +824,15 @@ bool baro_alt_get_acc_bias(const baro_alt_t* b, float* acc_bias_mps2)
 {
     if (b == NULL || !b->is_initialized) { return false; }
     *acc_bias_mps2 = b->x[2];
+    return true;
+}
+
+bool baro_alt_get_acc_bias_stddev(const baro_alt_t* b, float* stddev_mps2)
+{
+    if (b == NULL || stddev_mps2 == NULL || !b->is_initialized) { return false; }
+    const float var = baro_alt_state_var(b, 2);
+    if (!isfinite(var) || var < 0.0f) { return false; }
+    *stddev_mps2 = SQRTF(var);
     return true;
 }
 
@@ -851,7 +939,7 @@ int local_gnss_alt_init(local_gnss_alt_t* g, const local_gnss_alt_config_t* cfg,
 void local_gnss_alt_update(local_gnss_alt_t* g, baro_alt_time_us_t t, float h_local_m,
                            float local_stddev_m, float h_gnss_ell_m, float gnss_stddev_m)
 {
-    if (!g->is_initialized) { return; }
+    if (g == NULL || !g->is_initialized) { return; }
 
     float R;
     if (!local_gnss_alt_pair_ok(&g->cfg, h_local_m, local_stddev_m, h_gnss_ell_m, gnss_stddev_m,

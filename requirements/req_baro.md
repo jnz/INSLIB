@@ -450,7 +450,12 @@ externally, e.g. on a live telemetry plot.
 
 - **Status:** verified
 - **Parent:** REQ-SYS-017
-- **Verification:** Test: tests/test_baro.c:scenario_predict_correct_equivalence
+- **Verification:** Test: tests/test_baro.c:scenario_predict_correct_equivalence; Test: tests/test_baro.c:scenario_step_null_args
+
+A NULL instance, accelerometer or attitude pointer shall drop the epoch
+in baro_alt_predict_step(), and a NULL instance shall make
+baro_alt_correct_step(), baro_alt_update() and local_gnss_alt_update()
+return without effect, like every other entry point of the module.
 
 baro_alt_predict_step() and baro_alt_correct_step() shall together be
 exactly equivalent to baro_alt_update(): baro_alt_update() is
@@ -497,3 +502,84 @@ no longer connect to the motion after it. The barometer still pins the
 height, but a filter that simply skips the gap and goes on fusing it
 learns whatever does not fit as a_b. The bias itself has not moved in the
 gap and is the slowest state to converge, so it is carried.
+
+## REQ-BARO-028 — Attitude error in the process noise
+
+- **Status:** verified
+- **Parent:** REQ-BARO-003
+- **Verification:** Test: tests/test_baro.c:scenario_baro_tilt_process_noise
+
+baro_alt shall accept the roll/pitch 1-sigma sigma_t of the attitude it
+is handed (baro_alt_set_tilt_stddev(), valid until changed, reset to 0
+by baro_alt_init(), a non-positive or non-finite value counts as 0).
+Each prediction step shall then add sigma_t^2 * (f_N^2 + f_E^2) * T to the
+accelerometer noise density sigma_a^2 of REQ-BARO-003, f_N and f_E being
+the horizontal components of the specific force rotated to NED with
+that attitude, and T = 1 s the factor that turns the variance of the
+leaked acceleration into a density. With sigma_t = 0 the process noise is exactly that of
+REQ-BARO-003.
+
+Rationale: small tilt errors dtheta_N, dtheta_E move the up component of
+the rotated specific force by dtheta_N * f_E - dtheta_E * f_N. The
+leakage grows with the horizontal acceleration, while the gravity share
+only enters at second order. A fixed sigma_a has to be sized for the
+worst manoeuvre and is too large at rest, the per-epoch term follows the
+actual excitation and the actual attitude uncertainty.
+
+Rationale for T: sigma_t^2 * (f_N^2 + f_E^2) is a variance in (m/s^2)^2,
+sigma_a^2 a density in (m/s^2)^2/Hz, so the two cannot be added as they
+stand. The attitude error is not white either, it wanders with the
+corrections of the attitude filter. A first-order process of variance s^2
+and correlation time tau has the low-frequency density 2 * s^2 * tau, so
+T = 2 * tau: the value chosen models an attitude error that decorrelates
+within half a second, the order of the accelerometer correction period of
+the ARS/AHRS.
+
+## REQ-BARO-029 — Step on the acceleration correction
+
+- **Status:** verified
+- **Parent:** REQ-BARO-002
+- **Verification:** Test: tests/test_baro.c:scenario_baro_shift_acc_bias
+
+baro_alt shall offer baro_alt_shift_acc_bias(), which adds a given step
+to the acceleration correction a_b and leaves height, vertical velocity
+and the covariance unchanged. It shall be a no-op while the filter is
+not initialized and for a non-finite step.
+
+Rationale: a caller that starts or stops correcting the accelerometer
+input itself (REQ-SUITE-031) changes a_up by a known amount. Moving a_b
+by the opposite amount keeps a_up + a_b, and with it the propagation,
+continuous. The step is a known input change, not information, so the
+uncertainty stays as it is.
+
+## REQ-BARO-030 — Body-frame accelerometer bias from outside
+
+- **Status:** verified
+- **Parent:** REQ-BARO-002
+- **Verification:** Test: tests/test_baro.c:scenario_baro_body_acc_bias
+
+baro_alt shall accept a body-frame accelerometer bias vector
+(baro_alt_set_acc_bias_body()) and subtract it from every accelerometer
+sample before the sample is rotated to the navigation frame. The vector
+shall hold until it is changed, baro_alt_init() shall reset it to zero,
+and a call with a non-finite vector or on a filter that is not
+initialized shall be ignored.
+
+The call shall take an optional attitude. With an attitude, a_b shall be
+moved by the up share of the old vector minus the up share of the new
+one at that attitude, so that the sum of the corrected up-acceleration
+and a_b does not step (REQ-BARO-029). Without one, a_b shall be left
+alone and the change of the vector reaches the propagation as it is.
+
+Rationale: a_b is one scalar on the vertical. A real accelerometer bias
+is fixed to the body, so its up share changes with every change of
+orientation, and a_b can only relearn it through the barometer. A caller
+that knows the bias as a vector (the navigation filter next to it) can
+hand it over, and baro_alt then rotates it along with the sample. Holding
+the vector inside baro_alt is what keeps that knowledge through the time
+the other filter is not available, which is the time the vertical
+channel is needed most. The two ways of changing the vector are the two
+things a change can mean: a new owner of the same bias (first hand-over,
+a restarted source: no new information, so no step), or better knowledge
+of it (a running source refining its estimate: the propagation shall
+follow).

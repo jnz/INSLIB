@@ -75,6 +75,10 @@
 #define AHRS_LOG_GYR_BIAS_SANITY_DPS    (10.0f)
 #define AHRS_LOG_BIAS_SANITY_REPEAT_SEC (60.0f)
 
+/* Diagnostics: repeat interval of the frozen-IMU warning (an auto-ZARU
+   variance window with zero spread, see ahrs_static_variance_update). */
+#define AHRS_LOG_FROZEN_IMU_REPEAT_SEC (240.0f)
+
 /* Gravity [m/s^2] (this code is not safe for other planets). */
 #define AHRS_GRAVITY INS_GRAVITY_NOMINAL
 
@@ -152,6 +156,54 @@ static inline float qsquare(float x) { return x * x; }
  * Config resolution (0 -> default)
  * ============================================================================
  */
+
+/* Is every float of the configuration finite (REQ-AHRS-008)? The default
+   resolution below tests "<= 0", which a NaN passes as if it were a valid
+   setting. Lists every float field: a new one has to be added here. */
+/* @satisfies REQ-AHRS-008 */
+static bool ahrs_config_finite(const ahrs_config_t* cfg)
+{
+    const struct
+    {
+        const float* v;
+        int          n;
+    } fld[] = {{cfg->rpy_init_rad, 3},
+               {cfg->rpy_init_stddev_rad, 3},
+               {cfg->gyr_bias_init_rps, 3},
+               {cfg->gyr_bias_init_stddev_rps, 3},
+               {&cfg->gyr_noise_psd, 1},
+               {&cfg->gyr_bias_rw, 1},
+               {&cfg->acc_noise_mps2, 1},
+               {&cfg->rpy_pred_stddev_rad_sqrts, 1},
+               {&cfg->imu_loss_timeout_sec, 1},
+               {&cfg->kalman_update_dt_sec, 1},
+               {&cfg->acc_freq_hz, 1},
+               {&cfg->gravity_diff_penalty, 1},
+               {&cfg->chi2_threshold, 1},
+               {&cfg->acc_cutoff_freq_hz, 1},
+               {&cfg->acc_reject_gravity_mps2, 1},
+               {&cfg->mag_yaw_stddev_rad, 1},
+               {&cfg->mag_freq_hz, 1},
+               {&cfg->mag_chi2_threshold, 1},
+               {&cfg->mag_field_tolerance, 1},
+               {&cfg->zero_rot_stddev_rps, 1},
+               {&cfg->auto_zaru_static_gyr_rps, 1},
+               {&cfg->auto_zaru_static_acc_mps2, 1},
+               {&cfg->auto_zaru_dwell_sec, 1},
+               {&cfg->auto_zaru_static_gyr_stddev_rps, 1},
+               {&cfg->auto_zaru_static_acc_stddev_mps2, 1},
+               {cfg->restart_att_stddev_rad, 3},
+               {&cfg->restart_warmup_sec, 1}};
+    int i, k;
+    for (i = 0; i < (int)(sizeof(fld) / sizeof(fld[0])); ++i)
+    {
+        for (k = 0; k < fld[i].n; ++k)
+        {
+            if (!isfinite(fld[i].v[k])) { return false; }
+        }
+    }
+    return true;
+}
 
 /* @satisfies REQ-AHRS-027 */
 static void ahrs_resolve_config(const ahrs_config_t* in, ahrs_config_t* out)
@@ -322,10 +374,7 @@ int ahrs_init(ahrs_t* a, const ahrs_config_t* cfg, ahrs_time_us_t t)
             return -1;
         }
     }
-    if (!ins_vec3_finite(cfg->rpy_init_rad) || !ins_vec3_finite(cfg->gyr_bias_init_rps))
-    {
-        return -1;
-    }
+    if (!ahrs_config_finite(cfg)) { return -1; }
 
     memset(a, 0, sizeof(*a));
     ahrs_resolve_config(cfg, &a->cfg);
@@ -741,7 +790,8 @@ static bool ahrs_static_variance_update(ahrs_t* a, const float gyr_rps[3], const
     const float x[6] = {gyr_rps[0], gyr_rps[1], gyr_rps[2], acc_mps2[0], acc_mps2[1], acc_mps2[2]};
     int         i;
 
-    if (a->static_var_count == 0)
+    /* A sample older than the window start (clock set back) restarts it. */
+    if (a->static_var_count == 0 || t < a->static_var_window_since)
     {
         for (i = 0; i < 6; ++i)
         {
@@ -768,13 +818,38 @@ static bool ahrs_static_variance_update(ahrs_t* a, const float gyr_rps[3], const
     }
 
     const float inv_dof = 1.0f / (3.0f * (float)(a->static_var_count - 1u));
-    const float gyr_rms =
-        SQRTF((a->static_var_m2[0] + a->static_var_m2[1] + a->static_var_m2[2]) * inv_dof);
-    const float acc_rms =
-        SQRTF((a->static_var_m2[3] + a->static_var_m2[4] + a->static_var_m2[5]) * inv_dof);
-    a->static_var_ok = (gyr_rms <= a->cfg.auto_zaru_static_gyr_stddev_rps) &&
-                       (acc_rms <= a->cfg.auto_zaru_static_acc_stddev_mps2);
+    const float gyr_m2  = a->static_var_m2[0] + a->static_var_m2[1] + a->static_var_m2[2];
+    const float acc_m2  = a->static_var_m2[3] + a->static_var_m2[4] + a->static_var_m2[5];
+    /* Zero spread on all three axes of a sensor is a frozen driver or bus,
+       not a standstill: the accelerometer on a single window, the gyro on a
+       run of them, see ins_static_variance_update. */
+    const bool acc_frozen = !(acc_m2 > 0.0f);
+    if (gyr_m2 > 0.0f) { a->static_gyr_const_windows = 0; }
+    else if (a->static_gyr_const_windows < INS_DEFAULT_FROZEN_GYR_WINDOWS)
+    {
+        a->static_gyr_const_windows++;
+    }
+    const bool gyr_frozen = (a->static_gyr_const_windows >= INS_DEFAULT_FROZEN_GYR_WINDOWS);
+    const bool frozen     = acc_frozen || gyr_frozen;
+    a->static_var_ok      = !frozen &&
+                       (SQRTF(gyr_m2 * inv_dof) <= a->cfg.auto_zaru_static_gyr_stddev_rps) &&
+                       (SQRTF(acc_m2 * inv_dof) <= a->cfg.auto_zaru_static_acc_stddev_mps2);
     a->static_var_count = 0; /* start the next window */
+
+    if (frozen)
+    {
+        a->n_imu_frozen++;
+        const bool  first_warn = (a->log_state.t_last_frozen_imu_warn == 0);
+        const float since_warn_sec =
+            first_warn ? 0.0f : time_diff_sec(t, a->log_state.t_last_frozen_imu_warn);
+        if (first_warn || since_warn_sec >= AHRS_LOG_FROZEN_IMU_REPEAT_SEC)
+        {
+            LOG_WARN("ahrs: %s repeats the same sample bit for bit - frozen sensor or bus "
+                     "(or noise far below one LSB), auto-ZARU vetoed (%u windows since init)",
+                     acc_frozen ? "accelerometer" : "gyro", (unsigned int)a->n_imu_frozen);
+            a->log_state.t_last_frozen_imu_warn = t;
+        }
+    }
     return a->static_var_ok;
 }
 
@@ -804,8 +879,11 @@ static bool ahrs_auto_zaru_detect(ahrs_t* a, const float gyr_rps[3], const float
         a->auto_zaru_static_since = 0;
         a->auto_zaru_var_since    = 0;
         a->zaru_gyr_count         = 0;
-        a->static_var_count       = 0;
-        a->static_var_ok          = false;
+        /* The window keeps running for the frozen-sensor verdict, which does
+           not depend on the fallback (REQ-AHRS-017). Only its stillness
+           verdict is discarded. */
+        (void)ahrs_static_variance_update(a, gyr_rps, acc_mps2, t);
+        a->static_var_ok = false;
         return false;
     }
 
@@ -1019,7 +1097,10 @@ static void ahrs_check_precision(ahrs_t* a)
 int ahrs_predict_step(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const float acc_mps2[3],
                       const float mag_b[3], bool zero_rotation_update, float* phi_out)
 {
-    if (!a->is_initialized) { return AHRS_EPOCH_DROPPED; }
+    if (a == NULL || gyr_rps == NULL || acc_mps2 == NULL || !a->is_initialized)
+    {
+        return AHRS_EPOCH_DROPPED;
+    }
 
     /* Cleared up front so a dropped epoch (non-finite input, backwards
        time) reports "no trigger" instead of the previous epoch's value. */
@@ -1058,7 +1139,13 @@ int ahrs_predict_step(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const
         a->t_last_zero_rot_fusion = t;
         a->zaru_gyr_count         = 0;
         a->auto_zaru_static_since = 0;
-        a->step_ctx.active        = false;
+        /* The stillness window and its latched verdict belong to the old
+           clock as well: a verdict from before the jump must not arm the
+           fallback after it (REQ-AHRS-017). */
+        a->auto_zaru_var_since = 0;
+        a->static_var_count    = 0;
+        a->static_var_ok       = false;
+        a->step_ctx.active     = false;
         return AHRS_EPOCH_DROPPED;
     }
 
@@ -1119,7 +1206,7 @@ int ahrs_predict_step(ahrs_t* a, ahrs_time_us_t t, const float gyr_rps[3], const
 /* @satisfies REQ-AHRS-025 */
 void ahrs_correct_step(ahrs_t* a)
 {
-    if (!a->step_ctx.active) return;
+    if (a == NULL || !a->step_ctx.active) return;
     a->step_ctx.active = false;
 
     const ahrs_time_us_t t                    = a->step_ctx.t;

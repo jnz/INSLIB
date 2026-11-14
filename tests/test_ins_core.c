@@ -150,7 +150,18 @@ static void vec3_assign(float dst[3], const float src[3])
     dst[2] = src[2];
 }
 
-static void set_imu(ins_measurements_t* m, const float acc[3], const float gyr[3], float dt)
+/* Zero-mean dither added by set_imu, alternating sign on every call. A real
+   IMU never repeats a sample bit for bit, and the stillness detector reads a
+   window of identical samples as a frozen sensor (REQ-NAV-013), so perfectly
+   noise-free synthetic data would veto every auto-ZUPT/ZARU. The amplitudes
+   sit far below every tolerance in this file, a few float ulps of gravity. */
+#define TEST_IMU_DITHER_GYR_RPS  (1e-6f)
+#define TEST_IMU_DITHER_ACC_MPS2 (1e-5f)
+static float test_imu_dither_sign = 1.0f;
+
+/* set_imu without the dither: a bit-identical stream, for the frozen-IMU
+   scenario. */
+static void set_imu_raw(ins_measurements_t* m, const float acc[3], const float gyr[3], float dt)
 {
     m->strapdown_dt_sec = dt;
     m->acc.data[0]      = acc[0];
@@ -163,6 +174,19 @@ static void set_imu(ins_measurements_t* m, const float acc[3], const float gyr[3
     m->gyr.data[2]                                               = gyr[2];
     m->gyr.Qll_diag[0] = m->gyr.Qll_diag[1] = m->gyr.Qll_diag[2] = 1e-5f;
     m->gyr.is_valid                                              = true;
+}
+
+static void set_imu(ins_measurements_t* m, const float acc[3], const float gyr[3], float dt)
+{
+    const float s        = test_imu_dither_sign;
+    test_imu_dither_sign = -test_imu_dither_sign;
+    const float acc_d[3] = {acc[0] + s * TEST_IMU_DITHER_ACC_MPS2,
+                            acc[1] - s * TEST_IMU_DITHER_ACC_MPS2,
+                            acc[2] + s * TEST_IMU_DITHER_ACC_MPS2};
+    const float gyr_d[3] = {gyr[0] + s * TEST_IMU_DITHER_GYR_RPS,
+                            gyr[1] - s * TEST_IMU_DITHER_GYR_RPS,
+                            gyr[2] + s * TEST_IMU_DITHER_GYR_RPS};
+    set_imu_raw(m, acc_d, gyr_d, dt);
 }
 
 static void set_baro(ins_measurements_t* m, float pressure_pa, float stddev_m)
@@ -3257,6 +3281,87 @@ static void scenario_autoinit_mag_yaw_cached(void)
     const float yaw_var    = f.d[INS_IDX_RPY + 2];
     const float expect_var = init.rpy_init_stddev_rad[0] * init.rpy_init_stddev_rad[0];
     CHECK_NEAR(yaw_var, expect_var, 1e-4, "cached-mag yaw variance is mag-derived, not 'unknown'");
+}
+
+/* REQ-NAV-044: a hard-iron bias carried into the bootstrap (REQ-NAV-061) is
+ * taken off the magnetometer sample the heading is computed from. The sample
+ * here is the true field plus a hard iron large enough to turn the heading by
+ * several degrees, and the carry holds exactly that hard iron. */
+static void scenario_autoinit_mag_yaw_bias_carry(void)
+{
+    printf("\n=== Scenario: auto-init mag yaw uses the carried hard-iron bias "
+           "(REQ-NAV-044) ===\n");
+
+    int c;
+    for (c = 0; c < 2; ++c)
+    {
+        const bool with_carry = (c == 1);
+        ins_t      f;
+        memset(&f, 0, sizeof(f));
+        ins_init_t init;
+        fill_default_init(&init, 0);
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.auto_init         = true;
+        opt.estimate_mag_bias = true;
+        CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init");
+
+        const float hard_iron[3] = {12.0f, -9.0f, 4.0f};
+        if (with_carry)
+        {
+            vec3_assign(f.bias_carry.mag_bias, hard_iron);
+            f.bias_carry.acc_bias_stddev_mps2 = 0.1f;
+            f.bias_carry.gyr_bias_stddev_rps  = 0.01f;
+            f.bias_carry.mag_bias_stddev_ut   = 1.0f;
+            f.bias_carry.valid                = true;
+        }
+
+        float g_vec[3];
+        ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+        const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]}; /* level */
+        const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+        const float yaw_true    = 25.0f * (float)M_PI / 180.0f;
+        const float mh          = sqrtf(init.magnetic_n[0] * init.magnetic_n[0] +
+                                        init.magnetic_n[1] * init.magnetic_n[1]);
+
+        const float   dt = 0.01f;
+        ins_time_us_t t  = 0;
+        int           step;
+        for (step = 1; step <= 11; ++step)
+        {
+            t += us_from_sec(dt);
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            set_imu(&m, acc_body, gyr_body, dt);
+            m.mag.data[0]  = mh * cosf(-yaw_true) + hard_iron[0];
+            m.mag.data[1]  = mh * sinf(-yaw_true) + hard_iron[1];
+            m.mag.data[2]  = init.magnetic_n[2] + hard_iron[2];
+            m.mag.is_valid = true;
+            if (step == 11)
+            {
+                m.gnss_pos.llh[0]     = init.llh[0];
+                m.gnss_pos.llh[1]     = init.llh[1];
+                m.gnss_pos.llh[2]     = init.llh[2];
+                m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = m.gnss_pos.Qll_ned[8] = 1.0f;
+                m.gnss_pos.is_valid                                                   = true;
+            }
+            ins_update(&f, &m);
+        }
+        if (!f.is_initialized)
+        {
+            printf("  FAIL  filter did not bootstrap\n");
+            fails++;
+            return;
+        }
+        float roll, pitch, yaw;
+        ins_get_rpy(&f, &roll, &pitch, &yaw);
+        const float err = fabsf(ins_angle_diff(yaw, yaw_true));
+        printf("  %s: yaw %.1f deg (true %.1f)\n", with_carry ? "with carry" : "no carry  ",
+               (double)RAD2DEG(yaw), (double)RAD2DEG(yaw_true));
+        if (with_carry) { CHECK_TRUE(err < 0.02f, "carried hard iron: heading is the true one"); }
+        else { CHECK_TRUE(err > 0.05f, "control: the hard iron does turn the raw heading"); }
+    }
 }
 
 /* REQ-NAV-045: entry into 3D (ins ready) is held off until the position fix
@@ -9237,6 +9342,163 @@ static void scenario_static_variance_gate(void)
     }
 }
 
+/* Frozen IMU (REQ-NAV-013): a sensor that repeats its last sample bit for
+ * bit has zero spread, which passes any upper variance bound. The detector
+ * must read it as a frozen driver/bus, not as standstill, and count it:
+ * a frozen accelerometer from its first window on, a frozen gyro once the
+ * run of windows without spread is long enough (a coarse gyro may hold one
+ * code for a while). The control run with the same values plus set_imu's
+ * dither must arm, so the veto is what blocks the frozen runs and not some
+ * other gate. The verdict is also reached with the detector disabled and
+ * while the filter is still collecting. */
+static void scenario_static_variance_frozen_imu(void)
+{
+    printf("\n=== Scenario: frozen IMU vetoes the stillness detector (REQ-NAV-013) ===\n");
+
+    int c;
+    for (c = 0; c < 3; ++c)
+    {
+        const bool frozen_gyr = (c == 1);
+        const bool frozen_acc = (c == 2);
+
+        ins_t f;
+        memset(&f, 0, sizeof(f));
+        ins_init_t init;
+        fill_default_init(&init, 0);
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        if (ins_init(&f, &init, &opt) != 0)
+        {
+            printf("init failed\n");
+            fails++;
+            return;
+        }
+
+        float g_vec[3];
+        ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+        const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+        const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+
+        const float   dt = 0.01f;
+        ins_time_us_t t  = 0;
+        int           step;
+        uint32_t      n_zupt_1s = 0, n_zupt_4s = 0, n_frozen_1s = 0;
+        for (step = 1; step <= 800; ++step) /* 8 s, far past the dwell */
+        {
+            t += us_from_sec(dt);
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            set_imu(&m, acc_body, gyr_body, dt);
+            /* Freeze one sensor only: the other keeps its spread, so the
+               veto has to come from that sensor alone. */
+            if (frozen_gyr) { vec3_assign(m.gyr.data, gyr_body); }
+            if (frozen_acc) { vec3_assign(m.acc.data, acc_body); }
+            ins_update(&f, &m);
+            if (step == 100)
+            {
+                n_zupt_1s   = ins_get_diag(&f)->n_auto_zupt;
+                n_frozen_1s = ins_get_diag(&f)->n_imu_frozen;
+            }
+            if (step == 400) { n_zupt_4s = ins_get_diag(&f)->n_auto_zupt; }
+        }
+
+        const ins_diag_t* d = ins_get_diag(&f);
+        if (c == 0)
+        {
+            CHECK_TRUE(d->n_auto_zupt > 0, "control: dithered standstill arms the detector");
+            CHECK_TRUE(d->n_imu_frozen == 0, "control: no frozen window counted");
+        }
+        else if (frozen_gyr)
+        {
+            /* A short run of gyro windows without spread is not a verdict yet:
+               the detector works through the first second. */
+            CHECK_TRUE(n_zupt_1s > 0, "gyro without spread: detector armed in the first second");
+            CHECK_TRUE(n_frozen_1s == 0, "gyro without spread: not frozen after one second");
+            CHECK_TRUE(d->n_auto_zupt == n_zupt_4s,
+                       "frozen gyro: nothing fused once the run is long");
+            CHECK_TRUE(!ins_auto_zupt_active(&f), "frozen gyro: detector reports not still");
+            CHECK_TRUE(d->n_imu_frozen > 0, "frozen gyro: windows counted");
+        }
+        else
+        {
+            CHECK_TRUE(d->n_auto_zupt == 0, "frozen accel never arms the detector");
+            CHECK_TRUE(!ins_auto_zupt_active(&f), "detector reports not still");
+            CHECK_TRUE(d->n_imu_frozen > 0, "frozen windows counted");
+        }
+    }
+
+    /* The verdict does not depend on the detector: disabled (c == 0) and still
+       collecting for the bootstrap (c == 1), a frozen stream is counted. */
+    for (c = 0; c < 2; ++c)
+    {
+        ins_t f;
+        memset(&f, 0, sizeof(f));
+        ins_init_t init;
+        fill_default_init(&init, 0);
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        if (c == 0) { opt.auto_zupt_disable = true; }
+        else { opt.auto_init = true; }
+        CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init (detector off / collecting)");
+        float g_vec[3];
+        ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+        const float   acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+        const float   gyr_body[3] = {0.0f, 0.0f, 0.0f};
+        const float   dt          = 0.01f;
+        ins_time_us_t t           = 0;
+        int           step;
+        for (step = 1; step <= 300; ++step)
+        {
+            t += us_from_sec(dt);
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            set_imu_raw(&m, acc_body, gyr_body, dt);
+            ins_update(&f, &m);
+        }
+        if (c == 0) { CHECK_TRUE(f.is_initialized, "detector off: filter runs"); }
+        else { CHECK_TRUE(!f.is_initialized && f.is_collecting, "no fix: still collecting"); }
+        CHECK_TRUE(ins_get_diag(&f)->n_imu_frozen > 0,
+                   (c == 0) ? "detector off: frozen windows still counted"
+                            : "collecting: frozen windows still counted");
+        CHECK_TRUE(ins_get_diag(&f)->n_auto_zupt == 0, "and nothing was fused on them");
+    }
+
+    /* Recovery: once the sensor comes back, the detector arms again. */
+    {
+        ins_t f;
+        memset(&f, 0, sizeof(f));
+        ins_init_t init;
+        fill_default_init(&init, 0);
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init (recovery)");
+        float g_vec[3];
+        ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+        const float   acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+        const float   gyr_body[3] = {0.0f, 0.0f, 0.0f};
+        const float   dt          = 0.01f;
+        ins_time_us_t t           = 0;
+        int           step;
+        for (step = 1; step <= 1000; ++step) /* 5 s frozen, then 5 s live */
+        {
+            t += us_from_sec(dt);
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            if (step <= 500) { set_imu_raw(&m, acc_body, gyr_body, dt); }
+            else { set_imu(&m, acc_body, gyr_body, dt); }
+            ins_update(&f, &m);
+            if (step == 500)
+            {
+                CHECK_TRUE(ins_get_diag(&f)->n_auto_zupt == 0, "nothing fused while frozen");
+            }
+        }
+        CHECK_TRUE(ins_get_diag(&f)->n_auto_zupt > 0, "detector arms again after recovery");
+    }
+}
+
 /* Initial bias-prior consistency check (REQ-NAV-050): standing still,
  * the averaged raw IMU is the sensor bias itself, so a bias far outside
  * the configured initial 1-sigma prior must be flagged (counter + WARN)
@@ -11198,6 +11460,91 @@ static void scenario_init_validation(void)
     ins_init_t bad = init;
     bad.llh[0]     = 3.0; /* far past the pole */
     CHECK_TRUE(ins_init(&f, &bad, &opt) == -1, "init rejects an impossible latitude");
+
+    /* REQ-NAV-095: a non-finite float anywhere in the configuration. One
+       field of each kind: a stddev that resolves "0 -> default", an initial
+       state, a reference vector, an option threshold, a calibration matrix. */
+    CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "control: the unmodified configuration starts");
+    bad                           = init;
+    bad.acc_bias_init_stddev_mps2 = NAN;
+    CHECK_TRUE(ins_init(&f, &bad, &opt) == -1, "init rejects a NaN bias stddev");
+    bad                 = init;
+    bad.rpy_init_rad[2] = NAN;
+    CHECK_TRUE(ins_init(&f, &bad, &opt) == -1, "init rejects a NaN initial attitude");
+    bad            = init;
+    bad.vel_ned[0] = INFINITY;
+    CHECK_TRUE(ins_init(&f, &bad, &opt) == -1, "init rejects an infinite initial velocity");
+    bad              = init;
+    bad.gravity_n[1] = NAN;
+    CHECK_TRUE(ins_init(&f, &bad, &opt) == -1, "init rejects a NaN gravity vector");
+    ins_options_t bad_opt           = opt;
+    bad_opt.max_prediction_time_sec = NAN;
+    CHECK_TRUE(ins_init(&f, &init, &bad_opt) == -1, "init rejects a NaN option");
+    bad_opt                         = opt;
+    bad_opt.imu_acc_misalignment[4] = NAN;
+    CHECK_TRUE(ins_init(&f, &init, &bad_opt) == -1, "init rejects a NaN calibration matrix");
+    bad_opt                     = opt;
+    bad_opt.gnss_stop_dwell_sec = -INFINITY;
+    CHECK_TRUE(ins_init(&f, &init, &bad_opt) == -1, "init rejects an infinite option");
+}
+
+/* REQ-NAV-042: a non-finite bias state trips the health check like a
+   non-finite position, velocity or attitude does. Without it the filter
+   keeps publishing while every corrected IMU sample is already NaN. */
+static void scenario_nonfinite_bias_health(void)
+{
+    printf("\n=== Scenario: non-finite bias state trips the health check (REQ-NAV-042) ===\n");
+
+    int c;
+    for (c = 0; c < 3; ++c)
+    {
+        ins_t f;
+        memset(&f, 0, sizeof(f));
+        ins_init_t init;
+        fill_default_init(&init, 0);
+        ins_options_t opt;
+        fill_default_opt(&opt);
+        opt.estimate_mag_bias = (c == 2);
+        CHECK_TRUE(ins_init(&f, &init, &opt) == 0, "init");
+
+        float g_vec[3];
+        ins_gravity_ned((float)init.llh[0], (float)init.llh[2], g_vec);
+        const float   acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+        const float   gyr_body[3] = {0.0f, 0.0f, 0.0f};
+        const float   dt          = 0.01f;
+        ins_time_us_t t           = 0;
+        int           step;
+        for (step = 1; step <= 100; ++step)
+        {
+            t += us_from_sec(dt);
+            ins_measurements_t m;
+            memset(&m, 0, sizeof(m));
+            m.timestamp = t;
+            set_imu(&m, acc_body, gyr_body, dt);
+            ins_update(&f, &m);
+        }
+        CHECK_TRUE(f.is_initialized, "running before the corruption");
+        const uint32_t resets_before = ins_get_diag(&f)->n_health_reset;
+
+        if (c == 0) { f.state.acc_bias[1] = NAN; }
+        else if (c == 1) { f.state.gyr_bias[2] = INFINITY; }
+        else { f.state.mag_bias[0] = NAN; }
+
+        t += us_from_sec(dt);
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_body, dt);
+        ins_update(&f, &m);
+
+        float v[3];
+        CHECK_TRUE(!f.is_initialized, (c == 0)   ? "NaN accel bias: filter not ready"
+                                      : (c == 1) ? "Inf gyro bias: filter not ready"
+                                                 : "NaN mag bias: filter not ready");
+        CHECK_TRUE(!ins_get_velocity_ned(&f, v), "no solution published");
+        CHECK_TRUE(ins_get_diag(&f)->n_health_reset == resets_before + 1u || !f.is_collecting,
+                   "counted as a health shutdown");
+    }
 }
 
 /* Every public accessor's own "!f" arm, tested elsewhere only with a
@@ -12388,10 +12735,9 @@ static void scenario_degenerate_process_noise(void)
         memset(&m, 0, sizeof(m));
         m.timestamp        = t;
         m.strapdown_dt_sec = 1.0f / (float)rate;
-        vec3_assign(m.acc.data, acc);
+        /* set_imu's dither, the Qll below are this scenario's own. */
+        set_imu(&m, acc, gyr, m.strapdown_dt_sec);
         m.acc.Qll_diag[0] = m.acc.Qll_diag[1] = m.acc.Qll_diag[2] = 6.9e-7f;
-        m.acc.is_valid                                            = true;
-        vec3_assign(m.gyr.data, gyr);
         m.gyr.Qll_diag[0] = m.gyr.Qll_diag[1] = m.gyr.Qll_diag[2] = 2.1e-10f;
         m.gyr.is_valid                                            = true;
         if (i % rate == 0 || i == 1) /* 1 Hz cm-level RTK; i==1 crosses the
@@ -12486,6 +12832,15 @@ static void scenario_set_world_model(void)
     const float g_custom[3] = {0.0f, 0.0f, 9.7f};
     ins_set_world_model(&f, g_custom, (const float*)0);
     CHECK_NEAR(f.gravity_n[2], 9.7, 1e-6, "gravity replaced");
+
+    /* A non-finite vector is ignored like a NULL one (REQ-NAV-095). */
+    const float g_nan[3]   = {0.0f, NAN, 9.8f};
+    const float mag_inf[3] = {20.0f, 0.0f, INFINITY};
+    ins_set_world_model(&f, g_nan, mag_inf);
+    CHECK_NEAR(f.gravity_n[2], 9.7, 1e-6, "NaN gravity ignored");
+    CHECK_TRUE(isfinite(f.gravity_n[1]), "gravity reference still finite");
+    CHECK_NEAR(f.magnetic_n[0], mag_before[0], 1e-9, "non-finite mag ref ignored");
+    CHECK_TRUE(isfinite(f.magnetic_n[2]), "magnetic reference still finite");
     ins_set_world_model(&f, g_n, (const float*)0);
 
     /* Rotate the magnetic reference by +30 deg about down: with the
@@ -13157,6 +13512,61 @@ static void scenario_gnss_cov_conditioning_gates_unscaled(void)
     CHECK_TRUE(p_fl > p_ref * 4.0f, "floor 25 m: but the fusion did see it");
 }
 
+/* Runs a stationary filter for 20 s with an IMU of period imu_period_us and a
+   GNSS position fix every `fix_every` IMU epochs, alternating between
+   fix_every - fix_jitter and fix_every + fix_jitter, and reports the
+   resulting diagnostics. Used for the fusion rate limit (REQ-NAV-074). */
+static void run_gnss_rate_ex(int min_delay_ms, int fix_every, int fix_jitter, int imu_period_us,
+                             ins_diag_t* out)
+{
+    ins_t f;
+    memset(&f, 0, sizeof(f));
+    ins_init_t init;
+    fill_default_init(&init, 0);
+    ins_options_t o;
+    fill_default_opt(&o);
+    o.gnss_min_delay_ms = min_delay_ms;
+    if (ins_init(&f, &init, &o) != 0)
+    {
+        printf("  init failed\n");
+        fails++;
+        return;
+    }
+
+    double truth_ecef[3];
+    memcpy(truth_ecef, init_ecef(&init), sizeof(truth_ecef));
+    float g_vec[3];
+    ins_gravity_ned((float)f.latlonh[0], (float)f.latlonh[2], g_vec);
+    const float acc_body[3] = {0.0f, 0.0f, -g_vec[2]};
+    const float gyr_body[3] = {0.0f, 0.0f, 0.0f};
+
+    const float   dt       = (float)imu_period_us * 1e-6f;
+    ins_time_us_t t        = 0;
+    int           step     = 0;
+    int           next_fix = fix_every - fix_jitter;
+    int           jit_sign = 1;
+    const int     n_steps  = (int)(20000000LL / imu_period_us);
+    for (step = 1; step <= n_steps; ++step)
+    {
+        t += imu_period_us;
+        ins_measurements_t m;
+        memset(&m, 0, sizeof(m));
+        m.timestamp = t;
+        set_imu(&m, acc_body, gyr_body, dt);
+        if (step == next_fix)
+        {
+            next_fix += fix_every + jit_sign * fix_jitter;
+            jit_sign = -jit_sign;
+            ins_ecef_to_latlonh(truth_ecef, &m.gnss_pos.llh[0], &m.gnss_pos.llh[1],
+                                &m.gnss_pos.llh[2]);
+            m.gnss_pos.Qll_ned[0] = m.gnss_pos.Qll_ned[4] = m.gnss_pos.Qll_ned[8] = 4.0f;
+            m.gnss_pos.is_valid                                                   = true;
+        }
+        ins_update(&f, &m);
+    }
+    *out = *ins_get_diag(&f);
+}
+
 /* Runs a stationary filter for 20 s with a 100 Hz IMU and a GNSS position
    fix every `fix_every` IMU epochs, and reports the resulting diagnostics.
    Used for the fusion rate limit (REQ-NAV-074). */
@@ -13252,6 +13662,41 @@ static void scenario_gnss_rate_limit(void)
            (unsigned)d200.n_gnss_rate_limited);
     CHECK_TRUE(d200.n_gnss_used > 80u && d200.n_gnss_used < 120u,
                "explicit 200 ms limit: ~5 Hz out of a 10 Hz stream");
+
+    /* A receiver AT the limit must pass in full, however the fix epochs land
+       on the IMU grid. An IMU period a hair short of nominal puts every fix
+       99.9 ms after the last one, which a bare comparison against 100 ms
+       turns into every second fix. */
+    ins_diag_t dshort;
+    memset(&dshort, 0, sizeof(dshort));
+    run_gnss_rate_ex(0, 10, 0, 9990, &dshort);
+    printf("  10 Hz stream, 99.9 ms apart: seen %u, used %u, rate-limited %u\n",
+           (unsigned)dshort.n_gnss_seen, (unsigned)dshort.n_gnss_used,
+           (unsigned)dshort.n_gnss_rate_limited);
+    CHECK_TRUE(dshort.n_gnss_seen > 190u, "99.9 ms: the stream is seen");
+    CHECK_TRUE(dshort.n_gnss_rate_limited == 0u, "99.9 ms: nothing is paced");
+    CHECK_TRUE(dshort.n_gnss_used == dshort.n_gnss_seen, "99.9 ms: every fix is spent");
+
+    /* The same with the fixes alternating 80 and 120 ms apart. */
+    ins_diag_t djit;
+    memset(&djit, 0, sizeof(djit));
+    run_gnss_rate_ex(0, 10, 2, 10000, &djit);
+    printf("  10 Hz stream, 80/120 ms:     seen %u, used %u, rate-limited %u\n",
+           (unsigned)djit.n_gnss_seen, (unsigned)djit.n_gnss_used,
+           (unsigned)djit.n_gnss_rate_limited);
+    CHECK_TRUE(djit.n_gnss_rate_limited == 0u, "jittered 10 Hz: nothing is paced");
+    CHECK_TRUE(djit.n_gnss_used == djit.n_gnss_seen, "jittered 10 Hz: every fix is spent");
+
+    /* The tolerance does not raise the rate: a 12.5 Hz stream (80 ms, inside
+       the tolerance of a single fix) is still paced to 10 Hz on average. */
+    ins_diag_t d80;
+    memset(&d80, 0, sizeof(d80));
+    run_gnss_rate_ex(0, 8, 0, 10000, &d80);
+    printf("  12.5 Hz stream:              seen %u, used %u, rate-limited %u\n",
+           (unsigned)d80.n_gnss_seen, (unsigned)d80.n_gnss_used, (unsigned)d80.n_gnss_rate_limited);
+    CHECK_TRUE(d80.n_gnss_seen > 240u, "12.5 Hz: the stream is seen");
+    CHECK_TRUE(d80.n_gnss_used <= 201u, "12.5 Hz: no more than 10 Hz on average is spent");
+    CHECK_TRUE(d80.n_gnss_used > 150u, "12.5 Hz: and not far less either");
 }
 
 /* REQ-NAV-071: the conditioning clamps the per-axis stddev from above as
@@ -15548,6 +15993,7 @@ int main(void)
     scenario_autoinit_mag_yaw();
     scenario_autoinit_mag_yaw_dip_zone();
     scenario_autoinit_mag_yaw_cached();
+    scenario_autoinit_mag_yaw_bias_carry();
     scenario_gnss_init_dwell();
     scenario_gnss_mode_hysteresis();
     scenario_gnss_quality_exit_bias_carry();
@@ -15591,6 +16037,7 @@ int main(void)
     scenario_auto_zupt_gnss_vel_while_moving();
     scenario_auto_zaru_vibration();
     scenario_static_variance_gate();
+    scenario_static_variance_frozen_imu();
     scenario_bias_prior_check();
     scenario_nan_inf_inputs();
     scenario_deadreckoning_reacquire();
@@ -15605,6 +16052,7 @@ int main(void)
     scenario_reacquire_att_hint();
     scenario_reacquire_yaw_unknown();
     scenario_init_validation();
+    scenario_nonfinite_bias_health();
     scenario_accessor_null_guards();
     scenario_reacquire_variants();
     scenario_delayed_no_anchor_and_gates();

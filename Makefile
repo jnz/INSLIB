@@ -337,7 +337,7 @@ $(TEST_CORE): $(NAV_SRC) $(KFCORE_SRC) tests/test_ins_core.c $(NAV_HDR) | $(BUIL
 $(TEST_MATH): $(MATH_SRC) $(KFCORE_SRC_MATH) tests/test_ins_math.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
-$(TEST_AHRS): $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c $(NAV_HDR) | $(BUILD_DIR)
+$(TEST_AHRS): $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c tests/test_imu_dither.h $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 # Neither magnetic_model.c nor log.c is linked (logging is compiled out), so
@@ -345,7 +345,7 @@ $(TEST_AHRS): $(SUITE_SRC) $(KFCORE_SRC) tests/test_ahrs.c $(NAV_HDR) | $(BUILD_
 $(TEST_AHRS_NOMAG): $(AHRS_NOMAG_SRC) $(KFCORE_SRC) tests/test_ahrs_nomag.c $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(AHRS_NOMAG_FLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
-$(TEST_BARO): $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c $(NAV_HDR) | $(BUILD_DIR)
+$(TEST_BARO): $(SUITE_SRC) $(KFCORE_SRC) tests/test_baro.c tests/test_imu_dither.h $(NAV_HDR) | $(BUILD_DIR)
 	$(CC) $(HARNESS_CFLAGS) $(TEST_LOG_LEVEL_CFLAGS) $(INCLUDES) $(filter %.c,$^) $(LDLIBS) -o $@
 
 $(TEST_LOG): src/log.c tests/test_log.c $(NAV_HDR) | $(BUILD_DIR)

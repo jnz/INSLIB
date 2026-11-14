@@ -313,6 +313,9 @@ typedef struct
     float          static_var_m2[6];        /**< Welford sum of squared deviations */
     uint32_t       static_var_count;        /**< samples in the current window
                                                  (0 = window not started) */
+    uint32_t static_gyr_const_windows;      /**< consecutive completed windows
+                                                 without any gyro spread, for
+                                                 the frozen-gyro verdict */
     bool static_var_ok;                     /**< verdict latched from the last COMPLETED
                                                  window; false until the first one
                                                  completes */
@@ -360,6 +363,12 @@ typedef struct
     uint32_t n_restart;       /**< times the attitude-precision watchdog
                                    marked the filter uninitialized
                                    (REQ-AHRS-023) */
+    uint32_t n_imu_frozen;    /**< auto-ZARU variance windows judged "not
+                                   still" because a sensor repeated itself
+                                   bit for bit on all three axes (frozen
+                                   driver/bus): any such accelerometer
+                                   window, a gyro window once a run of them
+                                   is long enough (REQ-AHRS-017) */
 
     /** Gyro bias latched by an IMU loss (REQ-AHRS-029), kept until the next
         ahrs_init. */
@@ -400,6 +409,8 @@ typedef struct
         ahrs_time_us_t t_last_gyr_bias_sanity_warn; /**< throttle for the gyro-bias
                                                           sanity-bound warning
                                                           (0 = none yet) */
+        ahrs_time_us_t t_last_frozen_imu_warn;      /**< throttle for the frozen-IMU
+                                                         warning (0 = none yet) */
         float yaw_stddev_window_deg;                /**< yaw stddev at window start [deg] */
         float gyr_bias_window_dps;                  /**< |gyro bias| at window start [deg/s] */
     } log_state;

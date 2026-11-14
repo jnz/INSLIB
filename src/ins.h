@@ -63,7 +63,8 @@
 
 /** Compile-time maximum state size: all covariance/history arrays are
  *  dimensioned to this. The active size is chosen per instance at init
- *  (15, or 18 with estimate_mag_bias). */
+ *  (15, or 18 with estimate_mag_bias). Loops run to that active size, which
+ *  never exceeds this bound (REQ-SYS-004). */
 #ifndef INS_UNKNOWNS_MAX
 #define INS_UNKNOWNS_MAX INS_UNKNOWNS_MAG
 #endif
@@ -946,7 +947,8 @@ typedef struct
      * shortens the coasting window.
      *
      * 0 -> built-in default, negative -> no limit. */
-    int gnss_min_delay_ms; /**< min. time between two fused GNSS epochs [ms]
+    int gnss_min_delay_ms; /**< interval GNSS fusion is paced to [ms], a fix
+                                up to a quarter of it early still passes
                                 (0 -> default, < 0 -> no limit) */
 
     /* Range aiding into the height under the barometric height source
@@ -1085,7 +1087,12 @@ typedef struct
                                   ins.c), 0 whenever chi2_disable is set */
 
     /* Automatic ZUPT/ZARU detector (see opt.auto_zupt_*). */
-    uint32_t n_auto_zupt; /**< epochs where the detector fired */
+    uint32_t n_auto_zupt;  /**< epochs where the detector fired */
+    uint32_t n_imu_frozen; /**< stillness-variance windows judged "not still"
+                                because a sensor repeated itself bit for bit on
+                                all three axes (frozen driver/bus): any such
+                                accelerometer window, a gyro window once a run
+                                of them is long enough (REQ-NAV-013) */
 
     /* Initial bias-prior consistency check (REQ-NAV-050, diagnostic only):
        while the platform stands still, the averaged raw IMU is essentially the
@@ -1390,6 +1397,10 @@ typedef struct
         (REQ-NAV-074). Its own field rather than diag.t_last_gnss_fusion: that
         one records what happened, this one decides what happens next. */
     ins_time_us_t t_last_gnss_fused;
+    /** Earliest epoch the next GNSS fix is scheduled for (REQ-NAV-074).
+        Advances by one interval per spent fix, so a fix that was accepted
+        early does not raise the average rate. */
+    ins_time_us_t t_gnss_fusion_due;
 
     /* GNSS quality state of the running 3D solution (REQ-NAV-052). A sustained
        quality loss re-arms the filter into the collecting state, so the restart
@@ -1522,6 +1533,9 @@ typedef struct
     float         static_var_m2[6];        /**< Welford sum of squared deviations */
     uint32_t      static_var_count;        /**< samples in the current window
                                                 (0 = window not started) */
+    uint32_t static_gyr_const_windows;     /**< consecutive completed windows
+                                                without any gyro spread, for
+                                                the frozen-gyro verdict */
     bool static_var_ok;                    /**< verdict latched from the last COMPLETED
                                                 window, false until the first one
                                                 completes */
@@ -1556,7 +1570,7 @@ typedef struct
                                                      at finalize, so never "unseen") */
         ins_time_us_t t_last_yaw_stddev_warn;  /**< throttle for the unaided-yaw
                                                      warning (0 = none yet) */
-        ins_time_us_t t_last_stuck_warn;       /**< throttle for the stuck-sensor
+        ins_time_us_t t_last_frozen_imu_warn;  /**< throttle for the frozen-IMU
                                                      warning (0 = none yet) */
         ins_time_us_t t_last_mag_disturb_warn; /**< throttle for the persistent
                                                      magnetic-disturbance warning
@@ -1588,13 +1602,9 @@ typedef struct
         ins_time_us_t t_last_large_pos_res_log;    /**< throttle for the "large GNSS position
                                                          correction pending" message
                                                          (0 = none yet) */
-        float last_gyr_raw[3];                     /**< gyro sample of the previous epoch,
-                                                        for the stuck-sensor check */
         float    yaw_stddev_window_deg;            /**< yaw stddev at window start [deg] */
         float    gyr_bias_window_dps;              /**< |gyro bias| at window start [deg/s] */
         float    acc_bias_window_mps2;             /**< |accel bias| at window start [m/s^2] */
-        uint32_t stuck_gyr_count;                  /**< consecutive epochs with a
-                                                        bit-identical gyro sample */
         uint32_t mag_disturbed_count;              /**< consecutive epochs the field-strength
                                                         gate has been outside tolerance */
         bool automotive_logged;                    /**< true once the one-shot
@@ -1608,7 +1618,6 @@ typedef struct
         bool gnss_delay_logged;                    /**< true once the one-shot
                                                         "first GNSS delay seen" info
                                                         has been printed */
-        bool last_gyr_raw_valid;                   /**< true once last_gyr_raw holds a value */
     } log_state;
 
     /* History ring buffer (for delayed measurement fusion) */
@@ -1954,6 +1963,15 @@ extern "C"
      *  @param[out] acc_bias_mps2 Accelerometer bias, body frame [m/s^2].
      *  @return true if the filter is initialized. */
     bool ins_get_bias_acc(const ins_t* f, float acc_bias_mps2[3]);
+
+    /** @brief 1-sigma of the accelerometer bias estimate along one body
+     *  direction, taken from the full bias covariance (cross terms included).
+     *  @param[in] f The filter instance.
+     *  @param[in] dir_b Direction in the body frame, used as given (a unit
+     *                   vector yields the 1-sigma along it).
+     *  @param[out] stddev_mps2 1-sigma of the bias along dir_b [m/s^2].
+     *  @return true if the filter is initialized and the result is finite. */
+    bool ins_get_bias_acc_stddev_along(const ins_t* f, const float dir_b[3], float* stddev_mps2);
 
     /** @brief Get current gyroscope bias estimate.
      *  @param[in] f The filter instance.
