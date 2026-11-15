@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `src/wmm_lut.h`: the WMM tables carry an optional `WMM_MEM_LOCATION`
+  attribute slot (empty by default). Define it before the include to place
+  the tables, e.g. `__attribute__((section(".name")))`.
+
 ## [1.4.3] - 2026-11-14 - Baro Alt Improvements
 
 ### Added

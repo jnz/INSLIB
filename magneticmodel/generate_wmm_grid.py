@@ -127,6 +127,12 @@ def generate_header():
         "#pragma once",
         "#include <stdint.h>",
         "",
+        "// Optional: define WMM_MEM_LOCATION before including this header to",
+        "// place the tables, e.g. as an __attribute__((section(\".name\"))).",
+        "#ifndef WMM_MEM_LOCATION",
+        "#define WMM_MEM_LOCATION",
+        "#endif",
+        "",
         f"#define WMM_STEP_DEG {STEP_DEG}",
         f"#define WMM_STEP_DEG_F {STEP_DEG_F}",
         f"#define WMM_LAT_MIN (-90)",
@@ -182,7 +188,7 @@ def generate_header():
         "// exclusion radius absorbs. The count is what the scan found, it is",
         "// not a fixed property of the field.",
         f"#define WMM_DIP_POLE_COUNT {len(poles)}",
-        f"const float wmm_dip_pole[{len(poles)}][2] = {{",
+        f"const float WMM_MEM_LOCATION wmm_dip_pole[{len(poles)}][2] = {{",
     ]
     for la, lo in poles:
         lines.append(f"    {{ {la:9.3f}f, {lo:9.3f}f }},")
@@ -191,7 +197,7 @@ def generate_header():
     lines += [
         "",
         f"// Declination values for Epoch {epoch_start}",
-        f"const int16_t wmm_decl_start[{lat_count}][{lon_count}] = {{"
+        f"const int16_t WMM_MEM_LOCATION wmm_decl_start[{lat_count}][{lon_count}] = {{"
     ]
 
     # Generate Start Epoch
@@ -207,7 +213,7 @@ def generate_header():
 
     # Generate End Epoch
     lines.append(f"// Declination values for Epoch {epoch_end}")
-    lines.append(f"const int16_t wmm_decl_end[{lat_count}][{lon_count}] = {{")
+    lines.append(f"const int16_t WMM_MEM_LOCATION wmm_decl_end[{lat_count}][{lon_count}] = {{")
     for lat in range(-90, 90 + 1, STEP_DEG):
         row_values = []
         for lon in range(-180, 180 + 1, STEP_DEG):
@@ -220,7 +226,7 @@ def generate_header():
 
     # Absolute field strength (uint8_t micro-Tesla, coarse grid)
     lines.append(f"// ABSOLUTE FIELD STRENGTH micro-Tesla (uT) ({epoch_start})")
-    lines.append(f"const uint8_t wmm_field_microTesla[{lat_count_f}][{lon_count_f}] = {{")
+    lines.append(f"const uint8_t WMM_MEM_LOCATION wmm_field_microTesla[{lat_count_f}][{lon_count_f}] = {{")
     for lat in range(-90, 90 + 1, STEP_DEG_F):
         row_values = []
         for lon in range(-180, 180 + 1, STEP_DEG_F):
@@ -237,7 +243,7 @@ def generate_header():
     # this fully defines the NED reference field:
     #   B_ned = F * [cosI cosD, cosI sinD, sinI]
     lines.append(f"// INCLINATION (dip) grad*100 ({epoch_start})")
-    lines.append(f"const int16_t wmm_incl_cdeg[{lat_count_f}][{lon_count_f}] = {{")
+    lines.append(f"const int16_t WMM_MEM_LOCATION wmm_incl_cdeg[{lat_count_f}][{lon_count_f}] = {{")
     for lat in range(-90, 90 + 1, STEP_DEG_F):
         row_values = []
         for lon in range(-180, 180 + 1, STEP_DEG_F):
